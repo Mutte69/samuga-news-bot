@@ -115,8 +115,9 @@ IMAGE: [2-3 word search keyword]"""
 # ── Fetch background image from Unsplash ─────────────────────────────────────
 def fetch_background_image(keyword):
     try:
+        log.info(f"🔑 Unsplash key present: {bool(UNSPLASH_ACCESS_KEY)}, length: {len(UNSPLASH_ACCESS_KEY)}")
         if UNSPLASH_ACCESS_KEY:
-            url = f"https://api.unsplash.com/photos/random?query={keyword}&orientation=squarish&client_id={UNSPLASH_ACCESS_KEY}"
+            url = f"https://api.unsplash.com/photos/random?query={keyword}&client_id={UNSPLASH_ACCESS_KEY}"
             resp = requests.get(url, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
@@ -219,7 +220,7 @@ def generate_card(rewritten_text, source, timestamp, bg_image=None):
         wm_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
     except:
         wm_font = ImageFont.load_default()
-    draw.text((W - 260, 55), "samugamedia.com", font=wm_font, fill=(255, 255, 255, 180))
+    draw.text((W - 260, 55), "t.me/samugacommunity", font=wm_font, fill=(255, 255, 255, 180))
 
     # Fonts
     try:
