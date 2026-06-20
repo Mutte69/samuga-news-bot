@@ -6,7 +6,7 @@ import json
 import feedparser
 import requests
 import anthropic
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
 from datetime import datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
 from io import BytesIO
@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "@samugacommunity")
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+UNSPLASH_ACCESS_KEY = os.environ.get("UNSPLASH_ACCESS_KEY", "")
 
 # ── Anthropic client ──────────────────────────────────────────────────────────
 ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -43,7 +44,7 @@ def load_seen():
 
 def save_seen(seen):
     with open(SEEN_FILE, "w") as f:
-        json.dump(list(seen)[-500:], f)  # keep last 500
+        json.dump(list(seen)[-500:], f)
 
 # ── Fetch news ────────────────────────────────────────────────────────────────
 def fetch_news():
@@ -64,7 +65,7 @@ def fetch_news():
             log.error(f"Feed error {url}: {e}")
     return articles
 
-# ── Rewrite with Claude ───────────────────────────────────────────────────────
+# ── Rewrite with Claude + get image keyword ───────────────────────────────────
 def rewrite_news(title, summary):
     prompt = f"""You are a news writer for Samuga Media, a Maldivian digital media outlet.
 
@@ -74,127 +75,208 @@ Rewrite the following news into a short, punchy, engaging English post for a Tel
 - No hashtags
 - No emojis
 - Professional but easy to read
-- End with one strong sentence that adds context or impact
+
+Also provide a 2-3 word image search keyword relevant to the news topic (e.g. "ocean waves", "parliament building", "coral reef").
 
 Title: {title}
 Summary: {summary}
 
-Return ONLY the rewritten post text, nothing else."""
+Respond in this exact format:
+TEXT: [your rewritten news text]
+IMAGE: [2-3 word search keyword]"""
 
     try:
         message = ai.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=300,
+            max_tokens=400,
             messages=[{"role": "user", "content": prompt}]
         )
-        return message.content[0].text.strip()
+        response = message.content[0].text.strip()
+        
+        text = ""
+        image_keyword = "maldives ocean"
+        
+        for line in response.split('\n'):
+            if line.startswith("TEXT:"):
+                text = line.replace("TEXT:", "").strip()
+            elif line.startswith("IMAGE:"):
+                image_keyword = line.replace("IMAGE:", "").strip()
+        
+        if not text:
+            text = response
+            
+        return text, image_keyword
     except Exception as e:
         log.error(f"Claude API error: {e}")
-        return f"{title}\n\n{summary[:200]}"
+        return f"{title}\n\n{summary[:200]}", "maldives"
+
+# ── Fetch background image from Unsplash ─────────────────────────────────────
+def fetch_background_image(keyword):
+    try:
+        if UNSPLASH_ACCESS_KEY:
+            url = f"https://api.unsplash.com/photos/random?query={keyword}&orientation=squarish&client_id={UNSPLASH_ACCESS_KEY}"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                img_url = data["urls"]["regular"]
+                img_resp = requests.get(img_url, timeout=15)
+                if img_resp.status_code == 200:
+                    log.info(f"✅ Got Unsplash image for: {keyword}")
+                    return Image.open(BytesIO(img_resp.content)).convert("RGB")
+        
+        # Fallback: search for maldives image without API key using picsum
+        log.warning("No Unsplash key or failed — using gradient background")
+        return None
+    except Exception as e:
+        log.error(f"Image fetch error: {e}")
+        return None
 
 # ── Card colors ───────────────────────────────────────────────────────────────
-BG_TOP    = (10, 40, 75)       # deep dark blue
-BG_BOTTOM = (5, 20, 45)        # even darker at bottom
-ACCENT    = (41, 171, 226)     # Samuga light blue #29ABE2
-WHITE     = (255, 255, 255)
+BG_TOP     = (10, 40, 75)
+BG_BOTTOM  = (5, 20, 45)
+ACCENT     = (41, 171, 226)
+WHITE      = (255, 255, 255)
 LIGHT_GRAY = (200, 215, 230)
 
 # ── Generate image card ───────────────────────────────────────────────────────
-def generate_card(rewritten_text, source, timestamp):
+def generate_card(rewritten_text, source, timestamp, bg_image=None):
     W, H = 1080, 1080
     img = Image.new("RGB", (W, H), BG_TOP)
+
+    if bg_image:
+        # Resize and crop background image to fill card
+        bg = bg_image.copy()
+        bg_ratio = bg.width / bg.height
+        if bg_ratio > 1:
+            new_h = H
+            new_w = int(H * bg_ratio)
+        else:
+            new_w = W
+            new_h = int(W / bg_ratio)
+        bg = bg.resize((new_w, new_h), Image.LANCZOS)
+        left = (new_w - W) // 2
+        top = (new_h - H) // 2
+        bg = bg.crop((left, top, left + W, top + H))
+
+        # Darken the image significantly for text readability
+        enhancer = ImageEnhance.Brightness(bg)
+        bg = enhancer.enhance(0.25)
+
+        # Add blue color overlay
+        overlay = Image.new("RGB", (W, H), (8, 30, 65))
+        img = Image.blend(bg, overlay, 0.55)
+    else:
+        # Gradient fallback
+        draw_temp = ImageDraw.Draw(img)
+        for y in range(H):
+            t = y / H
+            r = int(BG_TOP[0] + (BG_BOTTOM[0] - BG_TOP[0]) * t)
+            g = int(BG_TOP[1] + (BG_BOTTOM[1] - BG_TOP[1]) * t)
+            b = int(BG_TOP[2] + (BG_BOTTOM[2] - BG_TOP[2]) * t)
+            draw_temp.line([(0, y), (W, y)], fill=(r, g, b))
+
     draw = ImageDraw.Draw(img)
 
-    # Gradient background
-    for y in range(H):
-        t = y / H
-        r = int(BG_TOP[0] + (BG_BOTTOM[0] - BG_TOP[0]) * t)
-        g = int(BG_TOP[1] + (BG_BOTTOM[1] - BG_TOP[1]) * t)
-        b = int(BG_TOP[2] + (BG_BOTTOM[2] - BG_TOP[2]) * t)
-        draw.line([(0, y), (W, y)], fill=(r, g, b))
+    # Bottom gradient overlay for text area (bottom 60% of card)
+    overlay_img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay_img)
+    for y in range(H // 2, H):
+        t = (y - H // 2) / (H // 2)
+        alpha = int(200 * t)
+        overlay_draw.line([(0, y), (W, y)], fill=(5, 20, 50, alpha))
+    img = Image.alpha_composite(img.convert("RGBA"), overlay_img).convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    # Top overlay for logo area
+    top_overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    top_draw = ImageDraw.Draw(top_overlay)
+    for y in range(0, 180):
+        t = 1 - (y / 180)
+        alpha = int(180 * t)
+        top_draw.line([(0, y), (W, y)], fill=(5, 20, 50, alpha))
+    img = Image.alpha_composite(img.convert("RGBA"), top_overlay).convert("RGB")
+    draw = ImageDraw.Draw(img)
 
     # Accent line at top
-    draw.rectangle([(0, 0), (W, 6)], fill=ACCENT)
-
-    # Subtle accent glow strip
-    for i in range(20):
-        alpha = int(30 * (1 - i / 20))
-        draw.rectangle([(0, 6 + i), (W, 7 + i)], fill=(41, 171, 226, alpha))
+    draw.rectangle([(0, 0), (W, 5)], fill=ACCENT)
 
     # Logo
     try:
         logo = Image.open("logo.png").convert("RGBA")
-        logo_h = 80
+        logo_h = 75
         ratio = logo_h / logo.height
         logo_w = int(logo.width * ratio)
         logo = logo.resize((logo_w, logo_h), Image.LANCZOS)
-        img.paste(logo, (60, 50), logo)
+        img.paste(logo, (50, 40), logo)
     except Exception as e:
         log.warning(f"Logo error: {e}")
-        draw.text((60, 50), "SAMUGA MEDIA", fill=ACCENT)
+        draw.text((50, 40), "SAMUGA MEDIA", fill=WHITE)
 
-    # Divider line
-    draw.rectangle([(60, 160), (W - 60, 163)], fill=ACCENT)
-
-    # "BREAKING NEWS" tag
+    # Website watermark top right
     try:
-        tag_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+        wm_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
     except:
-        tag_font = ImageFont.load_default()
+        wm_font = ImageFont.load_default()
+    draw.text((W - 260, 55), "samugamedia.com", font=wm_font, fill=(255, 255, 255, 180))
 
-    draw.rectangle([(60, 185), (245, 220)], fill=ACCENT)
-    draw.text((75, 190), "● LATEST NEWS", font=tag_font, fill=WHITE)
-
-    # Main news text
+    # Fonts
     try:
-        text_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 44)
-        small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 28)
-        source_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+        tag_font   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+        title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 48)
+        body_font  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 28)
+        src_font   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
     except:
-        text_font = ImageFont.load_default()
-        small_font = ImageFont.load_default()
-        source_font = ImageFont.load_default()
+        tag_font = title_font = body_font = src_font = ImageFont.load_default()
 
-    # Word wrap text
-    words = rewritten_text.split()
-    lines = []
-    current = ""
-    max_chars = 28
+    # LATEST NEWS tag — positioned in lower half
+    tag_y = 580
+    draw.rectangle([(50, tag_y), (220, tag_y + 34)], fill=ACCENT)
+    draw.text((62, tag_y + 6), "● LATEST NEWS", font=tag_font, fill=WHITE)
 
-    for word in words:
-        if len(current) + len(word) + 1 <= max_chars:
-            current += (" " if current else "") + word
-        else:
-            if current:
-                lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
+    # Word wrap helper
+    def wrap_text(text, font, max_w):
+        words = text.split()
+        lines = []
+        current = ""
+        for word in words:
+            test = (current + " " + word).strip()
+            bbox = draw.textbbox((0, 0), test, font=font)
+            if bbox[2] <= max_w:
+                current = test
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+        return lines
 
-    # Limit to first 6 lines for main display
-    display_lines = lines[:6]
-    remaining = lines[6:]
+    max_w = W - 100
 
-    y_text = 260
-    for line in display_lines:
-        draw.text((60, y_text), line, font=text_font, fill=WHITE)
-        y_text += 58
+    # Split into headline + body
+    sentences = rewritten_text.split('. ')
+    headline = sentences[0] + ('.' if len(sentences) > 1 else '')
+    body = '. '.join(sentences[1:]) if len(sentences) > 1 else ''
 
-    # Remaining text in smaller font
-    if remaining:
-        remaining_text = " ".join(remaining)
-        draw.text((60, y_text + 10), remaining_text, font=small_font, fill=LIGHT_GRAY)
+    title_lines = wrap_text(headline, title_font, max_w)
+    body_lines  = wrap_text(body, body_font, max_w) if body else []
+
+    y = tag_y + 50
+    for line in title_lines[:4]:
+        draw.text((50, y), line, font=title_font, fill=WHITE)
+        y += 58
+
+    if body_lines:
+        y += 6
+        for line in body_lines[:3]:
+            draw.text((50, y), line, font=body_font, fill=LIGHT_GRAY)
+            y += 38
 
     # Bottom bar
-    draw.rectangle([(0, H - 90), (W, H)], fill=(5, 15, 35))
-    draw.rectangle([(0, H - 90), (W, H - 87)], fill=ACCENT)
-
-    # Source + timestamp
-    draw.text((60, H - 65), f"Source: {source}", font=source_font, fill=LIGHT_GRAY)
-    draw.text((W - 300, H - 65), timestamp, font=source_font, fill=LIGHT_GRAY)
-
-    # Watermark
-    draw.text((W - 280, 55), "samugamedia.com", font=source_font, fill=(41, 171, 226, 150))
+    draw.rectangle([(0, H - 80), (W, H)], fill=(0, 0, 0, 180))
+    draw.rectangle([(0, H - 80), (W, H - 77)], fill=ACCENT)
+    draw.text((50, H - 55), f"Source: {source}", font=src_font, fill=LIGHT_GRAY)
+    draw.text((W - 260, H - 55), timestamp, font=src_font, fill=LIGHT_GRAY)
 
     buf = BytesIO()
     img.save(buf, format="PNG", quality=95)
@@ -229,10 +311,13 @@ def run_job():
             continue
 
         log.info(f"📰 Processing: {article['title'][:60]}...")
-        rewritten = rewrite_news(article["title"], article["summary"])
+        rewritten, image_keyword = rewrite_news(article["title"], article["summary"])
+
+        log.info(f"🖼️ Fetching image for: {image_keyword}")
+        bg_image = fetch_background_image(image_keyword)
 
         timestamp = datetime.now().strftime("%d %b %Y • %H:%M")
-        card = generate_card(rewritten, article["source"], timestamp)
+        card = generate_card(rewritten, article["source"], timestamp, bg_image)
 
         caption = (
             f"<b>{article['title']}</b>\n\n"
@@ -245,8 +330,8 @@ def run_job():
             seen.add(article["id"])
             save_seen(seen)
             posted += 1
-            time.sleep(5)  # small delay between posts
-            break  # post 1 article per run to avoid spam
+            time.sleep(5)
+            break
 
     if posted == 0:
         log.info("No new articles found this run.")
@@ -254,7 +339,7 @@ def run_job():
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("🚀 Samuga News Bot starting...")
-    run_job()  # run immediately on start
+    run_job()
 
     scheduler = BlockingScheduler()
     scheduler.add_job(run_job, "interval", minutes=30)
