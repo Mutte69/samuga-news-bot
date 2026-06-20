@@ -34,7 +34,9 @@ RSS_FEEDS = [
 ]
 
 # ── Seen articles cache ───────────────────────────────────────────────────────
-SEEN_FILE = "seen_articles.json"
+DATA_DIR = "/data"
+os.makedirs(DATA_DIR, exist_ok=True)
+SEEN_FILE = os.path.join(DATA_DIR, "seen_articles.json")
 
 def load_seen():
     if os.path.exists(SEEN_FILE):
