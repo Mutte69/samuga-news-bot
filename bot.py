@@ -7,279 +7,257 @@ import feedparser
 import requests
 import anthropic
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
-from datetime import datetime
+from datetime import datetime, timezone
 from apscheduler.schedulers.blocking import BlockingScheduler
 from io import BytesIO
 
 # ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ── Config from env ───────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "@samugacommunity")
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-UNSPLASH_ACCESS_KEY = os.environ.get("UNSPLASH_ACCESS_KEY", "")
+# ── Config ────────────────────────────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHANNEL_ID  = os.environ.get("TELEGRAM_CHANNEL_ID", "@samugacommunity")
+ANTHROPIC_API_KEY    = os.environ["ANTHROPIC_API_KEY"]
+UNSPLASH_ACCESS_KEY  = os.environ.get("UNSPLASH_ACCESS_KEY", "")
 
-# ── Anthropic client ──────────────────────────────────────────────────────────
 ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ── RSS Feeds (Maldives focused) ──────────────────────────────────────────────
+# ── RSS Feeds ─────────────────────────────────────────────────────────────────
 RSS_FEEDS = [
     "https://news.google.com/rss/search?q=maldives&hl=en-MV&gl=MV&ceid=MV:en",
     "https://news.google.com/rss/search?q=maldives+news&hl=en&gl=US&ceid=US:en",
 ]
 
-# ── Seen articles cache ───────────────────────────────────────────────────────
-DATA_DIR = "/data"
+# ── Persistent seen cache ─────────────────────────────────────────────────────
+DATA_DIR  = "/data"
 os.makedirs(DATA_DIR, exist_ok=True)
 SEEN_FILE = os.path.join(DATA_DIR, "seen_articles.json")
 
 def load_seen():
-    if os.path.exists(SEEN_FILE):
-        with open(SEEN_FILE, "r") as f:
-            return set(json.load(f))
+    try:
+        if os.path.exists(SEEN_FILE):
+            with open(SEEN_FILE) as f:
+                return set(json.load(f))
+    except Exception as e:
+        log.warning(f"Load seen error: {e}")
     return set()
 
 def save_seen(seen):
-    with open(SEEN_FILE, "w") as f:
-        json.dump(list(seen)[-500:], f)
+    try:
+        with open(SEEN_FILE, "w") as f:
+            json.dump(list(seen)[-500:], f)
+    except Exception as e:
+        log.warning(f"Save seen error: {e}")
 
-# ── Fetch news ────────────────────────────────────────────────────────────────
+# ── Fetch news (today only) ───────────────────────────────────────────────────
 def fetch_news():
     articles = []
+    seen_titles = set()
     for url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
-            for entry in feed.entries[:5]:
-                article_id = hashlib.md5(entry.get("link", entry.title).encode()).hexdigest()
+            for entry in feed.entries[:10]:
+                title = entry.get("title", "")
+                # Deduplicate by title
+                title_key = title.lower()[:50]
+                if title_key in seen_titles:
+                    continue
+                seen_titles.add(title_key)
+
+                article_id = hashlib.md5(entry.get("link", title).encode()).hexdigest()
                 articles.append({
                     "id": article_id,
-                    "title": entry.get("title", ""),
-                    "summary": entry.get("summary", entry.get("title", "")),
+                    "title": title,
+                    "summary": entry.get("summary", title),
                     "link": entry.get("link", ""),
                     "source": entry.get("source", {}).get("title", "Google News"),
+                    "published": entry.get("published", ""),
                 })
         except Exception as e:
             log.error(f"Feed error {url}: {e}")
     return articles
 
-# ── Rewrite with Claude + get image keyword ───────────────────────────────────
+# ── Rewrite + image keyword ───────────────────────────────────────────────────
 def rewrite_news(title, summary):
     prompt = f"""You are a news writer for Samuga Media, a Maldivian digital media outlet.
 
 Rewrite the following news into a short, punchy, engaging English post for a Telegram channel.
 - Max 3 sentences
-- Clear and direct
-- No hashtags
-- No emojis
+- Clear and direct  
+- No hashtags, no emojis
 - Professional but easy to read
 
-Also provide a 2-3 word image search keyword relevant to the news topic (e.g. "ocean waves", "parliament building", "coral reef").
+Also provide a 2-3 word Unsplash image search keyword relevant to the topic (e.g. "tropical ocean", "government building", "coral reef diving").
 
 Title: {title}
 Summary: {summary}
 
-Respond in this exact format:
-TEXT: [your rewritten news text]
-IMAGE: [2-3 word search keyword]"""
+Respond in EXACTLY this format (two lines only):
+TEXT: [rewritten news]
+IMAGE: [2-3 word keyword]"""
 
     try:
-        message = ai.messages.create(
+        msg = ai.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=400,
             messages=[{"role": "user", "content": prompt}]
         )
-        response = message.content[0].text.strip()
-        
-        text = ""
-        image_keyword = "maldives ocean"
-        
+        response = msg.content[0].text.strip()
+        text, keyword = "", "maldives tropical"
         for line in response.split('\n'):
             if line.startswith("TEXT:"):
-                text = line.replace("TEXT:", "").strip()
+                text = line[5:].strip()
             elif line.startswith("IMAGE:"):
-                image_keyword = line.replace("IMAGE:", "").strip()
-        
-        if not text:
-            text = response
-            
-        return text, image_keyword
+                keyword = line[6:].strip()
+        return (text or title), keyword
     except Exception as e:
-        log.error(f"Claude API error: {e}")
-        return f"{title}\n\n{summary[:200]}", "maldives"
+        log.error(f"Claude error: {e}")
+        return title, "maldives"
 
-# ── Fetch background image from Unsplash ─────────────────────────────────────
+# ── Fetch Unsplash image ──────────────────────────────────────────────────────
 def fetch_background_image(keyword):
+    if not UNSPLASH_ACCESS_KEY:
+        log.warning("No Unsplash key set")
+        return None
     try:
-        log.info(f"🔑 Unsplash key present: {bool(UNSPLASH_ACCESS_KEY)}, length: {len(UNSPLASH_ACCESS_KEY)}")
-        if UNSPLASH_ACCESS_KEY:
-            url = f"https://api.unsplash.com/photos/random?query={keyword}&client_id={UNSPLASH_ACCESS_KEY}"
-            resp = requests.get(url, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                img_url = data["urls"]["regular"]
-                img_resp = requests.get(img_url, timeout=15)
-                if img_resp.status_code == 200:
-                    log.info(f"✅ Got Unsplash image for: {keyword}")
-                    return Image.open(BytesIO(img_resp.content)).convert("RGB")
-        
-        # Fallback: search for maldives image without API key using picsum
-        log.warning("No Unsplash key or failed — using gradient background")
-        return None
+        url = f"https://api.unsplash.com/photos/random?query={keyword}&client_id={UNSPLASH_ACCESS_KEY}"
+        log.info(f"Calling Unsplash: {url[:80]}...")
+        resp = requests.get(url, timeout=15)
+        log.info(f"Unsplash status: {resp.status_code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            img_url = data["urls"]["regular"]
+            log.info(f"Image URL: {img_url[:60]}...")
+            img_resp = requests.get(img_url, timeout=20)
+            if img_resp.status_code == 200:
+                log.info(f"✅ Got Unsplash image for: {keyword}")
+                return Image.open(BytesIO(img_resp.content)).convert("RGB")
+            else:
+                log.error(f"Image download failed: {img_resp.status_code}")
+        else:
+            log.error(f"Unsplash API failed: {resp.status_code} — {resp.text[:200]}")
     except Exception as e:
-        log.error(f"Image fetch error: {e}")
-        return None
+        log.error(f"Unsplash exception: {e}")
+    return None
 
-# ── Card colors ───────────────────────────────────────────────────────────────
+# ── Colors ────────────────────────────────────────────────────────────────────
 BG_TOP     = (10, 40, 75)
 BG_BOTTOM  = (5, 20, 45)
 ACCENT     = (41, 171, 226)
 WHITE      = (255, 255, 255)
 LIGHT_GRAY = (200, 215, 230)
 
-# ── Generate image card ───────────────────────────────────────────────────────
-def generate_card(rewritten_text, source, timestamp, bg_image=None):
+# ── Generate card ─────────────────────────────────────────────────────────────
+def generate_card(text, source, timestamp, bg_image=None):
     W, H = 1080, 1080
     img = Image.new("RGB", (W, H), BG_TOP)
 
     if bg_image:
-        # Resize and crop background image to fill card
         bg = bg_image.copy()
-        bg_ratio = bg.width / bg.height
-        if bg_ratio > 1:
-            new_h = H
-            new_w = int(H * bg_ratio)
+        r = bg.width / bg.height
+        if r > 1:
+            nh, nw = H, int(H * r)
         else:
-            new_w = W
-            new_h = int(W / bg_ratio)
-        bg = bg.resize((new_w, new_h), Image.LANCZOS)
-        left = (new_w - W) // 2
-        top = (new_h - H) // 2
-        bg = bg.crop((left, top, left + W, top + H))
-
-        # Darken the image significantly for text readability
-        enhancer = ImageEnhance.Brightness(bg)
-        bg = enhancer.enhance(0.25)
-
-        # Add blue color overlay
+            nw, nh = W, int(W / r)
+        bg = bg.resize((nw, nh), Image.LANCZOS)
+        bg = bg.crop(((nw - W) // 2, (nh - H) // 2, (nw - W) // 2 + W, (nh - H) // 2 + H))
+        bg = ImageEnhance.Brightness(bg).enhance(0.22)
         overlay = Image.new("RGB", (W, H), (8, 30, 65))
         img = Image.blend(bg, overlay, 0.55)
     else:
-        # Gradient fallback
-        draw_temp = ImageDraw.Draw(img)
+        d = ImageDraw.Draw(img)
         for y in range(H):
             t = y / H
-            r = int(BG_TOP[0] + (BG_BOTTOM[0] - BG_TOP[0]) * t)
-            g = int(BG_TOP[1] + (BG_BOTTOM[1] - BG_TOP[1]) * t)
-            b = int(BG_TOP[2] + (BG_BOTTOM[2] - BG_TOP[2]) * t)
-            draw_temp.line([(0, y), (W, y)], fill=(r, g, b))
+            d.line([(0, y), (W, y)], fill=(
+                int(BG_TOP[0] + (BG_BOTTOM[0] - BG_TOP[0]) * t),
+                int(BG_TOP[1] + (BG_BOTTOM[1] - BG_TOP[1]) * t),
+                int(BG_TOP[2] + (BG_BOTTOM[2] - BG_TOP[2]) * t),
+            ))
 
-    draw = ImageDraw.Draw(img)
-
-    # Bottom gradient overlay for text area (bottom 60% of card)
-    overlay_img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    overlay_draw = ImageDraw.Draw(overlay_img)
+    # Bottom dark gradient
+    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    od = ImageDraw.Draw(ov)
     for y in range(H // 2, H):
         t = (y - H // 2) / (H // 2)
-        alpha = int(200 * t)
-        overlay_draw.line([(0, y), (W, y)], fill=(5, 20, 50, alpha))
-    img = Image.alpha_composite(img.convert("RGBA"), overlay_img).convert("RGB")
+        od.line([(0, y), (W, y)], fill=(5, 20, 50, int(210 * t)))
+    img = Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
+
+    # Top dark gradient
+    ov2 = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    od2 = ImageDraw.Draw(ov2)
+    for y in range(0, 170):
+        t = 1 - y / 170
+        od2.line([(0, y), (W, y)], fill=(5, 20, 50, int(190 * t)))
+    img = Image.alpha_composite(img.convert("RGBA"), ov2).convert("RGB")
+
     draw = ImageDraw.Draw(img)
 
-    # Top overlay for logo area
-    top_overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    top_draw = ImageDraw.Draw(top_overlay)
-    for y in range(0, 180):
-        t = 1 - (y / 180)
-        alpha = int(180 * t)
-        top_draw.line([(0, y), (W, y)], fill=(5, 20, 50, alpha))
-    img = Image.alpha_composite(img.convert("RGBA"), top_overlay).convert("RGB")
-    draw = ImageDraw.Draw(img)
-
-    # Accent line at top
+    # Top accent line
     draw.rectangle([(0, 0), (W, 5)], fill=ACCENT)
 
     # Logo
     try:
         logo = Image.open("logo.png").convert("RGBA")
-        logo_h = 75
-        ratio = logo_h / logo.height
-        logo_w = int(logo.width * ratio)
-        logo = logo.resize((logo_w, logo_h), Image.LANCZOS)
-        img.paste(logo, (50, 40), logo)
+        lh = 72
+        lw = int(logo.width * lh / logo.height)
+        logo = logo.resize((lw, lh), Image.LANCZOS)
+        img.paste(logo, (50, 38), logo)
     except Exception as e:
-        log.warning(f"Logo error: {e}")
-        draw.text((50, 40), "SAMUGA MEDIA", fill=WHITE)
-
-    # Website watermark top right
-    try:
-        wm_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
-    except:
-        wm_font = ImageFont.load_default()
-    draw.text((W - 260, 55), "t.me/samugacommunity", font=wm_font, fill=(255, 255, 255, 180))
+        log.warning(f"Logo: {e}")
 
     # Fonts
     try:
-        tag_font   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
-        title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 48)
-        body_font  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 28)
-        src_font   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
+        f_tag   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+        f_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 46)
+        f_body  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 27)
+        f_sm    = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 21)
     except:
-        tag_font = title_font = body_font = src_font = ImageFont.load_default()
+        f_tag = f_title = f_body = f_sm = ImageFont.load_default()
 
-    # LATEST NEWS tag — positioned in lower half
-    tag_y = 580
-    draw.rectangle([(50, tag_y), (220, tag_y + 34)], fill=ACCENT)
-    draw.text((62, tag_y + 6), "● LATEST NEWS", font=tag_font, fill=WHITE)
+    # t.me/samugacommunity top right
+    draw.text((W - 310, 50), "t.me/samugacommunity", font=f_sm, fill=(200, 230, 255))
 
-    # Word wrap helper
-    def wrap_text(text, font, max_w):
+    # LATEST NEWS tag
+    tag_y = 590
+    draw.rectangle([(50, tag_y), (222, tag_y + 34)], fill=ACCENT)
+    draw.text((63, tag_y + 6), "● LATEST NEWS", font=f_tag, fill=WHITE)
+
+    # Word wrap
+    def wrap(text, font, max_w):
         words = text.split()
-        lines = []
-        current = ""
-        for word in words:
-            test = (current + " " + word).strip()
-            bbox = draw.textbbox((0, 0), test, font=font)
-            if bbox[2] <= max_w:
-                current = test
+        lines, cur = [], ""
+        for w in words:
+            test = (cur + " " + w).strip()
+            if draw.textbbox((0, 0), test, font=font)[2] <= max_w:
+                cur = test
             else:
-                if current:
-                    lines.append(current)
-                current = word
-        if current:
-            lines.append(current)
+                if cur: lines.append(cur)
+                cur = w
+        if cur: lines.append(cur)
         return lines
 
     max_w = W - 100
+    sentences = text.split('. ')
+    headline  = sentences[0] + ('.' if len(sentences) > 1 else '')
+    body      = '. '.join(sentences[1:]) if len(sentences) > 1 else ''
 
-    # Split into headline + body
-    sentences = rewritten_text.split('. ')
-    headline = sentences[0] + ('.' if len(sentences) > 1 else '')
-    body = '. '.join(sentences[1:]) if len(sentences) > 1 else ''
+    y = tag_y + 48
+    for line in wrap(headline, f_title, max_w)[:4]:
+        draw.text((50, y), line, font=f_title, fill=WHITE)
+        y += 56
 
-    title_lines = wrap_text(headline, title_font, max_w)
-    body_lines  = wrap_text(body, body_font, max_w) if body else []
-
-    y = tag_y + 50
-    for line in title_lines[:4]:
-        draw.text((50, y), line, font=title_font, fill=WHITE)
-        y += 58
-
-    if body_lines:
-        y += 6
-        for line in body_lines[:3]:
-            draw.text((50, y), line, font=body_font, fill=LIGHT_GRAY)
-            y += 38
+    if body:
+        y += 4
+        for line in wrap(body, f_body, max_w)[:3]:
+            draw.text((50, y), line, font=f_body, fill=LIGHT_GRAY)
+            y += 36
 
     # Bottom bar
-    draw.rectangle([(0, H - 80), (W, H)], fill=(0, 0, 0, 180))
-    draw.rectangle([(0, H - 80), (W, H - 77)], fill=ACCENT)
-    draw.text((50, H - 55), f"Source: {source}", font=src_font, fill=LIGHT_GRAY)
-    draw.text((W - 260, H - 55), timestamp, font=src_font, fill=LIGHT_GRAY)
+    draw.rectangle([(0, H - 78), (W, H)], fill=(3, 12, 30))
+    draw.rectangle([(0, H - 78), (W, H - 75)], fill=ACCENT)
+    draw.text((50, H - 53), f"Source: {source}", font=f_sm, fill=LIGHT_GRAY)
+    draw.text((W - 260, H - 53), timestamp, font=f_sm, fill=LIGHT_GRAY)
 
     buf = BytesIO()
     img.save(buf, format="PNG", quality=95)
@@ -287,14 +265,14 @@ def generate_card(rewritten_text, source, timestamp, bg_image=None):
     return buf
 
 # ── Send to Telegram ──────────────────────────────────────────────────────────
-def send_to_telegram(image_buf, caption):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+def send_to_telegram(buf, caption):
     try:
-        resp = requests.post(url, data={
-            "chat_id": TELEGRAM_CHANNEL_ID,
-            "caption": caption,
-            "parse_mode": "HTML",
-        }, files={"photo": ("card.png", image_buf, "image/png")}, timeout=30)
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+            data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"},
+            files={"photo": ("card.png", buf, "image/png")},
+            timeout=30
+        )
         resp.raise_for_status()
         log.info("✅ Posted to Telegram")
         return True
@@ -302,28 +280,62 @@ def send_to_telegram(image_buf, caption):
         log.error(f"Telegram error: {e}")
         return False
 
+# ── Breaking news keywords ───────────────────────────────────────────────────
+BREAKING_KEYWORDS = [
+    "breaking", "urgent", "alert", "killed", "dead", "explosion", "crash",
+    "attack", "arrested", "emergency", "disaster", "flood", "fire", "missing",
+    "tsunami", "earthquake", "accident", "murder", "terror", "bomb", "coup",
+    "resign", "resign", "crisis", "leaked", "scandal", "raid"
+]
+
+def is_breaking(title, summary):
+    text = (title + " " + summary).lower()
+    return any(kw in text for kw in BREAKING_KEYWORDS)
+
+def get_maldives_hour():
+    """Get current hour in Maldives Time (UTC+5)"""
+    utc_now = datetime.utcnow()
+    mvt_hour = (utc_now.hour + 5) % 24
+    return mvt_hour
+
+def is_active_hours():
+    """7:00 AM to 6:00 PM MVT = active (every 30 min)"""
+    h = get_maldives_hour()
+    return 7 <= h < 18
+
 # ── Main job ──────────────────────────────────────────────────────────────────
 def run_job():
+    mvt_hour = get_maldives_hour()
+    active   = is_active_hours()
+    log.info(f"🕐 MVT hour: {mvt_hour:02d}:xx | Mode: {'ACTIVE (30min)' if active else 'NIGHT (3hr, breaking only)'}")
     log.info("🔍 Fetching news...")
-    seen = load_seen()
-    articles = fetch_news()
 
-    posted = 0
+    seen     = load_seen()
+    articles = fetch_news()
+    posted   = 0
+
     for article in articles:
         if article["id"] in seen:
             continue
 
-        log.info(f"📰 Processing: {article['title'][:60]}...")
-        rewritten, image_keyword = rewrite_news(article["title"], article["summary"])
+        # Night mode: only post breaking news
+        if not active and not is_breaking(article["title"], article["summary"]):
+            log.info(f"⏭️ Skipping (night mode, not breaking): {article['title'][:50]}")
+            continue
 
-        log.info(f"🖼️ Fetching image for: {image_keyword}")
-        bg_image = fetch_background_image(image_keyword)
+        log.info(f"📰 {article['title'][:70]}...")
+        rewritten, keyword = rewrite_news(article["title"], article["summary"])
 
-        timestamp = datetime.now().strftime("%d %b %Y • %H:%M")
-        card = generate_card(rewritten, article["source"], timestamp, bg_image)
+        log.info(f"🖼️ Image keyword: {keyword}")
+        bg = fetch_background_image(keyword)
 
+        ts   = datetime.now().strftime("%d %b %Y • %H:%M")
+        card = generate_card(rewritten, article["source"], ts, bg)
+
+        # Add 🚨 tag for breaking news at night
+        breaking_tag = "🚨 <b>BREAKING</b>\n\n" if not active else ""
         caption = (
-            f"<b>{article['title']}</b>\n\n"
+            f"{breaking_tag}<b>{article['title']}</b>\n\n"
             f"{rewritten}\n\n"
             f"🔗 <a href='{article['link']}'>Read more</a>\n\n"
             f"📡 <b>Samuga Media</b> | @samugacommunity"
@@ -337,14 +349,27 @@ def run_job():
             break
 
     if posted == 0:
-        log.info("No new articles found this run.")
+        log.info("No new articles this run.")
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    log.info("🚀 Samuga News Bot starting...")
+# ── Smart scheduler ───────────────────────────────────────────────────────────
+def scheduled_check():
+    """Runs every 30 mins but skips night hours unless breaking news"""
+    mvt_hour = get_maldives_hour()
+    active   = is_active_hours()
+
+    # Night mode: only run every 3 hours (at 18, 21, 00, 03, 06)
+    if not active and mvt_hour not in [18, 21, 0, 3, 6]:
+        log.info(f"💤 Night mode — skipping this 30min tick (MVT {mvt_hour:02d}:xx)")
+        return
+
     run_job()
 
+# ── Entry ─────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    log.info("🚀 Samuga News Bot starting...")
+    log.info("📅 Schedule: 7AM-6PM MVT every 30min | 6PM-7AM MVT every 3hrs (breaking only)")
+    run_job()
     scheduler = BlockingScheduler()
-    scheduler.add_job(run_job, "interval", minutes=30)
-    log.info("⏰ Scheduler running — every 30 minutes")
+    scheduler.add_job(scheduled_check, "interval", minutes=30)
+    log.info("⏰ Scheduler started")
     scheduler.start()
