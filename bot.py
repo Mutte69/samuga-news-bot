@@ -504,32 +504,28 @@ def can_post_regular():
     elapsed = (datetime.utcnow() - last_regular_post_time).total_seconds()
     return elapsed >= 7200  # 2 hours
 
-def post_article(article, seen):
+def post_article(article, seen, social_only=False):
     """Process and post a single article. Returns True if posted."""
     global last_regular_post_time
     cat = article["cat"]
     breaking = is_breaking(article["title"], article["summary"], cat)
 
-    # Check if regular post is allowed on Telegram
-    if not breaking and not can_post_regular():
-        mins_left = int((7200 - (datetime.utcnow() - last_regular_post_time).total_seconds()) / 60)
-        log.info(f"⏳ [{cat}] Telegram throttled — {mins_left} mins left | posting to social only")
-        # Still post to social media even if Telegram is throttled!
-        rewritten, keyword = rewrite_news(article["title"], article["summary"], cat)
-        bg = fetch_background_image(keyword)
-        ts = datetime.now().strftime("%d %b %Y • %H:%M")
-        card = generate_card(rewritten, article["source"], ts, cat, bg)
-        cat_emoji = {"LOCAL":"🇲🇻","FOOTBALL":"⚽","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(cat,"📰")
-        caption = (
-            f"{cat_emoji} {article['title']}\n\n"
-            f"{rewritten}\n\n"
-            f"📡 Samuga Media | @samugacommunity"
-        )
-        card.seek(0)
-        threading.Thread(target=post_to_social, args=(card, caption), daemon=True).start()
-        seen.add(article["id"])
-        save_seen(seen)
-        return False
+    # In social_only mode — skip Telegram, only post to social
+    if not social_only:
+        if not breaking and not can_post_regular():
+            mins_left = int((7200 - (datetime.utcnow() - last_regular_post_time).total_seconds()) / 60)
+            log.info(f"⏳ [{cat}] Telegram throttled — {mins_left} mins left | posting to social only")
+            rewritten, keyword = rewrite_news(article["title"], article["summary"], cat)
+            bg = fetch_background_image(keyword)
+            ts = datetime.now().strftime("%d %b %Y • %H:%M")
+            card = generate_card(rewritten, article["source"], ts, cat, bg)
+            cat_emoji = {"LOCAL":"🇲🇻","FOOTBALL":"⚽","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(cat,"📰")
+            caption = f"{cat_emoji} {article['title']}\n\n{rewritten}\n\n📡 Samuga Media | @samugacommunity"
+            card.seek(0)
+            threading.Thread(target=post_to_social, args=(card, caption), daemon=True).start()
+            seen.add(article["id"])
+            save_seen(seen)
+            return False
 
     log.info(f"📰 [{'🔴 BREAKING' if breaking else '🟡 REGULAR'}][{cat}] {article['title'][:60]}...")
     rewritten, keyword = rewrite_news(article["title"], article["summary"], cat)
@@ -548,6 +544,16 @@ def post_article(article, seen):
         f"📡 <b>Samuga Media</b> | @samugacommunity"
     )
 
+    # Social only mode — skip Telegram, only post to social
+    if social_only:
+        card.seek(0)
+        threading.Thread(target=post_to_social, args=(card, caption), daemon=True).start()
+        seen.add(article["id"])
+        save_seen(seen)
+        remember_post(article["title"], cat, ts)
+        log.info(f"📱 Social only post done [{cat}]")
+        return True
+
     if send_to_telegram(card, caption):
         seen.add(article["id"])
         save_seen(seen)
@@ -563,9 +569,10 @@ def post_article(article, seen):
         return True
     return False
 
-def run_job():
+def run_job(social_only=False):
     h = get_mvt_hour()
-    log.info(f"🕐 MVT {h:02d}:xx | {'DAY' if is_day_mode() else 'NIGHT'} mode")
+    mode = "SOCIAL ONLY" if social_only else ("DAY" if is_day_mode() else "NIGHT")
+    log.info(f"🕐 MVT {h:02d}:xx | {mode} mode")
     seen     = load_seen()
     articles = fetch_news()
 
@@ -598,9 +605,9 @@ def run_job():
     # Post ALL breaking news immediately — no throttle
     for article in breaking_articles:
         log.info(f"🚀 BREAKING [{article['cat']}]...")
-        if post_article(article, seen):
+        if post_article(article, seen, social_only=social_only):
             posted += 1
-            time.sleep(10)  # small gap between breaking posts
+            time.sleep(10)
 
     # Post regular — one per category, respects 2hr throttle
     order = ["LOCAL", "WORLD", "FOOTBALL", "TOURISM", "WEATHER"]
@@ -609,7 +616,7 @@ def run_job():
             continue
         article = by_cat[cat]
         log.info(f"🚀 Regular [{cat}]...")
-        if post_article(article, seen):
+        if post_article(article, seen, social_only=social_only):
             posted += 1
             if posted < len(by_cat):
                 log.info(f"⏳ Waiting 5 mins before next category...")
@@ -620,7 +627,9 @@ def run_job():
 def scheduled_check():
     h = get_mvt_hour()
     if not is_day_mode() and h not in [18, 21, 0, 3, 6]:
-        log.info(f"💤 Night skip (MVT {h:02d}:xx)")
+        # Night skip for Telegram — but still run for social media!
+        log.info(f"💤 Night mode (MVT {h:02d}:xx) — social only run")
+        run_job(social_only=True)
         return
     run_job()
 
