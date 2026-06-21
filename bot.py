@@ -46,8 +46,9 @@ RSS_FEEDS = [
     # 🌍 World News
     {"url": "https://news.google.com/rss/search?q=war+conflict+breaking&hl=en&gl=US&ceid=US:en", "cat": "WORLD", "lang": "en"},
     {"url": "https://news.google.com/rss/search?q=breaking+news+world&hl=en&gl=US&ceid=US:en", "cat": "WORLD", "lang": "en"},
-    # 🌊 Disasters
-    {"url": "https://news.google.com/rss/search?q=earthquake+tsunami+volcanic+eruption&hl=en&gl=US&ceid=US:en", "cat": "DISASTER", "lang": "en"},
+    # 🚨 MVCrisis — Maldives Breaking News (via Google News)
+    {"url": "https://news.google.com/rss/search?q=maldives+breaking+site:twitter.com/mvcrisis+OR+mvcrisis&hl=en&gl=MV&ceid=MV:en", "cat": "DISASTER", "lang": "en"},
+    {"url": "https://news.google.com/rss/search?q=maldives+accident+incident+breaking&hl=en&gl=MV&ceid=MV:en", "cat": "DISASTER", "lang": "en"},
     # 🌤️ Weather Maldives
     {"url": "https://news.google.com/rss/search?q=maldives+weather+storm&hl=en&gl=US&ceid=US:en", "cat": "WEATHER", "lang": "en"},
     # ✈️ Tourism
@@ -366,27 +367,71 @@ def get_mvt_hour():
 def is_day_mode():
     return 7 <= get_mvt_hour() < 18
 
-# ── Main job ──────────────────────────────────────────────────────────────────
+# ── Two-tier posting logic ────────────────────────────────────────────────────
+BREAKING_KEYWORDS = [
+    "breaking", "urgent", "alert", "killed", "dead", "dies", "explosion",
+    "crash", "attack", "arrested", "emergency", "disaster", "flood", "fire",
+    "missing", "tsunami", "earthquake", "accident", "murder", "bomb",
+    "resign", "crisis", "leaked", "scandal", "raid", "collapse", "shot",
+    "war", "strike", "invasion", "hostage", "trapped", "sinking"
+]
+
+# Track last regular post time to enforce 2hr limit
+last_regular_post_time = None
+
+def is_breaking(title, summary="", cat=""):
+    text = (title + " " + summary).lower()
+    return any(kw in text for kw in BREAKING_KEYWORDS) or cat == "DISASTER"
+
+def can_post_regular():
+    """Regular news: max 1 post per 2 hours on Telegram"""
+    global last_regular_post_time
+    if last_regular_post_time is None:
+        return True
+    elapsed = (datetime.utcnow() - last_regular_post_time).total_seconds()
+    return elapsed >= 7200  # 2 hours
+
 def post_article(article, seen):
     """Process and post a single article. Returns True if posted."""
+    global last_regular_post_time
     cat = article["cat"]
-    log.info(f"📰 [{cat}] {article['title'][:60]}...")
+    breaking = is_breaking(article["title"], article["summary"], cat)
+
+    # Check if regular post is allowed
+    if not breaking and not can_post_regular():
+        mins_left = int((7200 - (datetime.utcnow() - last_regular_post_time).total_seconds()) / 60)
+        log.info(f"⏳ [{cat}] Regular post throttled — {mins_left} mins until next allowed")
+        # Still mark as seen so we don't repost later
+        seen.add(article["id"])
+        save_seen(seen)
+        return False
+
+    log.info(f"📰 [{'🔴 BREAKING' if breaking else '🟡 REGULAR'}][{cat}] {article['title'][:60]}...")
     rewritten, keyword = rewrite_news(article["title"], article["summary"], cat)
     log.info(f"🖼️ Keyword: {keyword}")
     bg = fetch_background_image(keyword)
     ts = datetime.now().strftime("%d %b %Y • %H:%M")
     card = generate_card(rewritten, article["source"], ts, cat, bg)
     cat_emoji = {"LOCAL":"🇲🇻","FOOTBALL":"⚽","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(cat,"📰")
+
+    # Add BREAKING tag to caption if breaking
+    breaking_tag = "🚨 <b>BREAKING NEWS</b>\n\n" if breaking else ""
     caption = (
-        f"{cat_emoji} <b>{article['title']}</b>\n\n"
+        f"{breaking_tag}{cat_emoji} <b>{article['title']}</b>\n\n"
         f"{rewritten}\n\n"
         f"🔗 <a href='{article['link']}'>Read more</a>\n\n"
         f"📡 <b>Samuga Media</b> | @samugacommunity"
     )
+
     if send_to_telegram(card, caption):
         seen.add(article["id"])
         save_seen(seen)
         remember_post(article["title"], cat, ts)
+        if not breaking:
+            last_regular_post_time = datetime.utcnow()
+            log.info(f"🕐 Regular post timer reset — next regular in 2hrs")
+        else:
+            log.info(f"🔴 Breaking news posted immediately!")
         return True
     return False
 
@@ -396,33 +441,51 @@ def run_job():
     seen     = load_seen()
     articles = fetch_news()
 
-    # Group fresh unseen articles by category
+    # Also check MVCrisis for breaking Maldives news
+    mvcrisis_articles = check_mvcrisis()
+    articles = mvcrisis_articles + articles
+
+    # Separate breaking vs regular, group by category
+    breaking_articles = []
     by_cat = {}
+
     for article in articles:
         if article["id"] in seen:
             continue
         cat = article["cat"]
-        if cat not in by_cat:
-            by_cat[cat] = article  # only first/freshest per category
+        if is_breaking(article["title"], article["summary"], cat):
+            breaking_articles.append(article)
+        elif cat not in by_cat:
+            by_cat[cat] = article
 
-    if not by_cat:
+    total = len(breaking_articles) + len(by_cat)
+    if total == 0:
         log.info("No fresh articles this run.")
         return
 
-    # Post order priority
-    order = ["DISASTER", "LOCAL", "WORLD", "FOOTBALL", "TOURISM", "WEATHER"]
+    log.info(f"🔴 {len(breaking_articles)} breaking | 🟡 {len(by_cat)} regular")
+
     posted = 0
 
+    # Post ALL breaking news immediately — no throttle
+    for article in breaking_articles:
+        log.info(f"🚀 BREAKING [{article['cat']}]...")
+        if post_article(article, seen):
+            posted += 1
+            time.sleep(10)  # small gap between breaking posts
+
+    # Post regular — one per category, respects 2hr throttle
+    order = ["LOCAL", "WORLD", "FOOTBALL", "TOURISM", "WEATHER"]
     for cat in order:
         if cat not in by_cat:
             continue
         article = by_cat[cat]
-        log.info(f"🚀 Posting [{cat}]...")
+        log.info(f"🚀 Regular [{cat}]...")
         if post_article(article, seen):
             posted += 1
             if posted < len(by_cat):
-                log.info(f"⏳ Waiting 5 mins before next category post...")
-                time.sleep(300)  # 5 min gap between posts
+                log.info(f"⏳ Waiting 5 mins before next category...")
+                time.sleep(300)
 
     log.info(f"✅ Posted {posted} articles this run.")
 
@@ -491,7 +554,56 @@ def tavily_search(query):
         log.error(f"Tavily exception: {e}")
     return ""
 
-def needs_web_search(message):
+def check_mvcrisis():
+    """Check MVCrisis for latest breaking Maldives news via Tavily"""
+    if not TAVILY_API_KEY:
+        return []
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": TAVILY_API_KEY,
+                "query": "site:t.me/mvcrisis OR site:twitter.com/mvcrisis Maldives breaking news latest",
+                "search_depth": "basic",
+                "max_results": 5,
+                "include_answer": False,
+            },
+            timeout=15
+        )
+        if resp.status_code == 200:
+            results = resp.json().get("results", [])
+            articles = []
+            for r in results:
+                title = r.get("title", "")
+                content = r.get("content", "")
+                if title and is_fresh_by_date(r.get("published_date", "")):
+                    article_id = hashlib.md5(r.get("url", title).encode()).hexdigest()
+                    articles.append({
+                        "id": article_id,
+                        "title": title,
+                        "summary": content[:300],
+                        "link": r.get("url", "https://t.me/mvcrisis"),
+                        "source": "MVCrisis",
+                        "cat": "DISASTER",
+                    })
+            log.info(f"🚨 MVCrisis found {len(articles)} articles")
+            return articles
+    except Exception as e:
+        log.error(f"MVCrisis search error: {e}")
+    return []
+
+def is_fresh_by_date(date_str, hours=24):
+    """Check if a date string is within last 24 hours"""
+    try:
+        if not date_str:
+            return True
+        from dateutil import parser as dateparser
+        dt = dateparser.parse(date_str)
+        if dt and dt.tzinfo:
+            dt = dt.replace(tzinfo=None)
+        return datetime.utcnow() - dt < timedelta(hours=hours)
+    except:
+        return True
     """Decide if message needs real-time web search"""
     keywords = [
         "latest", "today", "now", "current", "happening", "news",
