@@ -462,20 +462,11 @@ def post_article(article, seen, social_only=False):
     cat_emoji={"LOCAL":"🇲🇻","FOOTBALL":"⚽","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(cat,"📰")
     breaking_tag="🚨 <b>BREAKING NEWS</b>\n\n" if breaking else ""
 
-    # Generate Dhivehi caption via Gemini
-    dv_caption = make_dhivehi_caption(rewritten, article["title"])
-    if dv_caption:
-        caption = (f"{breaking_tag}{cat_emoji} <b>{article['title']}</b>\n\n"
-                   f"{dv_caption}\n\n"
-                   f"🔗 <a href='{article['link']}'>އިތުރަށް ކިޔުއްވާ</a>\n\n"
-                   f"📡 <b>ސަމުގަ މީޑިއާ</b> | @samugacommunity")
-    else:
-        caption = (f"{breaking_tag}{cat_emoji} <b>{article['title']}</b>\n\n"
-                   f"{rewritten}\n\n"
-                   f"🔗 <a href='{article['link']}'>Read more</a>\n\n"
-                   f"📡 <b>Samuga Media</b> | @samugacommunity")
+    caption = (f"{breaking_tag}{cat_emoji} <b>{article['title']}</b>\n\n"
+               f"{rewritten}\n\n"
+               f"🔗 <a href='{article['link']}'>Read more</a>\n\n"
+               f"📡 <b>Samuga Media</b> | @samugacommunity")
 
-    # Social caption always in Dhivehi if available
     social_caption = caption
 
     # Social only (night mode)
@@ -630,32 +621,33 @@ def is_dhivehi(text):
     return any('\u0780' <= c <= '\u07BF' for c in text)
 
 def chat_with_gemini_dhivehi(user_message, context=""):
-    """Handle Dhivehi chat via Gemini"""
-    if not GEMINI_API_KEY:
-        return None
+    """Handle Dhivehi chat using Claude with strong Dhivehi prompt"""
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-        prompt = f"""You are Samuga AI, a friendly Maldivian news assistant for Samuga Media.
+        system = f"""You are Samuga AI, a Maldivian news assistant. The user is writing in Dhivehi.
 
-The user is writing to you in Dhivehi. You MUST reply in natural, clear Dhivehi (Thaana script).
+YOU MUST reply ONLY in Dhivehi (Thaana script). Do not write any English words at all.
 
-{f"Latest Maldives news context:{chr(10)}{context}" if context else ""}
+{"Latest news: " + context if context else ""}
 
-About Samuga Media: A Maldivian news outlet. Our Telegram channel is @samugacommunity.
-Founder: Abdul Muhsin (Manchii). Co-Founder: Mariyam Ulya.
+Samuga Media is a Maldivian news outlet. Channel: @samugacommunity
+Founder: Abdul Muhsin (Manchii). Co-Founder: Mariyam Ulya (Uly).
 
-User message in Dhivehi: {user_message}
+Rules:
+- Reply in natural conversational Dhivehi only
+- Max 3 sentences
+- Mention @samugacommunity if relevant"""
 
-Reply in natural conversational Dhivehi. Keep it short (2-3 sentences). 
-Always mention @samugacommunity for more news if relevant."""
-
-        resp = requests.post(url, json={"contents":[{"parts":[{"text":prompt}]}]}, timeout=15)
-        if resp.status_code == 200:
-            reply = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            log.info("✅ Gemini Dhivehi chat reply done")
-            return reply
+        msg = ai.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            system=system,
+            messages=[{"role":"user","content":user_message}]
+        )
+        reply = msg.content[0].text.strip()
+        log.info("✅ Dhivehi reply done")
+        return reply
     except Exception as e:
-        log.error(f"Gemini Dhivehi chat: {e}")
+        log.error(f"Dhivehi chat error: {e}")
     return None
 
 def chat_with_claude(user_message, user_id=None):
