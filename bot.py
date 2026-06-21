@@ -310,6 +310,95 @@ def send_text(chat_id, text, reply_to=None):
     try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",json=payload,timeout=15)
     except Exception as e: log.error(f"Send text: {e}")
 
+# ── Gemini Dhivehi Caption ────────────────────────────────────────────────────
+def make_dhivehi_caption(english_text, title):
+    """Convert English news caption to Dhivehi using Gemini"""
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        prompt = f"""You are a Maldivian news writer. Write a short news caption in Dhivehi (Thaana script) for this news.
+
+English title: {title}
+English summary: {english_text}
+
+Write 2-3 sentences in natural Dhivehi as it would appear in a Maldivian news channel.
+Return ONLY the Dhivehi text, nothing else."""
+
+        resp = requests.post(url, json={"contents":[{"parts":[{"text":prompt}]}]}, timeout=15)
+        if resp.status_code == 200:
+            dv_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            log.info(f"✅ Gemini Dhivehi caption done")
+            return dv_text
+    except Exception as e:
+        log.error(f"Gemini Dhivehi caption: {e}")
+    return None
+
+# ── Auto Poll ─────────────────────────────────────────────────────────────────
+POLL_KEYWORDS = [
+    "government","president","parliament","minister","policy","law","vote","election",
+    "decision","budget","tax","fee","regulation","announce","reform","appointed",
+    "resign","fired","arrested","court","judge","sentence","verdict","accused",
+    "protest","rally","strike","ban","approve","reject","pass","failed"
+]
+
+def should_create_poll(title, summary, cat):
+    """Check if news warrants a poll"""
+    if cat not in ["LOCAL", "WORLD"]: return False
+    text = (title + " " + summary).lower()
+    return any(kw in text for kw in POLL_KEYWORDS)
+
+def generate_poll_question(title, rewritten):
+    """Use Claude to generate a relevant poll question"""
+    try:
+        msg = ai.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{"role":"user","content":f"""Based on this news, create a simple Telegram poll.
+
+News: {title}
+Summary: {rewritten}
+
+Return EXACTLY in this format (nothing else):
+QUESTION: [one short poll question in English]
+OPT1: [option 1, max 4 words]
+OPT2: [option 2, max 4 words]
+OPT3: [option 3, max 4 words]
+
+Keep it simple, neutral and relevant to the news."""}]
+        )
+        text = msg.content[0].text.strip()
+        question, options = "", []
+        for line in text.split('\n'):
+            if line.startswith("QUESTION:"): question = line[9:].strip()
+            elif line.startswith("OPT"): options.append(line.split(":",1)[1].strip())
+        return question, options[:3]
+    except Exception as e:
+        log.error(f"Poll generation: {e}")
+        return None, []
+
+def send_poll(question, options):
+    """Send a Telegram poll to the channel"""
+    if not question or len(options) < 2:
+        return
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPoll",
+            json={
+                "chat_id": TELEGRAM_CHANNEL_ID,
+                "question": f"🗳️ {question}",
+                "options": options,
+                "is_anonymous": True,
+            },
+            timeout=15
+        )
+        if resp.status_code == 200:
+            log.info(f"✅ Poll sent: {question[:50]}")
+        else:
+            log.error(f"Poll error: {resp.status_code}")
+    except Exception as e:
+        log.error(f"Poll send: {e}")
+
 # ── Buffer / Social ───────────────────────────────────────────────────────────
 def upload_to_imgbb(img_bytes):
     if not IMGBB_API_KEY: return None
@@ -372,13 +461,27 @@ def post_article(article, seen, social_only=False):
 
     cat_emoji={"LOCAL":"🇲🇻","FOOTBALL":"⚽","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(cat,"📰")
     breaking_tag="🚨 <b>BREAKING NEWS</b>\n\n" if breaking else ""
-    caption=(f"{breaking_tag}{cat_emoji} <b>{article['title']}</b>\n\n{rewritten}\n\n"
-             f"🔗 <a href='{article['link']}'>Read more</a>\n\n📡 <b>Samuga Media</b> | @samugacommunity")
+
+    # Generate Dhivehi caption via Gemini
+    dv_caption = make_dhivehi_caption(rewritten, article["title"])
+    if dv_caption:
+        caption = (f"{breaking_tag}{cat_emoji} <b>{article['title']}</b>\n\n"
+                   f"{dv_caption}\n\n"
+                   f"🔗 <a href='{article['link']}'>އިތުރަށް ކިޔުއްވާ</a>\n\n"
+                   f"📡 <b>ސަމުގަ މީޑިއާ</b> | @samugacommunity")
+    else:
+        caption = (f"{breaking_tag}{cat_emoji} <b>{article['title']}</b>\n\n"
+                   f"{rewritten}\n\n"
+                   f"🔗 <a href='{article['link']}'>Read more</a>\n\n"
+                   f"📡 <b>Samuga Media</b> | @samugacommunity")
+
+    # Social caption always in Dhivehi if available
+    social_caption = caption
 
     # Social only (night mode)
     if social_only:
         card.seek(0)
-        threading.Thread(target=post_to_social,args=(card,caption),daemon=True).start()
+        threading.Thread(target=post_to_social,args=(card,social_caption),daemon=True).start()
         seen.add(article["id"]); save_seen(seen); remember_post(article["title"],cat,ts)
         log.info(f"📱 Social only [{cat}]"); return True
 
@@ -387,7 +490,7 @@ def post_article(article, seen, social_only=False):
         mins=int((7200-(datetime.utcnow()-last_regular_post_time).total_seconds())/60)
         log.info(f"⏳ [{cat}] Telegram throttled {mins}m — social only")
         card.seek(0)
-        threading.Thread(target=post_to_social,args=(card,caption),daemon=True).start()
+        threading.Thread(target=post_to_social,args=(card,social_caption),daemon=True).start()
         seen.add(article["id"]); save_seen(seen); return False
 
     log.info(f"📰 [{'🔴BREAKING' if breaking else '🟡REGULAR'}][{cat}] {article['title'][:60]}...")
@@ -398,7 +501,16 @@ def post_article(article, seen, social_only=False):
             log.info("🕐 Regular timer reset — next in 2hrs")
         else: log.info("🔴 Breaking posted!")
         card.seek(0)
-        threading.Thread(target=post_to_social,args=(card,caption),daemon=True).start()
+        threading.Thread(target=post_to_social,args=(card,social_caption),daemon=True).start()
+
+        # Auto poll for political/government news
+        if should_create_poll(article["title"], article["summary"], cat):
+            log.info("🗳️ Generating poll...")
+            question, options = generate_poll_question(article["title"], rewritten)
+            if question and options:
+                time.sleep(3)
+                send_poll(question, options)
+
         return True
     return False
 
@@ -513,6 +625,33 @@ def needs_web_search(msg):
     return any(k in msg.lower() for k in kws)
 
 # ── Smart Chat ────────────────────────────────────────────────────────────────
+def is_dhivehi(text):
+    """Check if text contains Thaana script (Dhivehi)"""
+    return any('\u0780' <= c <= '\u07BF' for c in text)
+
+def chat_with_gemini_dhivehi(user_message, context=""):
+    """Handle Dhivehi chat via Gemini"""
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        prompt = f"""ތިބާ ތީ ސަމުގަ އޭ އައި — ސަމުގަ މީޑިއާގެ ޚަބަރު އެހީތެރިޔާ.
+
+{f"މިހާރު ހިނގަމުންދާ ޚަބަރުތައް:{chr(10)}{context}" if context else ""}
+
+ސުވާލު: {user_message}
+
+ދިވެހިން ޖަވާބު ދޭށެ. ކުރު، ސާދާ، 3-4 ޖުމްލަ. @samugacommunity ޗެނެލަށް ފޮނުވާލާ ވިދާޅުވޭ."""
+
+        resp = requests.post(url, json={"contents":[{"parts":[{"text":prompt}]}]}, timeout=15)
+        if resp.status_code == 200:
+            reply = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            log.info("✅ Gemini Dhivehi chat reply done")
+            return reply
+    except Exception as e:
+        log.error(f"Gemini Dhivehi chat: {e}")
+    return None
+
 def chat_with_claude(user_message, user_id=None):
     try:
         headlines=[]
@@ -595,6 +734,7 @@ def handle_updates():
                         send_text(chat_id,
                             f"👋 Hey {user_name}! I'm <b>Samuga AI</b> — your Maldives news assistant!\n\n"
                             f"Ask me anything about Maldives news, politics, tourism, football or world news.\n\n"
+                            f"ދިވެހިން ވެސް ވާހަކަ ދެއްކިދާނެ! 🇲🇻\n\n"
                             f"📡 Follow <b>@samugacommunity</b> for live news updates!",reply_to=msg_id)
                     elif text.startswith("/search "):
                         query=text[8:].strip()
@@ -604,14 +744,31 @@ def handle_updates():
                         send_text(chat_id, reply, reply_to=msg_id)
                     else:
                         log.info(f"💬 DM {user_name}: {text[:50]}")
-                        send_text(chat_id, chat_with_claude(text, user_id), reply_to=msg_id)
+                        # Route Dhivehi to Gemini
+                        if is_dhivehi(text):
+                            log.info("🇲🇻 Dhivehi detected — using Gemini")
+                            headlines = get_local_headlines()
+                            context = "\n".join(headlines[:5]) if headlines else ""
+                            reply = chat_with_gemini_dhivehi(text, context)
+                            if not reply:
+                                reply = chat_with_claude(text, user_id)
+                        else:
+                            reply = chat_with_claude(text, user_id)
+                        send_text(chat_id, reply, reply_to=msg_id)
 
                 elif chat_type in ["group","supergroup"]:
                     if bot_mention in text.lower():
                         clean=text.lower().replace(bot_mention,"").strip()
                         if clean:
                             log.info(f"💬 Group {user_name}: {clean[:50]}")
-                            send_text(chat_id, chat_with_claude(clean, user_id), reply_to=msg_id)
+                            if is_dhivehi(clean):
+                                log.info("🇲🇻 Dhivehi group mention — using Gemini")
+                                headlines = get_local_headlines()
+                                context = "\n".join(headlines[:5]) if headlines else ""
+                                reply = chat_with_gemini_dhivehi(clean, context) or chat_with_claude(clean, user_id)
+                            else:
+                                reply = chat_with_claude(clean, user_id)
+                            send_text(chat_id, reply, reply_to=msg_id)
         except Exception as e:
             log.error(f"Update loop: {e}"); time.sleep(5)
 
