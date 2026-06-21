@@ -746,6 +746,20 @@ def is_fresh_by_date(date_str, hours=24):
     msg_lower = message.lower()
     return any(kw in msg_lower for kw in keywords)
 
+def needs_web_search(message):
+    """Decide if message needs real-time web search"""
+    keywords = [
+        "latest", "today", "now", "current", "happening", "news",
+        "score", "match", "result", "win", "won", "lost", "lose", "goal", "goals",
+        "weather", "storm", "earthquake", "tsunami", "war", "attack",
+        "price", "stock", "update", "recently", "just", "breaking",
+        "who", "when", "which team", "final", "semi", "quarter",
+        "champion", "tournament", "league", "cup", "world cup",
+        "killed", "dead", "crash", "accident", "fire", "flood",
+        "yesterday", "last night", "this week", "election", "vote"
+    ]
+    return any(kw in message.lower() for kw in keywords)
+
 def chat_with_claude(user_message):
     try:
         # Get local headlines for context
