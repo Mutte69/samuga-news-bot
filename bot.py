@@ -900,4 +900,4 @@ if __name__ == "__main__":
     scheduler = BlockingScheduler()
     scheduler.add_job(scheduled_check, "interval", minutes=30)
     log.info("⏰ Scheduler started — first run in 30 minutes")
-    scheduler.start()v
+    scheduler.start()
