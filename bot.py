@@ -376,6 +376,104 @@ def send_to_telegram(buf, caption):
         log.error(f"Telegram error: {e}")
         return False
 
+# ── Buffer Social Media Posting ───────────────────────────────────────────────
+BUFFER_TOKEN   = os.environ.get("BUFFER_ACCESS_TOKEN", "")
+BUFFER_ORG_ID  = os.environ.get("BUFFER_ORG_ID", "")
+BUFFER_FB_ID   = os.environ.get("BUFFER_FACEBOOK_ID", "")
+BUFFER_IG_ID   = os.environ.get("BUFFER_INSTAGRAM_ID", "")
+BUFFER_TW_ID   = os.environ.get("BUFFER_TWITTER_ID", "")
+
+def upload_image_to_buffer(img_bytes):
+    """Upload image to a hosting service to get public URL for Buffer"""
+    try:
+        # Use Telegram file as image source — upload to imgbb (free)
+        IMGBB_KEY = os.environ.get("IMGBB_API_KEY", "")
+        if not IMGBB_KEY:
+            return None
+        import base64
+        img_b64 = base64.b64encode(img_bytes).decode()
+        resp = requests.post(
+            "https://api.imgbb.com/1/upload",
+            data={"key": IMGBB_KEY, "image": img_b64},
+            timeout=20
+        )
+        if resp.status_code == 200:
+            url = resp.json()["data"]["url"]
+            log.info(f"✅ Image uploaded to imgbb: {url[:50]}")
+            return url
+    except Exception as e:
+        log.error(f"Image upload error: {e}")
+    return None
+
+def post_to_buffer(image_url, caption, channel_ids):
+    """Post to multiple Buffer channels via GraphQL API"""
+    if not BUFFER_TOKEN or not image_url:
+        return False
+    try:
+        # Clean caption — remove HTML tags for social media
+        import re
+        clean_caption = re.sub(r'<[^>]+>', '', caption)
+        clean_caption = clean_caption.replace('&amp;', '&').strip()
+
+        query = """
+        mutation CreatePost($input: CreatePostInput!) {
+            createPost(input: $input) {
+                post {
+                    id
+                    status
+                }
+            }
+        }
+        """
+        for channel_id in channel_ids:
+            if not channel_id:
+                continue
+            variables = {
+                "input": {
+                    "channelId": channel_id,
+                    "content": {
+                        "text": clean_caption[:2200],
+                        "media": [{"url": image_url, "type": "image"}]
+                    }
+                }
+            }
+            resp = requests.post(
+                "https://api.buffer.com/graphql",
+                json={"query": query, "variables": variables},
+                headers={"Authorization": f"Bearer {BUFFER_TOKEN}"},
+                timeout=20
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if "errors" in data:
+                    log.error(f"Buffer error [{channel_id[:8]}]: {data['errors']}")
+                else:
+                    log.info(f"✅ Posted to Buffer channel: {channel_id[:8]}...")
+            else:
+                log.error(f"Buffer HTTP error: {resp.status_code}")
+            time.sleep(2)
+        return True
+    except Exception as e:
+        log.error(f"Buffer exception: {e}")
+        return False
+
+def post_to_social(img_buf, caption):
+    """Post card to Facebook, Instagram, X via Buffer — every 30 mins"""
+    if not BUFFER_TOKEN:
+        log.info("No Buffer token — skipping social post")
+        return
+    try:
+        img_bytes = img_buf.getvalue()
+        image_url = upload_image_to_buffer(img_bytes)
+        if not image_url:
+            log.warning("No image URL — skipping Buffer post")
+            return
+        channel_ids = [BUFFER_FB_ID, BUFFER_IG_ID, BUFFER_TW_ID]
+        if post_to_buffer(image_url, caption, channel_ids):
+            log.info("✅ Posted to all social channels via Buffer!")
+    except Exception as e:
+        log.error(f"Social post error: {e}")
+
 def get_mvt_hour():
     return (datetime.utcnow().hour + 5) % 24
 
@@ -391,7 +489,7 @@ BREAKING_KEYWORDS = [
     "war", "strike", "invasion", "hostage", "trapped", "sinking"
 ]
 
-# Track last regular post time to enforce 2hr limit
+# Track last regular post time to enforce 2hr Telegram limit
 last_regular_post_time = None
 
 def is_breaking(title, summary="", cat=""):
@@ -412,11 +510,23 @@ def post_article(article, seen):
     cat = article["cat"]
     breaking = is_breaking(article["title"], article["summary"], cat)
 
-    # Check if regular post is allowed
+    # Check if regular post is allowed on Telegram
     if not breaking and not can_post_regular():
         mins_left = int((7200 - (datetime.utcnow() - last_regular_post_time).total_seconds()) / 60)
-        log.info(f"⏳ [{cat}] Regular post throttled — {mins_left} mins until next allowed")
-        # Still mark as seen so we don't repost later
+        log.info(f"⏳ [{cat}] Telegram throttled — {mins_left} mins left | posting to social only")
+        # Still post to social media even if Telegram is throttled!
+        rewritten, keyword = rewrite_news(article["title"], article["summary"], cat)
+        bg = fetch_background_image(keyword)
+        ts = datetime.now().strftime("%d %b %Y • %H:%M")
+        card = generate_card(rewritten, article["source"], ts, cat, bg)
+        cat_emoji = {"LOCAL":"🇲🇻","FOOTBALL":"⚽","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(cat,"📰")
+        caption = (
+            f"{cat_emoji} {article['title']}\n\n"
+            f"{rewritten}\n\n"
+            f"📡 Samuga Media | @samugacommunity"
+        )
+        card.seek(0)
+        threading.Thread(target=post_to_social, args=(card, caption), daemon=True).start()
         seen.add(article["id"])
         save_seen(seen)
         return False
@@ -447,6 +557,9 @@ def post_article(article, seen):
             log.info(f"🕐 Regular post timer reset — next regular in 2hrs")
         else:
             log.info(f"🔴 Breaking news posted immediately!")
+        # Post to social media via Buffer (every 3hrs)
+        card.seek(0)
+        threading.Thread(target=post_to_social, args=(card, caption), daemon=True).start()
         return True
     return False
 
@@ -787,4 +900,4 @@ if __name__ == "__main__":
     scheduler = BlockingScheduler()
     scheduler.add_job(scheduled_check, "interval", minutes=30)
     log.info("⏰ Scheduler started — first run in 30 minutes")
-    scheduler.start()
+    scheduler.start()v
