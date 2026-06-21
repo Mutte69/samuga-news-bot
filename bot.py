@@ -337,8 +337,114 @@ def scheduled_check():
 if __name__ == "__main__":
     log.info("🚀 Samuga News Bot starting...")
     log.info("📅 7AM-6PM MVT: every 30min | 6PM-7AM MVT: every 3hrs")
+    log.info("💬 Chat assistant active — DMs + group mentions")
+
+    # Start chat listener in background thread
+    chat_thread = threading.Thread(target=handle_updates, daemon=True)
+    chat_thread.start()
+
     run_job()
     scheduler = BlockingScheduler()
     scheduler.add_job(scheduled_check, "interval", minutes=30)
     log.info("⏰ Scheduler started")
     scheduler.start()
+
+# ── Chat Assistant ────────────────────────────────────────────────────────────
+import threading
+
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "SamugaNewsBot")
+
+def chat_with_claude(user_message, user_name):
+    try:
+        msg = ai.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=500,
+            system="""You are Samuga AI, the assistant for Samuga Media — a Maldivian digital media outlet.
+You help people with:
+- Latest news about the Maldives
+- Questions about Maldivian politics, tourism, culture, economy
+- General questions
+- Info about Samuga Media and the @samugacommunity Telegram channel
+
+Keep responses short, friendly and conversational. Max 3-4 sentences.
+Always respond in English. If asked about very recent news, mention they can check @samugacommunity for the latest updates.
+You are powered by Claude AI by Anthropic.""",
+            messages=[{"role": "user", "content": user_message}]
+        )
+        return msg.content[0].text.strip()
+    except Exception as e:
+        log.error(f"Chat Claude error: {e}")
+        return "Sorry, I'm having trouble right now. Please try again in a moment! 🙏"
+
+def send_text(chat_id, text, reply_to=None):
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json=payload, timeout=15
+        )
+    except Exception as e:
+        log.error(f"Send text error: {e}")
+
+def handle_updates():
+    offset = 0
+    bot_mention = f"@{BOT_USERNAME}".lower()
+
+    while True:
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                params={"offset": offset, "timeout": 30},
+                timeout=40
+            )
+            if resp.status_code != 200:
+                time.sleep(5)
+                continue
+
+            updates = resp.json().get("result", [])
+            for update in updates:
+                offset = update["update_id"] + 1
+                msg = update.get("message", {})
+                if not msg:
+                    continue
+
+                text = msg.get("text", "")
+                if not text:
+                    continue
+
+                chat_id   = msg["chat"]["id"]
+                msg_id    = msg["message_id"]
+                chat_type = msg["chat"]["type"]
+                user_name = msg.get("from", {}).get("first_name", "there")
+
+                # DM — always respond
+                if chat_type == "private":
+                    if text.startswith("/start"):
+                        send_text(chat_id,
+                            f"👋 Hey {user_name}! I'm <b>Samuga AI</b> — your Maldives news assistant!\n\n"
+                            f"Ask me anything about Maldives news, politics, tourism or culture.\n\n"
+                            f"📡 Follow <b>@samugacommunity</b> for live news updates!",
+                            reply_to=msg_id)
+                    else:
+                        log.info(f"💬 DM from {user_name}: {text[:50]}")
+                        reply = chat_with_claude(text, user_name)
+                        send_text(chat_id, reply, reply_to=msg_id)
+
+                # Group — only respond when mentioned
+                elif chat_type in ["group", "supergroup"]:
+                    if bot_mention in text.lower():
+                        clean = text.lower().replace(bot_mention, "").strip()
+                        if clean:
+                            log.info(f"💬 Group mention from {user_name}: {clean[:50]}")
+                            reply = chat_with_claude(clean, user_name)
+                            send_text(chat_id, reply, reply_to=msg_id)
+
+        except Exception as e:
+            log.error(f"Update loop error: {e}")
+            time.sleep(5)
