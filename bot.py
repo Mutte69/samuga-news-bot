@@ -367,44 +367,63 @@ def is_day_mode():
     return 7 <= get_mvt_hour() < 18
 
 # ── Main job ──────────────────────────────────────────────────────────────────
+def post_article(article, seen):
+    """Process and post a single article. Returns True if posted."""
+    cat = article["cat"]
+    log.info(f"📰 [{cat}] {article['title'][:60]}...")
+    rewritten, keyword = rewrite_news(article["title"], article["summary"], cat)
+    log.info(f"🖼️ Keyword: {keyword}")
+    bg = fetch_background_image(keyword)
+    ts = datetime.now().strftime("%d %b %Y • %H:%M")
+    card = generate_card(rewritten, article["source"], ts, cat, bg)
+    cat_emoji = {"LOCAL":"🇲🇻","FOOTBALL":"⚽","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(cat,"📰")
+    caption = (
+        f"{cat_emoji} <b>{article['title']}</b>\n\n"
+        f"{rewritten}\n\n"
+        f"🔗 <a href='{article['link']}'>Read more</a>\n\n"
+        f"📡 <b>Samuga Media</b> | @samugacommunity"
+    )
+    if send_to_telegram(card, caption):
+        seen.add(article["id"])
+        save_seen(seen)
+        return True
+    return False
+
 def run_job():
     h = get_mvt_hour()
     log.info(f"🕐 MVT {h:02d}:xx | {'DAY' if is_day_mode() else 'NIGHT'} mode")
     seen     = load_seen()
     articles = fetch_news()
-    posted   = 0
 
+    # Group fresh unseen articles by category
+    by_cat = {}
     for article in articles:
         if article["id"] in seen:
             continue
-
         cat = article["cat"]
-        log.info(f"📰 [{cat}] {article['title'][:60]}...")
-        rewritten, keyword = rewrite_news(article["title"], article["summary"], cat)
+        if cat not in by_cat:
+            by_cat[cat] = article  # only first/freshest per category
 
-        log.info(f"🖼️ Keyword: {keyword}")
-        bg = fetch_background_image(keyword)
-
-        ts   = datetime.now().strftime("%d %b %Y • %H:%M")
-        card = generate_card(rewritten, article["source"], ts, cat, bg)
-
-        cat_emoji = {"LOCAL":"🇲🇻","FOOTBALL":"⚽","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(cat,"📰")
-        caption = (
-            f"{cat_emoji} <b>{article['title']}</b>\n\n"
-            f"{rewritten}\n\n"
-            f"🔗 <a href='{article['link']}'>Read more</a>\n\n"
-            f"📡 <b>Samuga Media</b> | @samugacommunity"
-        )
-
-        if send_to_telegram(card, caption):
-            seen.add(article["id"])
-            save_seen(seen)
-            posted += 1
-            time.sleep(5)
-            break
-
-    if posted == 0:
+    if not by_cat:
         log.info("No fresh articles this run.")
+        return
+
+    # Post order priority
+    order = ["DISASTER", "LOCAL", "WORLD", "FOOTBALL", "TOURISM", "WEATHER"]
+    posted = 0
+
+    for cat in order:
+        if cat not in by_cat:
+            continue
+        article = by_cat[cat]
+        log.info(f"🚀 Posting [{cat}]...")
+        if post_article(article, seen):
+            posted += 1
+            if posted < len(by_cat):
+                log.info(f"⏳ Waiting 5 mins before next category post...")
+                time.sleep(300)  # 5 min gap between posts
+
+    log.info(f"✅ Posted {posted} articles this run.")
 
 def scheduled_check():
     h = get_mvt_hour()
