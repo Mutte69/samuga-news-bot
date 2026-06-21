@@ -171,21 +171,36 @@ def rewrite_news(title, summary, cat):
         "TOURISM":  "tourism and travel news",
     }.get(cat, "news")
 
+    default_keywords = {
+        "LOCAL": "maldives government",
+        "FOOTBALL": "football match stadium",
+        "WORLD": "world news politics",
+        "DISASTER": "emergency rescue",
+        "WEATHER": "tropical weather storm",
+        "TOURISM": "maldives resort beach",
+    }
+
+    if not summary or summary.strip() == title.strip() or len(summary) < 30:
+        extra = "Note: Only a headline is available. Write a short punchy 2-3 sentence post expanding on the headline with relevant context."
+    else:
+        extra = ""
+
     prompt = f"""You are a news writer for Samuga Media, a Maldivian digital media outlet.
 Rewrite this {cat_context} into a short, punchy, engaging English post for a Telegram channel.
 - Max 3 sentences
 - Clear and direct
 - No hashtags, no emojis
 - Professional but easy to read
+{extra}
 
-Also provide a 2-3 word Pexels image search keyword relevant to the topic.
+Also provide a 2-3 word Pexels image search keyword SPECIFIC to this topic.
 
 Title: {title}
 Summary: {summary}
 
 Respond in EXACTLY this format:
 TEXT: [rewritten news]
-IMAGE: [2-3 word keyword]"""
+IMAGE: [specific 2-3 word keyword]"""
 
     try:
         msg = ai.messages.create(
@@ -194,7 +209,7 @@ IMAGE: [2-3 word keyword]"""
             messages=[{"role": "user", "content": prompt}]
         )
         response = msg.content[0].text.strip()
-        text, keyword = "", "maldives"
+        text, keyword = "", default_keywords.get(cat, "maldives news")
         for line in response.split('\n'):
             if line.startswith("TEXT:"):
                 text = line[5:].strip()
@@ -203,7 +218,7 @@ IMAGE: [2-3 word keyword]"""
         return (text or title), keyword
     except Exception as e:
         log.error(f"Claude error: {e}")
-        return title, "maldives"
+        return title, default_keywords.get(cat, "maldives")
 
 # ── Pexels image ──────────────────────────────────────────────────────────────
 def fetch_background_image(keyword):
@@ -751,11 +766,15 @@ if __name__ == "__main__":
     log.info("💬 Chat assistant active — DMs + group mentions")
     log.info("📰 Categories: LOCAL 🇲🇻 | FOOTBALL ⚽ | WORLD 🌍 | DISASTER 🚨 | WEATHER 🌤️ | TOURISM ✈️")
 
+    # Log seen articles count on startup
+    seen_on_start = load_seen()
+    log.info(f"📚 Loaded {len(seen_on_start)} seen articles from storage")
+
     chat_thread = threading.Thread(target=handle_updates, daemon=True)
     chat_thread.start()
 
-    run_job()
+    # No immediate run on startup — prevents posting on every redeploy!
     scheduler = BlockingScheduler()
     scheduler.add_job(scheduled_check, "interval", minutes=30)
-    log.info("⏰ Scheduler started")
+    log.info("⏰ Scheduler started — first run in 30 minutes")
     scheduler.start()
