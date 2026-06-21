@@ -635,13 +635,19 @@ def chat_with_gemini_dhivehi(user_message, context=""):
         return None
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-        prompt = f"""ތިބާ ތީ ސަމުގަ އޭ އައި — ސަމުގަ މީޑިއާގެ ޚަބަރު އެހީތެރިޔާ.
+        prompt = f"""You are Samuga AI, a friendly Maldivian news assistant for Samuga Media.
 
-{f"މިހާރު ހިނގަމުންދާ ޚަބަރުތައް:{chr(10)}{context}" if context else ""}
+The user is writing to you in Dhivehi. You MUST reply in natural, clear Dhivehi (Thaana script).
 
-ސުވާލު: {user_message}
+{f"Latest Maldives news context:{chr(10)}{context}" if context else ""}
 
-ދިވެހިން ޖަވާބު ދޭށެ. ކުރު، ސާދާ، 3-4 ޖުމްލަ. @samugacommunity ޗެނެލަށް ފޮނުވާލާ ވިދާޅުވޭ."""
+About Samuga Media: A Maldivian news outlet. Our Telegram channel is @samugacommunity.
+Founder: Abdul Muhsin (Manchii). Co-Founder: Mariyam Ulya.
+
+User message in Dhivehi: {user_message}
+
+Reply in natural conversational Dhivehi. Keep it short (2-3 sentences). 
+Always mention @samugacommunity for more news if relevant."""
 
         resp = requests.post(url, json={"contents":[{"parts":[{"text":prompt}]}]}, timeout=15)
         if resp.status_code == 200:
