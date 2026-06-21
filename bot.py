@@ -621,8 +621,13 @@ def is_fresh_by_date(date_str, hours=24):
 def chat_with_claude(user_message):
     try:
         # Get local headlines for context
-        headlines = get_local_headlines()
-        headlines_text = "\n".join(headlines) if headlines else "No recent headlines available."
+        headlines = []
+        try:
+            headlines = get_local_headlines()
+        except Exception as e:
+            log.warning(f"Headlines fetch failed: {e}")
+
+        headlines_text = "\n".join(headlines[:8]) if headlines else "No recent headlines available."
 
         # Get recent posts memory
         memory_text = ""
@@ -633,52 +638,49 @@ def chat_with_claude(user_message):
 
         # Web search if needed
         web_context = ""
-        if needs_web_search(user_message):
-            log.info(f"🔍 Searching web for: {user_message[:50]}")
-            # Add "2026" context for sports/current events
-            search_query = user_message
-            if any(w in user_message.lower() for w in ["world cup", "match", "score", "won", "win"]):
-                search_query = f"{user_message} 2026 latest result"
-            web_context = tavily_search(search_query)
+        try:
+            if needs_web_search(user_message):
+                log.info(f"🔍 Searching web for: {user_message[:50]}")
+                search_query = user_message
+                if any(w in user_message.lower() for w in ["world cup", "match", "score", "won", "win"]):
+                    search_query = f"{user_message} 2026 latest result"
+                web_context = tavily_search(search_query)
+        except Exception as e:
+            log.warning(f"Web search failed: {e}")
 
-        # Build full context
-        context_parts = []
-        if headlines_text:
-            context_parts.append(f"LATEST LOCAL NEWS HEADLINES:\n{headlines_text}")
+        # Build context — keep it short to avoid token issues
+        context = f"LATEST MALDIVES NEWS:\n{headlines_text}"
         if memory_text:
-            context_parts.append(memory_text)
+            context += f"\n\n{memory_text}"
         if web_context:
-            context_parts.append(f"WEB SEARCH RESULTS:\n{web_context[:800]}")
+            context += f"\n\nWEB SEARCH:\n{web_context[:600]}"
 
-        context = "\n\n".join(context_parts)
+        system_prompt = f"""You are Samuga AI — friendly news assistant for Samuga Media, a Maldivian media outlet.
 
-        system_prompt = f"""You are Samuga AI — the smart, friendly news assistant for Samuga Media, a Maldivian digital media outlet.
-
-You have access to real-time context below. Use it to give accurate, up-to-date answers.
-
+CURRENT CONTEXT:
 {context}
 
-YOUR PERSONALITY:
-- Talk like a real human, warm and friendly — not robotic
-- Keep answers short and punchy (3-5 sentences max)
-- Use casual but professional tone
-- If you know the answer from context, be confident and direct
-- Always naturally guide people to @samugacommunity for more news
-- Never say "I don't have access to real-time data" — you DO have context above
-- If something isn't in your context, say "I'm not sure about that one, check @samugacommunity for the latest!"
-- You cover: Maldives news, football, world news, weather, tourism, general questions
-- Respond in English always"""
+RULES:
+- Talk warm and human, not robotic
+- Max 4 sentences per reply
+- Use context above to give accurate answers
+- Always guide people to @samugacommunity for more
+- Never say you lack real-time data — use the context
+- If not in context: "Check @samugacommunity for the latest on that!"
+- Cover: Maldives news, football, world news, weather, tourism
+- English only"""
 
         msg = ai.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=600,
+            max_tokens=500,
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}]
         )
         return msg.content[0].text.strip()
+
     except Exception as e:
         log.error(f"Chat error: {e}")
-        return "Hey! Having a small technical issue right now 😅 Check @samugacommunity for the latest news!"
+        return "Hey! Something went wrong on my end 😅 Check @samugacommunity for the latest news!"
 
 def send_text(chat_id, text, reply_to=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
