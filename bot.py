@@ -495,9 +495,13 @@ def needs_web_search(message):
     """Decide if message needs real-time web search"""
     keywords = [
         "latest", "today", "now", "current", "happening", "news",
-        "score", "match", "result", "win", "lost", "goal",
+        "score", "match", "result", "win", "won", "lost", "lose", "goal", "goals",
         "weather", "storm", "earthquake", "tsunami", "war", "attack",
-        "price", "stock", "update", "recently", "just", "breaking"
+        "price", "stock", "update", "recently", "just", "breaking",
+        "who", "when", "which team", "final", "semi", "quarter",
+        "champion", "tournament", "league", "cup", "world cup",
+        "killed", "dead", "crash", "accident", "fire", "flood",
+        "yesterday", "last night", "this week", "election", "vote"
     ]
     msg_lower = message.lower()
     return any(kw in msg_lower for kw in keywords)
@@ -519,7 +523,11 @@ def chat_with_claude(user_message):
         web_context = ""
         if needs_web_search(user_message):
             log.info(f"🔍 Searching web for: {user_message[:50]}")
-            web_context = tavily_search(user_message)
+            # Add "2026" context for sports/current events
+            search_query = user_message
+            if any(w in user_message.lower() for w in ["world cup", "match", "score", "won", "win"]):
+                search_query = f"{user_message} 2026 latest result"
+            web_context = tavily_search(search_query)
 
         # Build full context
         context_parts = []
