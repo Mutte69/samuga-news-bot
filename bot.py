@@ -20,14 +20,49 @@ TELEGRAM_BOT_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "@samugacommunity")
 ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
 PEXELS_API_KEY      = os.environ.get("PEXELS_API_KEY", "")
+GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
 BOT_USERNAME        = os.environ.get("BOT_USERNAME", "SamugaNewsBot")
 
 ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+# ── News Sources by Category ──────────────────────────────────────────────────
 RSS_FEEDS = [
-    "https://news.google.com/rss/search?q=maldives&hl=en-MV&gl=MV&ceid=MV:en",
-    "https://news.google.com/rss/search?q=maldives+news&hl=en&gl=US&ceid=US:en",
+    # 🇲🇻 Local Maldives — English
+    {"url": "https://news.google.com/rss/search?q=maldives&hl=en-MV&gl=MV&ceid=MV:en", "cat": "LOCAL", "lang": "en"},
+    {"url": "https://see.mv/feed", "cat": "LOCAL", "lang": "en"},
+    {"url": "https://english.sun.mv/feed", "cat": "LOCAL", "lang": "en"},
+    {"url": "https://edition.mv/feed", "cat": "LOCAL", "lang": "en"},
+    {"url": "https://maldivesindependent.com/feed", "cat": "LOCAL", "lang": "en"},
+    {"url": "https://oneonline.mv/en/feed", "cat": "LOCAL", "lang": "en"},
+    {"url": "https://psmnews.mv/en/feed", "cat": "LOCAL", "lang": "en"},
+    # 🇲🇻 Local Maldives — Dhivehi (Gemini translates)
+    {"url": "https://mihaaru.com/rss", "cat": "LOCAL", "lang": "dv"},
+    {"url": "https://avas.mv/feed", "cat": "LOCAL", "lang": "dv"},
+    {"url": "https://dhuvas.mv/feed", "cat": "LOCAL", "lang": "dv"},
+    # ⚽ Football
+    {"url": "https://news.google.com/rss/search?q=world+cup+2026+football&hl=en&gl=US&ceid=US:en", "cat": "FOOTBALL", "lang": "en"},
+    {"url": "https://news.google.com/rss/search?q=champions+league+football&hl=en&gl=US&ceid=US:en", "cat": "FOOTBALL", "lang": "en"},
+    {"url": "https://news.google.com/rss/search?q=football+match+results&hl=en&gl=US&ceid=US:en", "cat": "FOOTBALL", "lang": "en"},
+    # 🌍 World News
+    {"url": "https://news.google.com/rss/search?q=war+conflict+breaking&hl=en&gl=US&ceid=US:en", "cat": "WORLD", "lang": "en"},
+    {"url": "https://news.google.com/rss/search?q=breaking+news+world&hl=en&gl=US&ceid=US:en", "cat": "WORLD", "lang": "en"},
+    # 🌊 Disasters
+    {"url": "https://news.google.com/rss/search?q=earthquake+tsunami+volcanic+eruption&hl=en&gl=US&ceid=US:en", "cat": "DISASTER", "lang": "en"},
+    # 🌤️ Weather Maldives
+    {"url": "https://news.google.com/rss/search?q=maldives+weather+storm&hl=en&gl=US&ceid=US:en", "cat": "WEATHER", "lang": "en"},
+    # ✈️ Tourism
+    {"url": "https://news.google.com/rss/search?q=maldives+tourism+travel&hl=en&gl=US&ceid=US:en", "cat": "TOURISM", "lang": "en"},
 ]
+
+# Category display config
+CAT_CONFIG = {
+    "LOCAL":   {"label": "🇲🇻  LOCAL NEWS",    "color": (41, 171, 226)},
+    "FOOTBALL":{"label": "⚽  FOOTBALL",        "color": (34, 180, 80)},
+    "WORLD":   {"label": "🌍  WORLD NEWS",      "color": (220, 80, 60)},
+    "DISASTER":{"label": "🚨  DISASTER ALERT",  "color": (220, 120, 0)},
+    "WEATHER": {"label": "🌤️  WEATHER",         "color": (100, 180, 240)},
+    "TOURISM": {"label": "✈️  TOURISM",         "color": (160, 80, 220)},
+}
 
 DATA_DIR  = "/data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -45,7 +80,7 @@ def load_seen():
 def save_seen(seen):
     try:
         with open(SEEN_FILE, "w") as f:
-            json.dump(list(seen)[-500:], f)
+            json.dump(list(seen)[-1000:], f)
     except Exception as e:
         log.warning(f"Save seen: {e}")
 
@@ -57,41 +92,86 @@ def is_fresh(entry, hours=24):
             if pub_dt.tzinfo:
                 pub_dt = pub_dt.replace(tzinfo=None)
             return datetime.utcnow() - pub_dt < timedelta(hours=hours)
-    except Exception as e:
-        log.warning(f"Date parse: {e}")
+    except:
+        pass
     return True
 
+# ── Gemini translate Dhivehi → English ───────────────────────────────────────
+def gemini_translate(text):
+    if not GEMINI_API_KEY:
+        return text
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [{
+                "parts": [{"text": f"Translate this Dhivehi text to English. Return ONLY the English translation, nothing else:\n\n{text}"}]
+            }]
+        }
+        resp = requests.post(url, json=payload, timeout=15)
+        if resp.status_code == 200:
+            result = resp.json()
+            translated = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+            log.info(f"✅ Gemini translated: {translated[:60]}")
+            return translated
+        else:
+            log.error(f"Gemini error: {resp.status_code}")
+            return text
+    except Exception as e:
+        log.error(f"Gemini exception: {e}")
+        return text
+
+# ── Fetch all news ────────────────────────────────────────────────────────────
 def fetch_news():
     articles = []
     seen_titles = set()
-    for url in RSS_FEEDS:
+    for feed_cfg in RSS_FEEDS:
         try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:15]:
-                title = entry.get("title", "")
+            feed = feedparser.parse(feed_cfg["url"])
+            for entry in feed.entries[:8]:
+                title   = entry.get("title", "")
+                summary = entry.get("summary", title)
+                lang    = feed_cfg["lang"]
+
+                # Translate Dhivehi
+                if lang == "dv":
+                    title   = gemini_translate(title)
+                    summary = gemini_translate(summary[:300])
+
                 key = title.lower()[:50]
                 if key in seen_titles:
                     continue
                 if not is_fresh(entry):
-                    log.info(f"⏭️ Old: {title[:50]}")
                     continue
                 seen_titles.add(key)
+
                 article_id = hashlib.md5(entry.get("link", title).encode()).hexdigest()
                 articles.append({
-                    "id": article_id,
-                    "title": title,
-                    "summary": entry.get("summary", title),
-                    "link": entry.get("link", ""),
-                    "source": entry.get("source", {}).get("title", "Google News"),
+                    "id":      article_id,
+                    "title":   title,
+                    "summary": summary,
+                    "link":    entry.get("link", ""),
+                    "source":  entry.get("source", {}).get("title", feed_cfg.get("cat", "News")),
+                    "cat":     feed_cfg["cat"],
                 })
         except Exception as e:
-            log.error(f"Feed error: {e}")
+            log.error(f"Feed error {feed_cfg['url']}: {e}")
+
     log.info(f"Found {len(articles)} fresh articles")
     return articles
 
-def rewrite_news(title, summary):
+# ── Rewrite with Claude ───────────────────────────────────────────────────────
+def rewrite_news(title, summary, cat):
+    cat_context = {
+        "LOCAL":    "local Maldivian news",
+        "FOOTBALL": "football/soccer news",
+        "WORLD":    "world/international news",
+        "DISASTER": "natural disaster or emergency alert",
+        "WEATHER":  "weather news",
+        "TOURISM":  "tourism and travel news",
+    }.get(cat, "news")
+
     prompt = f"""You are a news writer for Samuga Media, a Maldivian digital media outlet.
-Rewrite the following news into a short, punchy, engaging English post for a Telegram channel.
+Rewrite this {cat_context} into a short, punchy, engaging English post for a Telegram channel.
 - Max 3 sentences
 - Clear and direct
 - No hashtags, no emojis
@@ -105,6 +185,7 @@ Summary: {summary}
 Respond in EXACTLY this format:
 TEXT: [rewritten news]
 IMAGE: [2-3 word keyword]"""
+
     try:
         msg = ai.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -112,7 +193,7 @@ IMAGE: [2-3 word keyword]"""
             messages=[{"role": "user", "content": prompt}]
         )
         response = msg.content[0].text.strip()
-        text, keyword = "", "maldives ocean"
+        text, keyword = "", "maldives"
         for line in response.split('\n'):
             if line.startswith("TEXT:"):
                 text = line[5:].strip()
@@ -123,6 +204,7 @@ IMAGE: [2-3 word keyword]"""
         log.error(f"Claude error: {e}")
         return title, "maldives"
 
+# ── Pexels image ──────────────────────────────────────────────────────────────
 def fetch_background_image(keyword):
     if not PEXELS_API_KEY:
         return None
@@ -130,26 +212,28 @@ def fetch_background_image(keyword):
         headers = {"Authorization": PEXELS_API_KEY}
         url = f"https://api.pexels.com/v1/search?query={keyword}&per_page=5&orientation=square"
         resp = requests.get(url, headers=headers, timeout=15)
-        log.info(f"Pexels status: {resp.status_code} for '{keyword}'")
         if resp.status_code == 200:
             photos = resp.json().get("photos", [])
             if photos:
                 img_resp = requests.get(photos[0]["src"]["large"], timeout=20)
                 if img_resp.status_code == 200:
-                    log.info(f"✅ Got Pexels image for: {keyword}")
+                    log.info(f"✅ Pexels image: {keyword}")
                     return Image.open(BytesIO(img_resp.content)).convert("RGB")
     except Exception as e:
         log.error(f"Pexels error: {e}")
     return None
 
-BG_TOP     = (10, 40, 75)
-BG_BOTTOM  = (5, 20, 45)
-ACCENT     = (41, 171, 226)
+# ── Generate card ─────────────────────────────────────────────────────────────
 WHITE      = (255, 255, 255)
 LIGHT_GRAY = (200, 215, 230)
+BG_TOP     = (10, 40, 75)
+BG_BOTTOM  = (5, 20, 45)
 
-def generate_card(text, source, timestamp, bg_image=None):
+def generate_card(text, source, timestamp, cat, bg_image=None):
     W, H = 1080, 1080
+    cat_color = CAT_CONFIG.get(cat, CAT_CONFIG["LOCAL"])["color"]
+    cat_label = CAT_CONFIG.get(cat, CAT_CONFIG["LOCAL"])["label"]
+
     img = Image.new("RGB", (W, H), BG_TOP)
 
     if bg_image:
@@ -167,13 +251,14 @@ def generate_card(text, source, timestamp, bg_image=None):
     else:
         d = ImageDraw.Draw(img)
         for y in range(H):
-            t = y / H
+            t = y/H
             d.line([(0,y),(W,y)], fill=(
                 int(BG_TOP[0]+(BG_BOTTOM[0]-BG_TOP[0])*t),
                 int(BG_TOP[1]+(BG_BOTTOM[1]-BG_TOP[1])*t),
                 int(BG_TOP[2]+(BG_BOTTOM[2]-BG_TOP[2])*t),
             ))
 
+    # Bottom gradient
     ov = Image.new("RGBA", (W, H), (0,0,0,0))
     od = ImageDraw.Draw(ov)
     for y in range(H//2, H):
@@ -181,16 +266,20 @@ def generate_card(text, source, timestamp, bg_image=None):
         od.line([(0,y),(W,y)], fill=(5,20,50,int(215*t)))
     img = Image.alpha_composite(img.convert("RGBA"), ov).convert("RGB")
 
+    # Top gradient
     ov2 = Image.new("RGBA", (W, H), (0,0,0,0))
     od2 = ImageDraw.Draw(ov2)
     for y in range(0, 170):
-        t = 1 - y/170
+        t = 1-y/170
         od2.line([(0,y),(W,y)], fill=(5,20,50,int(190*t)))
     img = Image.alpha_composite(img.convert("RGBA"), ov2).convert("RGB")
 
     draw = ImageDraw.Draw(img)
-    draw.rectangle([(0,0),(W,5)], fill=ACCENT)
 
+    # Top accent bar — category color
+    draw.rectangle([(0,0),(W,6)], fill=cat_color)
+
+    # Logo
     try:
         logo = Image.open("logo.png").convert("RGBA")
         lh = 72
@@ -210,9 +299,11 @@ def generate_card(text, source, timestamp, bg_image=None):
 
     draw.text((W-310, 50), "t.me/samugacommunity", font=f_sm, fill=(200,230,255))
 
+    # Category tag — dynamic color
     tag_y = 590
-    draw.rectangle([(50,tag_y),(222,tag_y+34)], fill=ACCENT)
-    draw.text((63,tag_y+6), "● LATEST NEWS", font=f_tag, fill=WHITE)
+    tag_w = draw.textbbox((0,0), cat_label, font=f_tag)[2] + 26
+    draw.rectangle([(50,tag_y),(50+tag_w, tag_y+34)], fill=cat_color)
+    draw.text((63, tag_y+6), cat_label, font=f_tag, fill=WHITE)
 
     def wrap(text, font, max_w):
         words = text.split()
@@ -244,7 +335,7 @@ def generate_card(text, source, timestamp, bg_image=None):
             y += 36
 
     draw.rectangle([(0,H-78),(W,H)], fill=(3,12,30))
-    draw.rectangle([(0,H-78),(W,H-75)], fill=ACCENT)
+    draw.rectangle([(0,H-78),(W,H-75)], fill=cat_color)
     draw.text((50,H-53), f"Source: {source}", font=f_sm, fill=LIGHT_GRAY)
     draw.text((W-260,H-53), timestamp, font=f_sm, fill=LIGHT_GRAY)
 
@@ -253,6 +344,7 @@ def generate_card(text, source, timestamp, bg_image=None):
     buf.seek(0)
     return buf
 
+# ── Send to Telegram ──────────────────────────────────────────────────────────
 def send_to_telegram(buf, caption):
     try:
         resp = requests.post(
@@ -274,34 +366,43 @@ def get_mvt_hour():
 def is_day_mode():
     return 7 <= get_mvt_hour() < 18
 
+# ── Main job ──────────────────────────────────────────────────────────────────
 def run_job():
     h = get_mvt_hour()
     log.info(f"🕐 MVT {h:02d}:xx | {'DAY' if is_day_mode() else 'NIGHT'} mode")
-    log.info("🔍 Fetching fresh news...")
-    seen = load_seen()
+    seen     = load_seen()
     articles = fetch_news()
-    posted = 0
+    posted   = 0
+
     for article in articles:
         if article["id"] in seen:
             continue
-        log.info(f"📰 {article['title'][:70]}...")
-        rewritten, keyword = rewrite_news(article["title"], article["summary"])
+
+        cat = article["cat"]
+        log.info(f"📰 [{cat}] {article['title'][:60]}...")
+        rewritten, keyword = rewrite_news(article["title"], article["summary"], cat)
+
         log.info(f"🖼️ Keyword: {keyword}")
         bg = fetch_background_image(keyword)
-        ts = datetime.now().strftime("%d %b %Y • %H:%M")
-        card = generate_card(rewritten, article["source"], ts, bg)
+
+        ts   = datetime.now().strftime("%d %b %Y • %H:%M")
+        card = generate_card(rewritten, article["source"], ts, cat, bg)
+
+        cat_emoji = {"LOCAL":"🇲🇻","FOOTBALL":"⚽","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(cat,"📰")
         caption = (
-            f"<b>{article['title']}</b>\n\n"
+            f"{cat_emoji} <b>{article['title']}</b>\n\n"
             f"{rewritten}\n\n"
             f"🔗 <a href='{article['link']}'>Read more</a>\n\n"
             f"📡 <b>Samuga Media</b> | @samugacommunity"
         )
+
         if send_to_telegram(card, caption):
             seen.add(article["id"])
             save_seen(seen)
             posted += 1
             time.sleep(5)
             break
+
     if posted == 0:
         log.info("No fresh articles this run.")
 
@@ -322,9 +423,8 @@ def chat_with_claude(user_message):
 You help people with:
 - Latest news about the Maldives
 - Questions about Maldivian politics, tourism, culture, economy
+- Football news, world news, weather, disasters
 - General knowledge questions
-- Info about Samuga Media and the @samugacommunity Telegram channel
-
 Keep responses short, friendly and conversational. Max 3-4 sentences.
 Always respond in English. If asked about very recent news, mention they can check @samugacommunity for the latest updates.
 You are powered by Claude AI by Anthropic.""",
@@ -351,7 +451,6 @@ def handle_updates():
     offset = 0
     bot_mention = f"@{BOT_USERNAME}".lower()
     log.info(f"💬 Chat listening for @{BOT_USERNAME}...")
-
     while True:
         try:
             resp = requests.get(
@@ -362,7 +461,6 @@ def handle_updates():
             if resp.status_code != 200:
                 time.sleep(5)
                 continue
-
             for update in resp.json().get("result", []):
                 offset = update["update_id"] + 1
                 msg = update.get("message", {})
@@ -371,7 +469,6 @@ def handle_updates():
                 text = msg.get("text", "")
                 if not text:
                     continue
-
                 chat_id   = msg["chat"]["id"]
                 msg_id    = msg["message_id"]
                 chat_type = msg["chat"]["type"]
@@ -381,7 +478,7 @@ def handle_updates():
                     if text.startswith("/start"):
                         send_text(chat_id,
                             f"👋 Hey {user_name}! I'm <b>Samuga AI</b> — your Maldives news assistant!\n\n"
-                            f"Ask me anything about Maldives news, politics, tourism or culture.\n\n"
+                            f"Ask me anything about Maldives news, politics, tourism, football or world news.\n\n"
                             f"📡 Follow <b>@samugacommunity</b> for live news updates!",
                             reply_to=msg_id)
                     else:
@@ -396,16 +493,16 @@ def handle_updates():
                             log.info(f"💬 Group mention from {user_name}: {clean[:50]}")
                             reply = chat_with_claude(clean)
                             send_text(chat_id, reply, reply_to=msg_id)
-
         except Exception as e:
             log.error(f"Update loop error: {e}")
             time.sleep(5)
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("🚀 Samuga News Bot starting...")
+    log.info("🚀 Samuga News Bot v2.0 starting...")
     log.info("📅 7AM-6PM MVT: every 30min | 6PM-7AM MVT: every 3hrs")
     log.info("💬 Chat assistant active — DMs + group mentions")
+    log.info("📰 Categories: LOCAL 🇲🇻 | FOOTBALL ⚽ | WORLD 🌍 | DISASTER 🚨 | WEATHER 🌤️ | TOURISM ✈️")
 
     chat_thread = threading.Thread(target=handle_updates, daemon=True)
     chat_thread.start()
