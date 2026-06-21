@@ -386,6 +386,7 @@ def post_article(article, seen):
     if send_to_telegram(card, caption):
         seen.add(article["id"])
         save_seen(seen)
+        remember_post(article["title"], cat, ts)
         return True
     return False
 
@@ -433,26 +434,131 @@ def scheduled_check():
     run_job()
 
 # ── Chat Assistant ────────────────────────────────────────────────────────────
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
+
+# Recent posts memory (in-memory, last 20 posts)
+recent_posts = []
+
+def remember_post(title, cat, timestamp):
+    """Store recently posted articles in memory"""
+    recent_posts.append({"title": title, "cat": cat, "time": timestamp})
+    if len(recent_posts) > 20:
+        recent_posts.pop(0)
+
+def get_local_headlines():
+    """Fetch fresh local headlines for context"""
+    headlines = []
+    try:
+        for feed_cfg in RSS_FEEDS[:4]:  # Only first 4 local feeds
+            feed = feedparser.parse(feed_cfg["url"])
+            for entry in feed.entries[:3]:
+                title = entry.get("title", "")
+                if title and is_fresh(entry, hours=12):
+                    headlines.append(f"• [{feed_cfg['cat']}] {title}")
+            if len(headlines) >= 10:
+                break
+    except Exception as e:
+        log.error(f"Headlines error: {e}")
+    return headlines[:10]
+
+def tavily_search(query):
+    """Search web with Tavily for real-time info"""
+    if not TAVILY_API_KEY:
+        return ""
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": TAVILY_API_KEY,
+                "query": query,
+                "search_depth": "basic",
+                "max_results": 4,
+                "include_answer": True,
+            },
+            timeout=15
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            answer = data.get("answer", "")
+            results = data.get("results", [])
+            snippets = [r.get("content", "")[:200] for r in results[:3]]
+            combined = answer + "\n" + "\n".join(snippets)
+            log.info(f"✅ Tavily search done for: {query[:40]}")
+            return combined.strip()
+        else:
+            log.error(f"Tavily error: {resp.status_code}")
+    except Exception as e:
+        log.error(f"Tavily exception: {e}")
+    return ""
+
+def needs_web_search(message):
+    """Decide if message needs real-time web search"""
+    keywords = [
+        "latest", "today", "now", "current", "happening", "news",
+        "score", "match", "result", "win", "lost", "goal",
+        "weather", "storm", "earthquake", "tsunami", "war", "attack",
+        "price", "stock", "update", "recently", "just", "breaking"
+    ]
+    msg_lower = message.lower()
+    return any(kw in msg_lower for kw in keywords)
+
 def chat_with_claude(user_message):
     try:
+        # Get local headlines for context
+        headlines = get_local_headlines()
+        headlines_text = "\n".join(headlines) if headlines else "No recent headlines available."
+
+        # Get recent posts memory
+        memory_text = ""
+        if recent_posts:
+            memory_text = "Recently posted to @samugacommunity:\n"
+            for p in recent_posts[-5:]:
+                memory_text += f"• [{p['cat']}] {p['title']} ({p['time']})\n"
+
+        # Web search if needed
+        web_context = ""
+        if needs_web_search(user_message):
+            log.info(f"🔍 Searching web for: {user_message[:50]}")
+            web_context = tavily_search(user_message)
+
+        # Build full context
+        context_parts = []
+        if headlines_text:
+            context_parts.append(f"LATEST LOCAL NEWS HEADLINES:\n{headlines_text}")
+        if memory_text:
+            context_parts.append(memory_text)
+        if web_context:
+            context_parts.append(f"WEB SEARCH RESULTS:\n{web_context[:800]}")
+
+        context = "\n\n".join(context_parts)
+
+        system_prompt = f"""You are Samuga AI — the smart, friendly news assistant for Samuga Media, a Maldivian digital media outlet.
+
+You have access to real-time context below. Use it to give accurate, up-to-date answers.
+
+{context}
+
+YOUR PERSONALITY:
+- Talk like a real human, warm and friendly — not robotic
+- Keep answers short and punchy (3-5 sentences max)
+- Use casual but professional tone
+- If you know the answer from context, be confident and direct
+- Always naturally guide people to @samugacommunity for more news
+- Never say "I don't have access to real-time data" — you DO have context above
+- If something isn't in your context, say "I'm not sure about that one, check @samugacommunity for the latest!"
+- You cover: Maldives news, football, world news, weather, tourism, general questions
+- Respond in English always"""
+
         msg = ai.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=500,
-            system="""You are Samuga AI, the assistant for Samuga Media — a Maldivian digital media outlet.
-You help people with:
-- Latest news about the Maldives
-- Questions about Maldivian politics, tourism, culture, economy
-- Football news, world news, weather, disasters
-- General knowledge questions
-Keep responses short, friendly and conversational. Max 3-4 sentences.
-Always respond in English. If asked about very recent news, mention they can check @samugacommunity for the latest updates.
-You are powered by Claude AI by Anthropic.""",
+            max_tokens=600,
+            system=system_prompt,
             messages=[{"role": "user", "content": user_message}]
         )
         return msg.content[0].text.strip()
     except Exception as e:
         log.error(f"Chat error: {e}")
-        return "Sorry, I'm having trouble right now. Please try again! 🙏"
+        return "Hey! Having a small technical issue right now 😅 Check @samugacommunity for the latest news!"
 
 def send_text(chat_id, text, reply_to=None):
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
