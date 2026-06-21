@@ -407,50 +407,60 @@ def upload_image_to_buffer(img_bytes):
 
 def post_to_buffer(image_url, caption, channel_ids):
     """Post to multiple Buffer channels via GraphQL API"""
-    if not BUFFER_TOKEN or not image_url:
+    if not BUFFER_TOKEN:
         return False
     try:
-        # Clean caption — remove HTML tags for social media
         import re
         clean_caption = re.sub(r'<[^>]+>', '', caption)
         clean_caption = clean_caption.replace('&amp;', '&').strip()
 
-        query = """
-        mutation CreatePost($input: CreatePostInput!) {
-            createPost(input: $input) {
-                post {
-                    id
-                    status
-                }
-            }
-        }
-        """
         for channel_id in channel_ids:
             if not channel_id:
                 continue
-            variables = {
-                "input": {
-                    "channelId": channel_id,
-                    "content": {
-                        "text": clean_caption[:2200],
-                        "media": [{"url": image_url, "type": "image"}]
+            query = """
+            mutation CreatePost($channelId: String!, $text: String!, $imageUrl: String!) {
+                createPost(input: {
+                    channelId: $channelId,
+                    text: $text,
+                    assets: [{url: $imageUrl, type: image}],
+                    schedulingType: automatic,
+                    mode: addToQueue
+                }) {
+                    ... on PostActionSuccess {
+                        post {
+                            id
+                        }
+                    }
+                    ... on MutationError {
+                        message
                     }
                 }
             }
+            """
+            variables = {
+                "channelId": channel_id,
+                "text": clean_caption[:2200],
+                "imageUrl": image_url
+            }
             resp = requests.post(
-                "https://api.buffer.com/graphql",
+                "https://api.buffer.com",
                 json={"query": query, "variables": variables},
-                headers={"Authorization": f"Bearer {BUFFER_TOKEN}"},
+                headers={
+                    "Authorization": f"Bearer {BUFFER_TOKEN}",
+                    "Content-Type": "application/json"
+                },
                 timeout=20
             )
             if resp.status_code == 200:
                 data = resp.json()
                 if "errors" in data:
                     log.error(f"Buffer error [{channel_id[:8]}]: {data['errors']}")
+                elif data.get("data", {}).get("createPost", {}).get("message"):
+                    log.error(f"Buffer post error: {data['data']['createPost']['message']}")
                 else:
                     log.info(f"✅ Posted to Buffer channel: {channel_id[:8]}...")
             else:
-                log.error(f"Buffer HTTP error: {resp.status_code}")
+                log.error(f"Buffer HTTP error: {resp.status_code} — {resp.text[:200]}")
             time.sleep(2)
         return True
     except Exception as e:
