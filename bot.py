@@ -17,7 +17,7 @@ GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
 TAVILY_API_KEY      = os.environ.get("TAVILY_API_KEY", "")
 BOT_USERNAME        = os.environ.get("BOT_USERNAME", "SamugaNewsBot")
 IMGBB_API_KEY       = os.environ.get("IMGBB_API_KEY", "")
-BUFFER_TOKEN        = os.environ.get("BUFFER_ACCESS_TOKEN", "")
+BUFFER_TOKEN        = os.environ.get("BUFFER_ACCESS_TOKEN", "") or os.environ.get("BUFFER_API_KEY", "")
 BUFFER_FB_ID        = os.environ.get("BUFFER_FACEBOOK_ID", "")
 BUFFER_IG_ID        = os.environ.get("BUFFER_INSTAGRAM_ID", "")
 BUFFER_TW_ID        = os.environ.get("BUFFER_TWITTER_ID", "")
@@ -417,15 +417,14 @@ def resolve_url(url):
     try:
         if "news.google.com" in url or "feedproxy" in url:
             r = requests.get(url, allow_redirects=True, timeout=10)
-            real = r.url
-            log.info(f"🔗 Resolved URL: {real[:80]}")
-            return real
+            log.info(f"🔗 Resolved: {r.url[:80]}")
+            return r.url
     except Exception as e:
         log.warning(f"URL resolve failed: {e}")
     return url
 
-def post_to_buffer(image_url, caption, channel_id, media_type=None):
-    """Post to a single Buffer channel with optional mediaType"""
+def post_to_buffer(image_url, caption, channel_id):
+    """Post to a single Buffer channel. Returns True on success."""
     if not BUFFER_TOKEN or not channel_id: return False
     clean = re.sub(r'<[^>]+>', '', caption).replace('&amp;', '&').strip()
 
@@ -440,18 +439,15 @@ mutation CreatePost($input: CreatePostInput!) {
     }
   }
 }"""
-
+    # No mediaType — not supported in CreatePostInput schema
+    post_input = {
+        "text": clean,
+        "channelId": channel_id,
+        "schedulingType": "automatic",
+        "mode": "addToQueue",
+        "assets": [{"image": {"url": image_url}}],
+    }
     try:
-        post_input = {
-            "text": clean,
-            "channelId": channel_id,
-            "schedulingType": "automatic",
-            "mode": "addToQueue",
-            "assets": [{"image": {"url": image_url}}]
-        }
-        if media_type:
-            post_input["mediaType"] = media_type
-
         resp = requests.post(
             "https://api.buffer.com",
             json={"query": query, "variables": {"input": post_input}},
@@ -482,7 +478,9 @@ mutation CreatePost($input: CreatePostInput!) {
     return False
 
 def post_to_social(img_buf, caption):
-    if not BUFFER_TOKEN: return
+    if not BUFFER_TOKEN:
+        log.warning("Social: no BUFFER_TOKEN, skipping")
+        return
     try:
         img_bytes = img_buf.getvalue()
         image_url = upload_to_imgbb(img_bytes)
@@ -493,7 +491,7 @@ def post_to_social(img_buf, caption):
         # Strip HTML for social platforms
         clean = re.sub(r'<[^>]+>', '', caption).replace('&amp;', '&').strip()
 
-        # Extract and resolve article URL (fixes Google News redirect URLs)
+        # Extract and resolve article URL (fixes Google News redirects)
         link_match = re.search(r"href='([^']+)'", caption)
         raw_url = link_match.group(1) if link_match else ""
         article_url = resolve_url(raw_url) if raw_url else ""
@@ -504,26 +502,29 @@ def post_to_social(img_buf, caption):
             fb_ig = fb_ig + "\n\n" + article_url
         fb_ig = fb_ig[:2200]
 
-        # Twitter caption: first line only + link (280 char hard limit)
+        # Twitter caption: first line + link (280 char hard limit)
         lines = [l.strip() for l in clean.split('\n') if l.strip()]
         tw = (lines[0] if lines else clean)[:220]
         if article_url:
             tw = tw + "\n\n" + article_url
         tw = tw[:280]
 
-        # Post to each platform with correct mediaType
-        for cid, cap, name, mtype in [
-            (BUFFER_FB_ID, fb_ig, "Facebook", "post"),
-            (BUFFER_IG_ID, fb_ig, "Instagram", "post"),
-            (BUFFER_TW_ID, tw,    "Twitter",   None),
+        results = {}
+        for cid, cap, name in [
+            (BUFFER_FB_ID, fb_ig, "Facebook"),
+            (BUFFER_IG_ID, fb_ig, "Instagram"),
+            (BUFFER_TW_ID, tw,    "Twitter"),
         ]:
             if not cid:
-                log.warning(f"Skipping {name} — no channel ID set")
+                log.warning(f"Social: skipping {name} — no channel ID set")
                 continue
-            post_to_buffer(image_url, cap, cid, media_type=mtype)
+            results[name] = post_to_buffer(image_url, cap, cid)
             time.sleep(2)
 
-        log.info("✅ Social posting done!")
+        ok = [k for k, v in results.items() if v]
+        fail = [k for k, v in results.items() if not v]
+        if ok: log.info(f"✅ Social posted to: {', '.join(ok)}")
+        if fail: log.error(f"❌ Social failed for: {', '.join(fail)}")
     except Exception as e:
         log.error(f"Social: {e}")
 
@@ -904,7 +905,7 @@ def handle_updates():
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("🚀 Samuga News Bot v3.1 starting...")
+    log.info("🚀 Samuga News Bot v3.2 starting...")
     log.info("📅 7AM-6PM: every 30min | Night: social only")
     log.info("🌅 7AM Morning Brief | 🌙 12AM Night Summary | 📊 Friday Weekly Digest")
     log.info("💬 Smart chat with history, Tavily search, Dhivehi support")
