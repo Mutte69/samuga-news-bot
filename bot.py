@@ -121,7 +121,7 @@ def can_post_regular():
 def gemini_translate(text):
     if not GEMINI_API_KEY: return text
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
         resp = requests.post(url, json={"contents":[{"parts":[{"text":f"Translate this Dhivehi text to English. Return ONLY the English translation:\n\n{text}"}]}]}, timeout=15)
         if resp.status_code == 200:
             return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -316,7 +316,7 @@ def make_dhivehi_caption(english_text, title):
     if not GEMINI_API_KEY:
         return None
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
         prompt = f"""You are a Maldivian news writer. Write a short news caption in Dhivehi (Thaana script) for this news.
 
 English title: {title}
@@ -626,7 +626,7 @@ def chat_with_gemini_dhivehi(user_message, context="", conversation_history=None
         log.warning("No GEMINI_API_KEY — falling back to Claude for Dhivehi")
         return None
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
         news_section = ("LATEST NEWS CONTEXT:\n" + context) if context else ""
         system_prompt = (
