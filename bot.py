@@ -507,8 +507,8 @@ def post_to_social(img_buf, caption):
 
         results = {}
         for cid, cap, name, meta in [
-            (BUFFER_FB_ID, fb_ig, "Facebook",  {"facebook":  {"postType": "post"}}),
-            (BUFFER_IG_ID, fb_ig, "Instagram", {"instagram": {"postType": "post"}}),
+            (BUFFER_FB_ID, fb_ig, "Facebook",  {"facebook":  {"type": "post"}}),
+            (BUFFER_IG_ID, fb_ig, "Instagram", {"instagram": {"type": "post", "shouldShareToFeed": True}}),
             (BUFFER_TW_ID, tw,    "Twitter",   None),
         ]:
             if not cid:
