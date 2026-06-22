@@ -628,43 +628,34 @@ def chat_with_gemini_dhivehi(user_message, context="", conversation_history=None
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
 
-        system_prompt = f"""ތިބާއީ ސަމޫގާ އޭއައި — ސަމޫގާ މީޑިއާގެ ހޭލުންތެރި ދިވެހި ނިއުސް އެސިސްޓެންޓް.
-
-You are Samuga AI, a Maldivian news assistant. Always reply in natural Dhivehi (Thaana script) only.
-
-ABOUT SAMUGA:
-- Samuga Media: Maldivian digital news outlet
-- Channel: @samugacommunity
-- Founder: Abdul Muhsin (Manchii) | Co-Founder: Mariyam Ulya (Uly)
-
-{("LATEST NEWS CONTEXT:\n" + context) if context else ""}
-
-RULES:
-- Reply ONLY in Dhivehi Thaana script
-- Natural, conversational tone like a friendly Maldivian
-- Max 3-4 sentences
-- Mention @samugacommunity when relevant
-- Never write in English or Latin script"""
+        news_section = ("LATEST NEWS CONTEXT:\n" + context) if context else ""
+        system_prompt = (
+            "You are Samuga AI, a Maldivian news assistant. Always reply in natural Dhivehi (Thaana script) only.\n\n"
+            "ABOUT SAMUGA:\n"
+            "- Samuga Media: Maldivian digital news outlet\n"
+            "- Channel: @samugacommunity\n"
+            "- Founder: Abdul Muhsin (Manchii) | Co-Founder: Mariyam Ulya (Uly)\n\n"
+            + (news_section + "\n\n" if news_section else "") +
+            "RULES:\n"
+            "- Reply ONLY in Dhivehi Thaana script\n"
+            "- Natural, conversational tone like a friendly Maldivian\n"
+            "- Max 3-4 sentences\n"
+            "- Mention @samugacommunity when relevant\n"
+            "- Never write in English or Latin script"
+        )
 
         # Build contents array with history for multi-turn
         contents = []
-
-        # Add conversation history if available
         if conversation_history:
-            for turn in conversation_history[-6:]:  # last 3 exchanges
+            for turn in conversation_history[-6:]:
                 role = "user" if turn["role"] == "user" else "model"
                 contents.append({"role": role, "parts": [{"text": turn["content"]}]})
-
-        # Add current message
         contents.append({"role": "user", "parts": [{"text": user_message}]})
 
         payload = {
             "system_instruction": {"parts": [{"text": system_prompt}]},
             "contents": contents,
-            "generationConfig": {
-                "maxOutputTokens": 400,
-                "temperature": 0.7,
-            }
+            "generationConfig": {"maxOutputTokens": 400, "temperature": 0.7}
         }
 
         resp = requests.post(url, json=payload, timeout=15)
