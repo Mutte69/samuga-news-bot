@@ -175,6 +175,7 @@ def rewrite_news(title, summary, cat):
     prompt = f"""You are a news writer for Samuga Media, a Maldivian digital media outlet.
 Rewrite this {cat_ctx} into a short punchy engaging English Telegram post.
 - Max 3 sentences, clear and direct, no hashtags, no emojis, professional
+- IMPORTANT: Use gender-neutral terms (they/their, "the accused", "the suspect", "the individual") unless the original text explicitly states gender. Do not assume gender from names.
 {extra}
 Also give a specific 2-3 word Pexels image keyword for this topic.
 
@@ -605,9 +606,14 @@ def send_morning_brief():
     try:
         headlines=get_local_headlines()
         if not headlines: return
-        prompt=f"""Create a warm "Good Morning Maldives 🌅" news brief for @samugacommunity.
+        # Inject actual MVT date so Claude never hallucinates it
+        from datetime import timezone, timedelta
+        mvt = datetime.now(timezone.utc) + timedelta(hours=5)
+        today_str = mvt.strftime("%A, %d %B %Y")
+        prompt = f"""Create a warm "Good Morning Maldives 🌅" news brief for @samugacommunity.
+Today's date is {today_str} (Maldives Time). Use this exact date in your greeting.
 Headlines: {chr(10).join(headlines[:8])}
-- Friendly greeting with today's date
+- Friendly greeting mentioning today's date exactly as given above
 - Top 3-5 stories in 1 sentence each with emoji  
 - Upbeat closing
 - Max 180 words, English"""
