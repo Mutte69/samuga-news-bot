@@ -545,30 +545,33 @@ def post_article(article, seen, social_only=False):
 
     social_caption = caption
 
-    # Social only (night mode)
+    # Social only (night mode) — always post to socials, skip Telegram
     if social_only:
         card.seek(0)
-        threading.Thread(target=post_to_social,args=(card,social_caption),daemon=True).start()
-        seen.add(article["id"]); save_seen(seen); remember_post(article["title"],cat,ts)
+        threading.Thread(target=post_to_social, args=(card, social_caption), daemon=True).start()
+        seen.add(article["id"]); save_seen(seen); remember_post(article["title"], cat, ts)
         log.info(f"📱 Social only [{cat}]"); return True
 
-    # Telegram throttle for regular posts
+    # Telegram throttle for regular posts — still post to socials every 30min
     if not breaking and not can_post_regular():
-        mins=int((7200-(datetime.utcnow()-last_regular_post_time).total_seconds())/60)
-        log.info(f"⏳ [{cat}] Telegram throttled {mins}m — social only")
+        mins = int((7200 - (datetime.utcnow() - last_regular_post_time).total_seconds()) / 60)
+        log.info(f"⏳ [{cat}] Telegram throttled {mins}m — posting to socials only")
         card.seek(0)
-        threading.Thread(target=post_to_social,args=(card,social_caption),daemon=True).start()
-        seen.add(article["id"]); save_seen(seen); return False
+        threading.Thread(target=post_to_social, args=(card, social_caption), daemon=True).start()
+        seen.add(article["id"]); save_seen(seen); remember_post(article["title"], cat, ts)
+        return False
 
+    # Day mode — post to Telegram + socials
     log.info(f"📰 [{'🔴BREAKING' if breaking else '🟡REGULAR'}][{cat}] {article['title'][:60]}...")
     if send_to_telegram(card, caption):
-        seen.add(article["id"]); save_seen(seen); remember_post(article["title"],cat,ts)
+        seen.add(article["id"]); save_seen(seen); remember_post(article["title"], cat, ts)
         if not breaking:
-            last_regular_post_time=datetime.utcnow()
+            last_regular_post_time = datetime.utcnow()
             log.info("🕐 Regular timer reset — next in 2hrs")
-        else: log.info("🔴 Breaking posted!")
+        else:
+            log.info("🔴 Breaking posted!")
         card.seek(0)
-        threading.Thread(target=post_to_social,args=(card,social_caption),daemon=True).start()
+        threading.Thread(target=post_to_social, args=(card, social_caption), daemon=True).start()
 
         # Auto poll for political/government news
         if should_create_poll(article["title"], article["summary"], cat):
@@ -579,6 +582,11 @@ def post_article(article, seen, social_only=False):
                 send_poll(question, options)
 
         return True
+    # Telegram failed — still post to socials
+    log.warning(f"Telegram failed for [{cat}] — posting to socials anyway")
+    card.seek(0)
+    threading.Thread(target=post_to_social, args=(card, social_caption), daemon=True).start()
+    seen.add(article["id"]); save_seen(seen)
     return False
 
 # ── Run Job ───────────────────────────────────────────────────────────────────
