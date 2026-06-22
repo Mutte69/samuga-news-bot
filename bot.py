@@ -779,27 +779,47 @@ def chat_with_gemini_dhivehi(user_message, context="", conversation_history=None
 
 def chat_with_claude(user_message, user_id=None):
     try:
-        headlines=[]
-        try: headlines=get_local_headlines()
-        except: pass
-        headlines_text="\n".join(headlines[:8]) if headlines else "No recent headlines."
+        # Run headlines + web search in parallel to cut latency
+        results = {}
 
-        memory_text=""
+        def fetch_headlines():
+            try: results["headlines"] = get_local_headlines()
+            except: results["headlines"] = []
+
+        def fetch_web():
+            try:
+                if needs_web_search(user_message):
+                    q = user_message
+                    local_kws = ["weather","news","update","what happened","anything","latest","today"]
+                    if any(w in user_message.lower() for w in local_kws) and "maldives" not in user_message.lower():
+                        q = f"maldives {user_message} 2026"
+                    elif any(w in user_message.lower() for w in ["world cup","match","score","won","win"]):
+                        q = f"{user_message} 2026 latest"
+                    results["web"] = tavily_search(q)
+                    if results["web"]: log.info(f"🌐 Web: {results['web'][:60]}...")
+            except Exception as e:
+                log.error(f"Web search: {e}")
+                results["web"] = ""
+
+        t1 = threading.Thread(target=fetch_headlines)
+        t2 = threading.Thread(target=fetch_web)
+        t1.start(); t2.start()
+        t1.join(timeout=5); t2.join(timeout=5)
+
+        headlines = results.get("headlines", [])
+        web_context = results.get("web", "") or ""
+        headlines_text = "\n".join(headlines[:8]) if headlines else "No recent headlines."
+
+        memory_text = ""
         if recent_posts:
-            memory_text="Recently posted:\n"+"".join([f"• [{p['cat']}] {p['title']}\n" for p in recent_posts[-5:]])
+            memory_text = "Recently posted:\n" + "".join([f"• [{p['cat']}] {p['title']}\n" for p in recent_posts[-5:]])
 
-        web_context=""
-        try:
-            if needs_web_search(user_message):
-                q=user_message
-                if any(w in user_message.lower() for w in ["world cup","match","score","won","win"]):
-                    q=f"{user_message} 2026 latest"
-                web_context=tavily_search(q)
-        except: pass
-
-        context=f"LATEST NEWS:\n{headlines_text}"
-        if memory_text: context+=f"\n\n{memory_text}"
-        if web_context: context+=f"\n\nWEB SEARCH:\n{web_context[:600]}"
+        if web_context:
+            context = f"LIVE WEB SEARCH (use this for your answer):\n{web_context[:800]}"
+            if memory_text: context += f"\n\n{memory_text}"
+        else:
+            context = f"LATEST NEWS:\n{headlines_text}"
+            if memory_text: context += f"\n\n{memory_text}"
 
         system=f"""You are Samuga AI — smart friendly Maldivian news assistant for Samuga Media.
 
