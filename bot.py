@@ -117,6 +117,36 @@ def can_post_regular():
     if not last_regular_post_time: return True
     return (datetime.utcnow()-last_regular_post_time).total_seconds() >= 7200
 
+# ── Social post daily counter (MVT based) ─────────────────────────────────────
+social_post_counts = {"date": None, "count": 0}
+
+def mvt_now():
+    """Current time in Maldives Time (UTC+5)"""
+    from datetime import timezone
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=5)
+
+def is_day_social():
+    """6AM to 10PM MVT = day mode for socials"""
+    h = mvt_now().hour
+    return 6 <= h < 22
+
+def can_post_social():
+    """Check if social daily limit not reached: 20 posts 6AM-10PM, 5 posts night"""
+    global social_post_counts
+    today = mvt_now().date()
+    if social_post_counts["date"] != today:
+        social_post_counts = {"date": today, "count": 0}
+    limit = 30 if is_day_social() else 5
+    return social_post_counts["count"] < limit
+
+def increment_social_count():
+    global social_post_counts
+    today = mvt_now().date()
+    if social_post_counts["date"] != today:
+        social_post_counts = {"date": today, "count": 0}
+    social_post_counts["count"] += 1
+    log.info(f"📊 Social posts today: {social_post_counts['count']} ({'day' if is_day_social() else 'night'} limit: {30 if is_day_social() else 5})")
+
 # ── Gemini Translate ──────────────────────────────────────────────────────────
 def gemini_translate(text):
     if not GEMINI_API_KEY: return text
@@ -305,6 +335,23 @@ def send_to_telegram(buf, caption):
         resp.raise_for_status(); log.info("✅ Posted to Telegram"); return True
     except Exception as e: log.error(f"Telegram: {e}"); return False
 
+def send_photo(chat_id, buf, caption):
+    """Send a photo to any Telegram chat/channel"""
+    try:
+        buf.seek(0)
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+            data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+            files={"photo": ("weather.png", buf, "image/png")},
+            timeout=30
+        )
+        resp.raise_for_status()
+        log.info("✅ Photo sent to Telegram")
+        return True
+    except Exception as e:
+        log.error(f"send_photo: {e}")
+        return False
+
 def send_text(chat_id, text, reply_to=None):
     payload={"chat_id":chat_id,"text":text,"parse_mode":"HTML"}
     if reply_to: payload["reply_to_message_id"]=reply_to
@@ -477,6 +524,10 @@ def post_to_social(img_buf, caption):
     if not BUFFER_TOKEN:
         log.warning("Social: no BUFFER_TOKEN, skipping")
         return
+    if not can_post_social():
+        limit = 30 if is_day_social() else 5
+        log.info(f"📵 Social limit reached ({30 if is_day_social() else 5} posts {'day' if is_day_social() else 'night'}) — skipping")
+        return
     try:
         img_bytes = img_buf.getvalue()
         image_url = upload_to_imgbb(img_bytes)
@@ -519,13 +570,15 @@ def post_to_social(img_buf, caption):
 
         ok = [k for k, v in results.items() if v]
         fail = [k for k, v in results.items() if not v]
-        if ok: log.info(f"✅ Social posted to: {', '.join(ok)}")
+        if ok:
+            log.info(f"✅ Social posted to: {', '.join(ok)}")
+            increment_social_count()
         if fail: log.error(f"❌ Social failed for: {', '.join(fail)}")
     except Exception as e:
         log.error(f"Social: {e}")
 
 # ── Post Article ──────────────────────────────────────────────────────────────
-def post_article(article, seen, social_only=False):
+def post_article(article, seen, social_only=False, allow_social=True):
     global last_regular_post_time
     cat=article["cat"]
     breaking=is_breaking(article["title"],article["summary"],cat)
@@ -547,8 +600,9 @@ def post_article(article, seen, social_only=False):
 
     # Social only (night mode) — always post to socials, skip Telegram
     if social_only:
-        card.seek(0)
-        threading.Thread(target=post_to_social, args=(card, social_caption), daemon=True).start()
+        if allow_social:
+            card.seek(0)
+            threading.Thread(target=post_to_social, args=(card, social_caption), daemon=True).start()
         seen.add(article["id"]); save_seen(seen); remember_post(article["title"], cat, ts)
         log.info(f"📱 Social only [{cat}]"); return True
 
@@ -590,28 +644,70 @@ def post_article(article, seen, social_only=False):
     return False
 
 # ── Run Job ───────────────────────────────────────────────────────────────────
+def score_article(a):
+    """Score article by Maldives relevance + breaking priority"""
+    score = 0
+    title_lower = a["title"].lower()
+    summary_lower = a.get("summary","").lower()
+    cat = a["cat"]
+    # Category priority
+    if cat == "LOCAL": score += 50
+    elif cat == "DISASTER": score += 40
+    elif cat == "WEATHER": score += 30
+    elif cat == "TOURISM": score += 20
+    elif cat == "WORLD": score += 10
+    elif cat == "FOOTBALL": score += 5
+    # Maldives keywords boost
+    mv_kws = ["maldives","male","dhivehi","raajje","mvr","atoll","island","resort","gaa",
+              "parliament","majlis","president","minister","police","court","malé"]
+    for kw in mv_kws:
+        if kw in title_lower or kw in summary_lower: score += 15
+    # Breaking boost
+    if is_breaking(a["title"], a.get("summary",""), cat): score += 60
+    return score
+
 def run_job(social_only=False):
     h=get_mvt_hour()
     log.info(f"🕐 MVT {h:02d}:xx | {'SOCIAL ONLY' if social_only else 'DAY' if is_day_mode() else 'NIGHT'}")
     seen=load_seen(); articles=fetch_news()
-    breaking_articles=[]; by_cat={}
-    for a in articles:
-        if a["id"] in seen: continue
-        cat=a["cat"]
-        if is_breaking(a["title"],a["summary"],cat): breaking_articles.append(a)
-        elif cat not in by_cat: by_cat[cat]=a
-    if not breaking_articles and not by_cat:
+
+    # Filter unseen and score by Maldives relevance
+    fresh = [a for a in articles if a["id"] not in seen]
+    if not fresh:
         log.info("No fresh articles."); return
-    log.info(f"🔴 {len(breaking_articles)} breaking | 🟡 {len(by_cat)} regular")
-    posted=0
+
+    # Sort by score descending
+    fresh.sort(key=score_article, reverse=True)
+
+    breaking_articles = [a for a in fresh if is_breaking(a["title"], a.get("summary",""), a["cat"])]
+    regular_articles  = [a for a in fresh if not is_breaking(a["title"], a.get("summary",""), a["cat"])]
+
+    log.info(f"🔴 {len(breaking_articles)} breaking | 🟡 {len(regular_articles)} regular")
+
+    posted = 0
+    social_posted = 0
+    MAX_SOCIAL_PER_RUN = 2  # max 2 social posts per 30min check
+
+    # Post breaking first
     for a in breaking_articles:
-        if post_article(a,seen,social_only): posted+=1
+        can_social = social_posted < MAX_SOCIAL_PER_RUN
+        if post_article(a, seen, social_only, allow_social=can_social):
+            posted += 1
+            social_posted += 1
         time.sleep(10)
-    for cat in ["LOCAL","WORLD","FOOTBALL","TOURISM","WEATHER"]:
-        if cat not in by_cat: continue
-        if post_article(by_cat[cat],seen,social_only): posted+=1
-        if posted<len(by_cat): time.sleep(300)
-    log.info(f"✅ Posted {posted} articles.")
+
+    # Then best regular articles (dedupe by category — one per cat)
+    seen_cats = set()
+    for a in regular_articles:
+        if a["cat"] in seen_cats: continue
+        seen_cats.add(a["cat"])
+        can_social = social_posted < MAX_SOCIAL_PER_RUN
+        if post_article(a, seen, social_only, allow_social=can_social):
+            posted += 1
+            social_posted += 1
+        if posted > 1: time.sleep(300)
+
+    log.info(f"✅ Posted {posted} articles ({social_posted} to socials).")
 
 def scheduled_check():
     h=get_mvt_hour()
@@ -643,6 +739,190 @@ Headlines: {chr(10).join(headlines[:8])}
         send_text(TELEGRAM_CHANNEL_ID, caption)
         log.info("✅ Morning brief sent!")
     except Exception as e: log.error(f"Morning brief: {e}")
+
+# ── Weather Card ──────────────────────────────────────────────────────────────
+def get_weather_data():
+    """Fetch real-time weather for Male, Maldives via Open-Meteo (free, no key needed)"""
+    try:
+        # Male, Maldives coordinates
+        url = ("https://api.open-meteo.com/v1/forecast"
+               "?latitude=4.1755&longitude=73.5093"
+               "&current=temperature_2m,weathercode,windspeed_10m,relativehumidity_2m,apparent_temperature"
+               "&hourly=temperature_2m,weathercode,precipitation_probability"
+               "&timezone=Indian%2FMaldives&forecast_days=1")
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as e:
+        log.error(f"Weather fetch: {e}")
+    return None
+
+def weather_code_to_info(code):
+    """Convert WMO weather code to emoji + description"""
+    if code == 0:   return "☀️", "Clear Sky"
+    if code in [1,2]: return "🌤️", "Partly Cloudy"
+    if code == 3:   return "☁️", "Overcast"
+    if code in [45,48]: return "🌫️", "Foggy"
+    if code in [51,53,55]: return "🌦️", "Drizzle"
+    if code in [61,63,65]: return "🌧️", "Rain"
+    if code in [71,73,75]: return "🌨️", "Snow"
+    if code in [80,81,82]: return "🌧️", "Rain Showers"
+    if code in [95,96,99]: return "⛈️", "Thunderstorm"
+    return "🌡️", "Unknown"
+
+def generate_weather_card(weather_data):
+    """Generate iPhone-style weather card"""
+    from PIL import Image, ImageDraw, ImageFont
+    import math
+
+    W, H = 1080, 1080
+    img = Image.new("RGB", (W, H), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    current = weather_data.get("current", {})
+    hourly  = weather_data.get("hourly", {})
+
+    temp     = round(current.get("temperature_2m", 29))
+    feels    = round(current.get("apparent_temperature", 29))
+    humidity = current.get("relativehumidity_2m", 80)
+    wind     = round(current.get("windspeed_10m", 10))
+    code     = current.get("weathercode", 0)
+    emoji, condition = weather_code_to_info(code)
+
+    # Hourly data
+    hours  = hourly.get("time", [])
+    temps  = hourly.get("temperature_2m", [])
+    codes  = hourly.get("weathercode", [])
+    precip = hourly.get("precipitation_probability", [])
+
+    # Background gradient: sky blue to dark blue
+    for y in range(H):
+        t = y / H
+        if code in [95,96,99]:  # thunder
+            r,g,b = int(20+t*30), int(10+t*20), int(40+t*60)
+        elif code in [61,63,65,80,81,82,51,53,55]:  # rain
+            r,g,b = int(40+t*30), int(60+t*40), int(100+t*60)
+        elif code == 0:  # clear
+            r,g,b = int(20+t*10), int(80+t*40), int(180+t*40)
+        else:  # cloudy
+            r,g,b = int(60+t*30), int(80+t*40), int(120+t*60)
+        draw.line([(0,y),(W,y)], fill=(r,g,b))
+
+    try:
+        font_huge  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 160)
+        font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 52)
+        font_med   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 36)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 28)
+        font_tiny  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
+    except:
+        font_huge = font_large = font_med = font_small = font_tiny = ImageFont.load_default()
+
+    from datetime import timezone
+    mvt = datetime.now(timezone.utc) + timedelta(hours=5)
+
+    # Location
+    loc = "Malé, Maldives"
+    lw = draw.textlength(loc, font=font_large)
+    draw.text(((W-lw)//2, 80), loc, font=font_large, fill=(255,255,255,230))
+
+    # Big emoji
+    ew = draw.textlength(emoji, font=font_huge)
+    draw.text(((W-ew)//2, 160), emoji, font=font_huge, fill=(255,255,255,255))
+
+    # Temperature
+    temp_str = f"{temp}°"
+    tw = draw.textlength(temp_str, font=font_huge)
+    draw.text(((W-tw)//2, 360), temp_str, font=font_huge, fill=(255,255,255,255))
+
+    # Condition
+    cw = draw.textlength(condition, font=font_large)
+    draw.text(((W-cw)//2, 540), condition, font=font_large, fill=(255,255,255,200))
+
+    # H/L feels like humidity wind
+    details = f"Feels {feels}°  💧 {humidity}%  💨 {wind} km/h"
+    dw = draw.textlength(details, font=font_med)
+    draw.text(((W-dw)//2, 615), details, font=font_med, fill=(255,255,255,180))
+
+    # Divider
+    draw.line([(80, 680), (W-80, 680)], fill=(255,255,255,60), width=1)
+
+    # Hourly forecast — next 8 hours
+    now_hour = mvt.hour
+    slot_w = (W - 160) // 8
+    from_hour = now_hour
+
+    displayed = 0
+    for i, (h_str, t, c, p) in enumerate(zip(hours, temps, codes, precip)):
+        try:
+            h_hour = int(h_str.split("T")[1][:2])
+        except: continue
+        if h_hour < from_hour: continue
+        if displayed >= 8: break
+
+        x = 80 + displayed * slot_w + slot_w // 2
+        y_base = 710
+
+        # Hour label
+        h_label = f"{h_hour:02d}:00" if displayed > 0 else "Now"
+        hw = draw.textlength(h_label, font=font_tiny)
+        draw.text((x - hw//2, y_base), h_label, font=font_tiny, fill=(255,255,255,180))
+
+        # Weather emoji
+        h_emoji, _ = weather_code_to_info(c)
+        ew2 = draw.textlength(h_emoji, font=font_small)
+        draw.text((x - ew2//2, y_base + 35), h_emoji, font=font_small, fill=(255,255,255,220))
+
+        # Temp
+        t_str = f"{round(t)}°"
+        tw2 = draw.textlength(t_str, font=font_small)
+        draw.text((x - tw2//2, y_base + 80), t_str, font=font_small, fill=(255,255,255,255))
+
+        # Rain %
+        if p > 0:
+            p_str = f"{p}%"
+            pw = draw.textlength(p_str, font=font_tiny)
+            draw.text((x - pw//2, y_base + 115), p_str, font=font_tiny, fill=(100,200,255,200))
+
+        displayed += 1
+
+    # Divider
+    draw.line([(80, 880), (W-80, 880)], fill=(255,255,255,60), width=1)
+
+    # Footer
+    time_str = mvt.strftime("%A, %d %B %Y • %H:%M MVT")
+    fw = draw.textlength(time_str, font=font_tiny)
+    draw.text(((W-fw)//2, 900), time_str, font=font_tiny, fill=(255,255,255,140))
+
+    brand = "Samuga Media | @samugacommunity"
+    bw = draw.textlength(brand, font=font_small)
+    draw.text(((W-bw)//2, 940), brand, font=font_small, fill=(255,255,255,200))
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+def send_weather_update(time_of_day="morning"):
+    """Send weather card to Telegram"""
+    log.info(f"🌤️ Weather update ({time_of_day})...")
+    try:
+        data = get_weather_data()
+        if not data:
+            log.error("Weather: no data"); return
+        card = generate_weather_card(data)
+        current = data.get("current", {})
+        temp = round(current.get("temperature_2m", 29))
+        code = current.get("weathercode", 0)
+        emoji, condition = weather_code_to_info(code)
+        greeting = "🌅 Good Morning Maldives!" if time_of_day == "morning" else "🌙 Good Evening Maldives!"
+        caption = (f"{greeting}\n\n"
+                   f"{emoji} <b>Current Weather \u2014 Mal\u00e9</b>\n"
+                   f"\U0001f321\ufe0f <b>{temp}\u00b0C</b> \u2014 {condition}\n\n"
+                   f"\U0001f4e1 <b>Samuga Media</b> | @samugacommunity")
+        send_photo(TELEGRAM_CHANNEL_ID, card, caption)
+        log.info(f"✅ Weather card sent ({time_of_day})")
+    except Exception as e:
+        log.error(f"Weather update: {e}")
 
 # ── Night Summary (12AM MVT) ──────────────────────────────────────────────────
 def send_night_summary():
@@ -931,7 +1211,7 @@ def handle_updates():
 if __name__ == "__main__":
     log.info("🚀 Samuga News Bot v3.2 starting...")
     log.info("📅 7AM-6PM: every 30min | Night: social only")
-    log.info("🌅 7AM Morning Brief | 🌙 12AM Night Summary | 📊 Friday Weekly Digest")
+    log.info("🌅 7AM Brief | 🌙 12AM Summary | 🌤️ 8AM/8PM Weather | 📊 Friday Digest")
     log.info("💬 Smart chat with history, Tavily search, Dhivehi support")
 
     seen_on_start=load_seen()
@@ -943,10 +1223,14 @@ if __name__ == "__main__":
     scheduler.add_job(scheduled_check, "interval", minutes=30)
     # Morning brief 7AM MVT = 2AM UTC
     scheduler.add_job(send_morning_brief, "cron", hour=2, minute=0)
-    # Night summary 12AM MVT = 7PM UTC (previous day)
+    # Night summary 12AM MVT = 7PM UTC
     scheduler.add_job(send_night_summary, "cron", hour=19, minute=0)
     # Weekly digest Friday 6PM MVT = 1PM UTC Friday
     scheduler.add_job(send_weekly_digest, "cron", day_of_week="fri", hour=13, minute=0)
+    # Weather update 8AM MVT = 3AM UTC
+    scheduler.add_job(lambda: send_weather_update("morning"), "cron", hour=3, minute=0)
+    # Weather update 8PM MVT = 3PM UTC
+    scheduler.add_job(lambda: send_weather_update("evening"), "cron", hour=15, minute=0)
 
     log.info("⏰ Scheduler started!")
     scheduler.start()
