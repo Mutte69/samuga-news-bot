@@ -53,6 +53,26 @@ CAT_CONFIG = {
     "TOURISM": {"label": "✈️  TOURISM",        "color": (160,80,220)},
 }
 
+# ── Core Team Config ──────────────────────────────────────────────────────────
+CORE_TEAM_CHAT_ID = "-1002829230299"
+
+CORE_TEAM_MEMBERS = {
+    "manchii": {"name": "Manchii", "full": "Abdul Muhsin", "role": "Founder & MD", "notes": "Big ideas, entrepreneur, boss, loves to push boundaries"},
+    "mutte":   {"name": "Manchii", "full": "Abdul Muhsin", "role": "Founder & MD", "notes": "Big ideas, entrepreneur, boss, loves to push boundaries"},
+    "uly":     {"name": "Uly", "full": "Mariyam Ulya", "role": "Co-Founder & Editor-in-Chief", "notes": "Journalist brain, editorial standards, keeps content sharp"},
+    "ulya":    {"name": "Uly", "full": "Mariyam Ulya", "role": "Co-Founder & Editor-in-Chief", "notes": "Journalist brain, editorial standards, keeps content sharp"},
+    "thooma":  {"name": "Thooma", "full": "Aminath Thooma", "role": "Presenter & Marketing Assistant", "notes": "Content face, presenter energy, needs confidence boosts sometimes"},
+    "kit":     {"name": "Kity", "full": "Kit", "role": "Manchii's wife & idea contributor", "notes": "Creative, boosts team morale, great at boosting Thooma, shares fresh ideas"},
+    "kity":    {"name": "Kity", "full": "Kit", "role": "Manchii's wife & idea contributor", "notes": "Creative, boosts team morale, great at boosting Thooma, shares fresh ideas"},
+}
+
+CORE_TEAM_PROACTIVE_TRIGGERS = [
+    "?", "idea", "what do you think", "thoughts", "suggest", "help", "brainstorm",
+    "samuga", "content", "post", "story", "news", "plan", "strategy", "marketing",
+    "tiktok", "instagram", "facebook", "caption", "script", "video", "reel",
+    "haha", "lol", "😂", "anyone", "guys", "team", "let's", "lets"
+]
+
 BREAKING_KEYWORDS = [
     "breaking","urgent","alert","killed","dead","dies","explosion","crash","attack",
     "arrested","emergency","disaster","flood","fire","missing","tsunami","earthquake",
@@ -744,11 +764,11 @@ Headlines: {chr(10).join(headlines[:8])}
 def get_weather_data():
     """Fetch real-time weather for Male, Maldives via Open-Meteo (free, no key needed)"""
     try:
-        # Male, Maldives coordinates
         url = ("https://api.open-meteo.com/v1/forecast"
                "?latitude=4.1755&longitude=73.5093"
                "&current=temperature_2m,weathercode,windspeed_10m,relativehumidity_2m,apparent_temperature"
                "&hourly=temperature_2m,weathercode,precipitation_probability"
+               "&daily=temperature_2m_max,temperature_2m_min,sunrise,sunset,weathercode"
                "&timezone=Indian%2FMaldives&forecast_days=1")
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
@@ -770,135 +790,188 @@ def weather_code_to_info(code):
     if code in [95,96,99]: return "⛈️", "Thunderstorm"
     return "🌡️", "Unknown"
 
+def draw_weather_icon(draw, code, x, y, size=40):
+    """Draw vector weather icon instead of emoji (fixes font rendering issues)"""
+    cx, cy = x, y
+    s = size
+    if code == 0:  # Sun
+        draw.ellipse([cx-s//3, cy-s//3, cx+s//3, cy+s//3], fill=(255,220,50,255))
+        for angle in range(0, 360, 45):
+            import math
+            rad = math.radians(angle)
+            x1 = cx + int((s//3+4)*math.cos(rad))
+            y1 = cy + int((s//3+4)*math.sin(rad))
+            x2 = cx + int((s//2+2)*math.cos(rad))
+            y2 = cy + int((s//2+2)*math.sin(rad))
+            draw.line([x1,y1,x2,y2], fill=(255,220,50,220), width=2)
+    elif code in [1,2]:  # Part cloud
+        draw.ellipse([cx-s//3, cy-s//3, cx+s//3, cy+s//3], fill=(255,220,50,200))
+        draw.ellipse([cx-s//2, cy, cx+s//2, cy+s//2], fill=(220,230,255,240))
+        draw.ellipse([cx-s//4, cy-s//6, cx+s//4+6, cy+s//3+4], fill=(220,230,255,240))
+    elif code == 3:  # Cloud
+        draw.ellipse([cx-s//2, cy-s//6, cx+s//2, cy+s//2], fill=(200,210,240,240))
+        draw.ellipse([cx-s//4, cy-s//3, cx+s//4+4, cy+s//4], fill=(200,210,240,240))
+    elif code in [51,53,55,61,63,65,80,81,82]:  # Rain
+        draw.ellipse([cx-s//2, cy-s//4, cx+s//2, cy+s//3], fill=(160,180,220,240))
+        draw.ellipse([cx-s//4, cy-s//2, cx+s//4+4, cy+s//6], fill=(160,180,220,240))
+        for rx in [-s//3, 0, s//3]:
+            draw.line([cx+rx, cy+s//3, cx+rx-4, cy+s//2+4], fill=(100,160,255,220), width=2)
+    elif code in [95,96,99]:  # Thunder
+        draw.ellipse([cx-s//2, cy-s//4, cx+s//2, cy+s//3], fill=(80,80,100,240))
+        draw.ellipse([cx-s//4, cy-s//2, cx+s//4+4, cy+s//6], fill=(80,80,100,240))
+        pts = [cx+4,cy+s//4, cx-4,cy+s//4, cx,cy+s//2, cx-8,cy+s//2, cx+12,cy+s*3//4]
+        draw.line(pts, fill=(255,220,0,255), width=3)
+    else:  # Default cloud
+        draw.ellipse([cx-s//2, cy-s//6, cx+s//2, cy+s//2], fill=(180,190,220,240))
+
 def generate_weather_card(weather_data):
-    """Generate iPhone-style weather card"""
+    """Generate iPhone-style weather card with drawn icons"""
     from PIL import Image, ImageDraw, ImageFont
     import math
 
     W, H = 1080, 1080
-    img = Image.new("RGB", (W, H), (0, 0, 0))
-    draw = ImageDraw.Draw(img)
+    img = Image.new("RGB", (W, H), (0,0,0))
+    draw = ImageDraw.Draw(img, "RGBA")
 
     current = weather_data.get("current", {})
     hourly  = weather_data.get("hourly", {})
+    daily   = weather_data.get("daily", {})
 
     temp     = round(current.get("temperature_2m", 29))
     feels    = round(current.get("apparent_temperature", 29))
     humidity = current.get("relativehumidity_2m", 80)
     wind     = round(current.get("windspeed_10m", 10))
     code     = current.get("weathercode", 0)
-    emoji, condition = weather_code_to_info(code)
+    _, condition = weather_code_to_info(code)
 
-    # Hourly data
+    # Daily H/L
+    temp_max = round(daily.get("temperature_2m_max", [temp])[0])
+    temp_min = round(daily.get("temperature_2m_min", [temp])[0])
+
+    # Sunrise/sunset
+    sunrise_raw = daily.get("sunrise", [""])[0]
+    sunset_raw  = daily.get("sunset", [""])[0]
+    sunrise_str = sunrise_raw.split("T")[1][:5] if "T" in sunrise_raw else "06:00"
+    sunset_str  = sunset_raw.split("T")[1][:5] if "T" in sunset_raw else "18:00"
+
+    # Hourly
     hours  = hourly.get("time", [])
     temps  = hourly.get("temperature_2m", [])
     codes  = hourly.get("weathercode", [])
     precip = hourly.get("precipitation_probability", [])
 
-    # Background gradient: sky blue to dark blue
+    # Background gradient
     for y in range(H):
         t = y / H
-        if code in [95,96,99]:  # thunder
-            r,g,b = int(20+t*30), int(10+t*20), int(40+t*60)
-        elif code in [61,63,65,80,81,82,51,53,55]:  # rain
-            r,g,b = int(40+t*30), int(60+t*40), int(100+t*60)
-        elif code == 0:  # clear
-            r,g,b = int(20+t*10), int(80+t*40), int(180+t*40)
-        else:  # cloudy
-            r,g,b = int(60+t*30), int(80+t*40), int(120+t*60)
-        draw.line([(0,y),(W,y)], fill=(r,g,b))
+        if code in [95,96,99]:
+            r,g,b = int(15+t*25), int(8+t*15), int(35+t*50)
+        elif code in [61,63,65,80,81,82,51,53,55]:
+            r,g,b = int(30+t*25), int(50+t*35), int(90+t*55)
+        elif code == 0:
+            r,g,b = int(15+t*8), int(70+t*35), int(170+t*35)
+        else:
+            r,g,b = int(50+t*25), int(70+t*35), int(110+t*55)
+        draw.line([(0,y),(W,y)], fill=(r,g,b,255))
 
     try:
-        font_huge  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 160)
+        font_huge  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 180)
         font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 52)
         font_med   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 36)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 28)
+        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
         font_tiny  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
+        font_xs    = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
     except:
-        font_huge = font_large = font_med = font_small = font_tiny = ImageFont.load_default()
+        font_huge = font_large = font_med = font_small = font_tiny = font_xs = ImageFont.load_default()
 
     from datetime import timezone
     mvt = datetime.now(timezone.utc) + timedelta(hours=5)
 
     # Location
-    loc = "Malé, Maldives"
+    loc = "Malé, Maldives"
     lw = draw.textlength(loc, font=font_large)
-    draw.text(((W-lw)//2, 80), loc, font=font_large, fill=(255,255,255,230))
+    draw.text(((W-lw)//2, 55), loc, font=font_large, fill=(255,255,255,230))
 
-    # Big emoji
-    ew = draw.textlength(emoji, font=font_huge)
-    draw.text(((W-ew)//2, 160), emoji, font=font_huge, fill=(255,255,255,255))
+    # Big weather icon (drawn)
+    draw_weather_icon(draw, code, W//2, 210, size=100)
 
     # Temperature
     temp_str = f"{temp}°"
     tw = draw.textlength(temp_str, font=font_huge)
-    draw.text(((W-tw)//2, 360), temp_str, font=font_huge, fill=(255,255,255,255))
+    draw.text(((W-tw)//2, 320), temp_str, font=font_huge, fill=(255,255,255,255))
 
     # Condition
     cw = draw.textlength(condition, font=font_large)
-    draw.text(((W-cw)//2, 540), condition, font=font_large, fill=(255,255,255,200))
+    draw.text(((W-cw)//2, 520), condition, font=font_large, fill=(255,255,255,200))
 
-    # H/L feels like humidity wind
-    details = f"Feels {feels}°  💧 {humidity}%  💨 {wind} km/h"
-    dw = draw.textlength(details, font=font_med)
-    draw.text(((W-dw)//2, 615), details, font=font_med, fill=(255,255,255,180))
+    # H / L
+    hl_str = f"H:{temp_max}°  L:{temp_min}°"
+    hlw = draw.textlength(hl_str, font=font_med)
+    draw.text(((W-hlw)//2, 585), hl_str, font=font_med, fill=(255,255,255,190))
+
+    # Details row: feels, humidity, wind
+    details = f"Feels {feels}°   Humidity {humidity}%   Wind {wind} km/h"
+    dw = draw.textlength(details, font=font_tiny)
+    draw.text(((W-dw)//2, 635), details, font=font_tiny, fill=(255,255,255,170))
+
+    # Sunrise / Sunset row
+    sun_str = f"Sunrise {sunrise_str}   Sunset {sunset_str}"
+    sw = draw.textlength(sun_str, font=font_tiny)
+    draw.text(((W-sw)//2, 665), sun_str, font=font_tiny, fill=(255,220,100,200))
 
     # Divider
-    draw.line([(80, 680), (W-80, 680)], fill=(255,255,255,60), width=1)
+    draw.line([(60, 705), (W-60, 705)], fill=(255,255,255,50), width=1)
 
-    # Hourly forecast — next 8 hours
+    # Hourly forecast — next 8 hours with drawn icons
     now_hour = mvt.hour
-    slot_w = (W - 160) // 8
-    from_hour = now_hour
-
+    slot_w = (W - 120) // 8
     displayed = 0
+
     for i, (h_str, t, c, p) in enumerate(zip(hours, temps, codes, precip)):
         try:
             h_hour = int(h_str.split("T")[1][:2])
         except: continue
-        if h_hour < from_hour: continue
+        if h_hour < now_hour: continue
         if displayed >= 8: break
 
-        x = 80 + displayed * slot_w + slot_w // 2
-        y_base = 710
+        x = 60 + displayed * slot_w + slot_w // 2
+        y_base = 725
 
         # Hour label
-        h_label = f"{h_hour:02d}:00" if displayed > 0 else "Now"
-        hw = draw.textlength(h_label, font=font_tiny)
-        draw.text((x - hw//2, y_base), h_label, font=font_tiny, fill=(255,255,255,180))
+        h_label = "Now" if displayed == 0 else f"{h_hour:02d}:00"
+        hw = draw.textlength(h_label, font=font_xs)
+        draw.text((x - hw//2, y_base), h_label, font=font_xs, fill=(255,255,255,170))
 
-        # Weather emoji
-        h_emoji, _ = weather_code_to_info(c)
-        ew2 = draw.textlength(h_emoji, font=font_small)
-        draw.text((x - ew2//2, y_base + 35), h_emoji, font=font_small, fill=(255,255,255,220))
+        # Drawn weather icon
+        draw_weather_icon(draw, c, x, y_base + 45, size=28)
 
         # Temp
         t_str = f"{round(t)}°"
         tw2 = draw.textlength(t_str, font=font_small)
-        draw.text((x - tw2//2, y_base + 80), t_str, font=font_small, fill=(255,255,255,255))
+        draw.text((x - tw2//2, y_base + 75), t_str, font=font_small, fill=(255,255,255,255))
 
         # Rain %
-        if p > 0:
+        if p and p > 0:
             p_str = f"{p}%"
-            pw = draw.textlength(p_str, font=font_tiny)
-            draw.text((x - pw//2, y_base + 115), p_str, font=font_tiny, fill=(100,200,255,200))
+            pw = draw.textlength(p_str, font=font_xs)
+            draw.text((x - pw//2, y_base + 108), p_str, font=font_xs, fill=(120,200,255,210))
 
         displayed += 1
 
-    # Divider
-    draw.line([(80, 880), (W-80, 880)], fill=(255,255,255,60), width=1)
+    # Bottom divider
+    draw.line([(60, 895), (W-60, 895)], fill=(255,255,255,50), width=1)
 
-    # Footer
-    time_str = mvt.strftime("%A, %d %B %Y • %H:%M MVT")
-    fw = draw.textlength(time_str, font=font_tiny)
-    draw.text(((W-fw)//2, 900), time_str, font=font_tiny, fill=(255,255,255,140))
+    # Date + time
+    time_str = mvt.strftime("%A, %d %B %Y  •  %H:%M MVT")
+    fw = draw.textlength(time_str, font=font_xs)
+    draw.text(((W-fw)//2, 910), time_str, font=font_xs, fill=(255,255,255,130))
 
-    brand = "Samuga Media | @samugacommunity"
+    # Brand
+    brand = "Samuga Media  |  @samugacommunity"
     bw = draw.textlength(brand, font=font_small)
     draw.text(((W-bw)//2, 940), brand, font=font_small, fill=(255,255,255,200))
 
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    img.convert("RGB").save(buf, format="PNG")
     buf.seek(0)
     return buf
 
@@ -1133,6 +1206,83 @@ PERSONALITY:
         log.error(f"Chat: {e}")
         return "Hey! Something went wrong 😅 Check @samugacommunity for the latest!"
 
+# ── Core Team Smart Chat ──────────────────────────────────────────────────────
+def get_sender_info(user_name, first_name):
+    """Identify core team member from username or first name"""
+    check = (user_name or "").lower()
+    fname = (first_name or "").lower()
+    for key, info in CORE_TEAM_MEMBERS.items():
+        if key in check or key in fname or info["name"].lower() in fname:
+            return info
+    return None
+
+def should_respond_proactively(text):
+    """Check if bot should jump in without being tagged"""
+    t = text.lower()
+    return any(trigger in t for trigger in CORE_TEAM_PROACTIVE_TRIGGERS)
+
+def chat_with_coreteam(message, sender_name, sender_info=None, conversation_history=None):
+    """Smart core team chat — creative, funny, knows the team"""
+    try:
+        # Build sender context
+        if sender_info:
+            sender_ctx = f"{sender_info['name']} ({sender_info['role']}) — {sender_info['notes']}"
+        else:
+            sender_ctx = sender_name or "a team member"
+
+        # Get recent headlines for context
+        headlines = []
+        try: headlines = get_local_headlines()
+        except: pass
+        news_ctx = "\n".join(headlines[:5]) if headlines else ""
+
+        system = f"""You are Samuga AI — the witty, sharp, creative team assistant for Samuga Media's core team.
+
+ABOUT SAMUGA MEDIA:
+- Maldivian digital news & media outlet
+- Mission: unfiltered truth, real stories, people's voice
+- Telegram: @samugacommunity | Website: en.samugamedia.com
+
+THE CORE TEAM (you know them personally):
+- Manchii (Abdul Muhsin) — Founder & MD. Big vision, entrepreneurial, always thinking of the next move. You can roast him gently 😄
+- Uly (Mariyam Ulya) — Co-Founder & Editor-in-Chief. Sharp journalist brain, keeps everything accurate and on-brand
+- Thooma (Aminath Thooma) — Presenter & Marketing. The face of content, full of energy, sometimes needs that extra confidence push
+- Kity (Kit) — Manchii's wife, creative contributor, team heart, great at hyping Thooma and bringing fresh ideas
+
+YOU ARE SPEAKING WITH: {sender_ctx}
+
+{"LATEST MALDIVES NEWS:\n" + news_ctx if news_ctx else ""}
+
+YOUR PERSONALITY IN THIS GROUP:
+- Casual, warm, feel like a real team member not a bot
+- Funny and witty — crack jokes when the vibe calls for it, especially with Manchii
+- Hype Thooma when she needs it, she's got it in her
+- Support Kity's ideas, she brings great creative energy
+- Help with content ideas, scripts, captions, strategies instantly
+- When brainstorming — give 3 specific ideas not generic ones
+- When asked about news — give sharp Maldivian angle
+- Keep replies SHORT unless they ask for detail — max 3-4 sentences casual
+- Use occasional emoji but don't overdo it
+- Never sound corporate or formal
+- You can randomly drop a fun fact or joke about Maldivian news if the vibe is right
+- Speak like you're part of the team, not serving the team"""
+
+        messages = []
+        if conversation_history:
+            messages = conversation_history[-8:]  # last 4 exchanges
+        messages.append({"role": "user", "content": message})
+
+        msg = ai.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=500,
+            system=system,
+            messages=messages
+        )
+        return msg.content[0].text.strip()
+    except Exception as e:
+        log.error(f"Core team chat: {e}")
+        return None
+
 # ── Chat Handler ──────────────────────────────────────────────────────────────
 def handle_updates():
     offset=0; bot_mention=f"@{BOT_USERNAME}".lower()
@@ -1151,13 +1301,15 @@ def handle_updates():
                 chat_id=msg["chat"]["id"]
                 msg_id=msg["message_id"]
                 chat_type=msg["chat"]["type"]
-                user_name=msg.get("from",{}).get("first_name","there")
+                user_name=msg.get("from",{}).get("username","")
+                first_name=msg.get("from",{}).get("first_name","there")
+                display_name=user_name or first_name
                 user_id=str(msg.get("from",{}).get("id",""))
 
                 if chat_type=="private":
                     if text.startswith("/start"):
                         send_text(chat_id,
-                            f"👋 Hey {user_name}! I'm <b>Samuga AI</b> — your Maldives news assistant!\n\n"
+                            f"👋 Hey {first_name}! I'm <b>Samuga AI</b> — your Maldives news assistant!\n\n"
                             f"Ask me anything about Maldives news, politics, tourism, football or world news.\n\n"
                             f"ދިވެހިން ވެސް ވާހަކަ ދެއްކިދާނެ! 🇲🇻\n\n"
                             f"📡 Follow <b>@samugacommunity</b> for live news updates!",reply_to=msg_id)
@@ -1168,7 +1320,7 @@ def handle_updates():
                         reply=chat_with_claude(f"Tell me about: {query}. Use this info: {results[:400]}", user_id)
                         send_text(chat_id, reply, reply_to=msg_id)
                     else:
-                        log.info(f"💬 DM {user_name}: {text[:50]}")
+                        log.info(f"💬 DM {display_name}: {text[:50]}")
                         # Route Dhivehi to Gemini
                         if is_dhivehi(text):
                             log.info("🇲🇻 Dhivehi detected — using Gemini")
@@ -1186,24 +1338,52 @@ def handle_updates():
                         send_text(chat_id, reply, reply_to=msg_id)
 
                 elif chat_type in ["group","supergroup"]:
-                    if bot_mention in text.lower():
-                        clean=text.lower().replace(bot_mention,"").strip()
-                        if clean:
-                            log.info(f"💬 Group {user_name}: {clean[:50]}")
+                    is_core_team = str(chat_id) == CORE_TEAM_CHAT_ID
+                    tagged = bot_mention in text.lower()
+                    clean = text.replace(bot_mention, "").strip() if tagged else text.strip()
+
+                    # Core team group — smarter behavior
+                    if is_core_team:
+                        sender_info = get_sender_info(display_name, first_name)
+                        history = get_conversation(user_id)
+
+                        # Respond if tagged OR proactive trigger detected
+                        if tagged or should_respond_proactively(text):
+                            if not clean: clean = text.strip()
+                            log.info(f"🧠 Core team {'[tagged]' if tagged else '[proactive]'} {display_name}: {clean[:50]}")
+
                             if is_dhivehi(clean):
-                                log.info("🇲🇻 Dhivehi group mention — using Gemini")
                                 headlines = get_local_headlines()
-                                context = "\n".join(headlines[:5]) if headlines else ""
-                                history = get_conversation(user_id)
-                                reply = chat_with_gemini_dhivehi(clean, context, history)
-                                if reply:
-                                    add_to_conversation(user_id, "user", clean)
-                                    add_to_conversation(user_id, "assistant", reply)
-                                else:
-                                    reply = chat_with_claude(clean, user_id)
+                                ctx = "\n".join(headlines[:5]) if headlines else ""
+                                reply = chat_with_gemini_dhivehi(clean, ctx, history)
+                                if not reply:
+                                    reply = chat_with_coreteam(clean, user_name, sender_info, history)
+                            else:
+                                reply = chat_with_coreteam(clean, user_name, sender_info, history)
+
+                            if reply:
+                                add_to_conversation(user_id, "user", clean)
+                                add_to_conversation(user_id, "assistant", reply)
+                                # Reply directly if tagged, send without reply if proactive
+                                send_text(chat_id, reply, reply_to=msg_id if tagged else None)
+
+                    # Regular group — only respond when tagged
+                    elif tagged and clean:
+                        log.info(f"💬 Group {display_name}: {clean[:50]}")
+                        if is_dhivehi(clean):
+                            log.info("🇲🇻 Dhivehi group mention — using Gemini")
+                            headlines = get_local_headlines()
+                            context = "\n".join(headlines[:5]) if headlines else ""
+                            history = get_conversation(user_id)
+                            reply = chat_with_gemini_dhivehi(clean, context, history)
+                            if reply:
+                                add_to_conversation(user_id, "user", clean)
+                                add_to_conversation(user_id, "assistant", reply)
                             else:
                                 reply = chat_with_claude(clean, user_id)
-                            send_text(chat_id, reply, reply_to=msg_id)
+                        else:
+                            reply = chat_with_claude(clean, user_id)
+                        send_text(chat_id, reply, reply_to=msg_id)
         except Exception as e:
             log.error(f"Update loop: {e}"); time.sleep(5)
 
