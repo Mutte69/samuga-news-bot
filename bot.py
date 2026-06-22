@@ -67,10 +67,10 @@ CORE_TEAM_MEMBERS = {
 }
 
 CORE_TEAM_PROACTIVE_TRIGGERS = [
-    "?", "idea", "what do you think", "thoughts", "suggest", "help", "brainstorm",
-    "samuga", "content", "post", "story", "news", "plan", "strategy", "marketing",
+    "?", "idea", "what do you think", "thoughts", "suggest", "brainstorm",
+    "samuga", "content", "post", "story", "plan", "strategy", "marketing",
     "tiktok", "instagram", "facebook", "caption", "script", "video", "reel",
-    "haha", "lol", "😂", "anyone", "guys", "team", "let's", "lets"
+    "haha", "lol", "😂", "anyone", "guys", "let's", "lets", "what if", "how about"
 ]
 
 BREAKING_KEYWORDS = [
@@ -1052,8 +1052,11 @@ def tavily_search(query):
 
 def needs_web_search(msg):
     # Skip search only for simple greetings / meta questions
-    skip_kws = ["hello", "hi ", "who are you", "what is samuga", "about you",
-                "thank", "okay", "ok", "bye", "good morning", "good night"]
+    # Skip search for short messages or greetings
+    if len(msg.strip()) <= 4: return False
+    skip_kws = ["hello", "hi", "who are you", "what is samuga", "about you",
+                "thank", "okay", "ok", "bye", "good morning", "good night",
+                "good evening", "assalam", "hey", "sup", "wassup"]
     if any(k in msg.lower() for k in skip_kws): return False
     return True  # Default: always search for current info
 
