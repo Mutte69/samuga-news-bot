@@ -609,11 +609,11 @@ def tavily_search(query):
     return ""
 
 def needs_web_search(msg):
-    kws=["latest","today","now","current","happening","news","score","match","result",
-         "win","won","lost","goal","weather","storm","earthquake","tsunami","war","attack",
-         "update","recently","breaking","who","when","champion","cup","killed","dead",
-         "crash","accident","fire","flood","yesterday","election","vote"]
-    return any(k in msg.lower() for k in kws)
+    # Skip search only for simple greetings / meta questions
+    skip_kws = ["hello", "hi ", "who are you", "what is samuga", "about you",
+                "thank", "okay", "ok", "bye", "good morning", "good night"]
+    if any(k in msg.lower() for k in skip_kws): return False
+    return True  # Default: always search for current info
 
 # ── Smart Chat ────────────────────────────────────────────────────────────────
 def is_dhivehi(text):
@@ -628,7 +628,23 @@ def chat_with_gemini_dhivehi(user_message, context="", conversation_history=None
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={GEMINI_API_KEY}"
 
-        news_section = ("LATEST NEWS CONTEXT:\n" + context) if context else ""
+        # Try web search for Dhivehi queries too
+        web_context = ""
+        try:
+            if needs_web_search(user_message) or not context:
+                web_context = tavily_search(f"maldives news today 2026")
+                if web_context:
+                    log.info("🌐 Dhivehi path: web search done")
+        except Exception as e:
+            log.error(f"Dhivehi web search: {e}")
+
+        if web_context:
+            news_section = "LIVE WEB SEARCH (use this for answers, never repeat same info):\n" + web_context[:600]
+        elif context:
+            news_section = "LATEST NEWS CONTEXT:\n" + context
+        else:
+            news_section = ""
+
         system_prompt = (
             "You are Samuga AI, a Maldivian news assistant. Always reply in natural Dhivehi (Thaana script) only.\n\n"
             "ABOUT SAMUGA:\n"
@@ -640,8 +656,11 @@ def chat_with_gemini_dhivehi(user_message, context="", conversation_history=None
             "- Reply ONLY in Dhivehi Thaana script\n"
             "- Natural, conversational tone like a friendly Maldivian\n"
             "- Max 3-4 sentences\n"
+            "- NEVER repeat the same news you already mentioned in this conversation\n"
+            "- If asked for more — give DIFFERENT stories\n"
             "- Mention @samugacommunity when relevant\n"
-            "- Never write in English or Latin script"
+            "- Never write in English or Latin script\n"
+            "- Never say you cannot search or lack real-time info"
         )
 
         # Build contents array with history for multi-turn
