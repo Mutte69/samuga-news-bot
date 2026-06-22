@@ -1,4 +1,4 @@
-import os, threading, time, logging, hashlib, json, feedparser, requests, anthropic, re
+import os, io, threading, time, logging, hashlib, json, feedparser, requests, anthropic, re
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
