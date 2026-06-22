@@ -412,57 +412,104 @@ def upload_to_imgbb(img_bytes):
 
 def post_to_buffer(image_url, caption, channel_ids):
     if not BUFFER_TOKEN: return False
-    clean = re.sub(r'<[^>]+>', '', caption).replace('&amp;', '&').strip()
+    clean = re.sub(r'<[^>]+>', '', caption).replace('&amp;', '&').strip()[:2200]
+
+    query = """
+mutation CreatePost($input: CreatePostInput!) {
+  createPost(input: $input) {
+    ... on PostActionSuccess {
+      post { id text }
+    }
+    ... on MutationError {
+      message
+    }
+  }
+}"""
+
     for cid in channel_ids:
         if not cid: continue
         try:
-            query = """
-mutation CreatePost {
-  createPost(input: {
-    text: "%s"
-    channelId: "%s"
-    schedulingType: automatic
-    mode: addToQueue
-    assets: [{ image: { url: "%s" } }]
-  }) {
-    ... on PostActionSuccess { post { id text } }
-    ... on MutationError { message }
-  }
-}""" % (clean[:2200].replace('"', '\\"').replace('\n', ' '), cid, image_url)
+            variables = {
+                "input": {
+                    "text": clean,
+                    "channelId": cid,
+                    "schedulingType": "automatic",
+                    "mode": "addToQueue",
+                    "assets": [{"image": {"url": image_url}}]
+                }
+            }
             resp = requests.post(
                 "https://api.buffer.com",
-                json={"query": query},
-                headers={"Authorization": f"Bearer {BUFFER_TOKEN}", "Content-Type": "application/json"},
+                json={"query": query, "variables": variables},
+                headers={
+                    "Authorization": f"Bearer {BUFFER_TOKEN}",
+                    "Content-Type": "application/json"
+                },
                 timeout=20
             )
+            log.info(f"Buffer raw [{cid[:8]}]: {resp.status_code} | {resp.text[:400]}")
             if resp.status_code == 200:
                 data = resp.json()
                 if "errors" in data:
-                    log.error(f"Buffer [{cid[:8]}]: {data['errors']}")
+                    log.error(f"Buffer GraphQL error [{cid[:8]}]: {data['errors']}")
                 else:
                     result = data.get("data", {}).get("createPost", {})
                     err_msg = result.get("message", "")
                     if err_msg:
-                        log.error(f"Buffer [{cid[:8]}]: {err_msg}")
+                        log.error(f"Buffer mutation error [{cid[:8]}]: {err_msg}")
                     else:
                         post_id = result.get("post", {}).get("id", "?")
-                        log.info(f"✅ Buffer posted [{cid[:8]}] post_id={post_id}")
+                        log.info(f"✅ Buffer posted [{cid[:8]}] id={post_id}")
             else:
                 log.error(f"Buffer HTTP {resp.status_code}: {resp.text[:300]}")
         except Exception as e:
-            log.error(f"Buffer: {e}")
+            log.error(f"Buffer exception [{cid[:8]}]: {e}")
         time.sleep(2)
     return True
 
 def post_to_social(img_buf, caption):
     if not BUFFER_TOKEN: return
     try:
-        img_bytes=img_buf.getvalue()
-        url=upload_to_imgbb(img_bytes)
-        if url:
-            post_to_buffer(url, caption, [BUFFER_FB_ID, BUFFER_IG_ID, BUFFER_TW_ID])
-            log.info("✅ Social posting done!")
-    except Exception as e: log.error(f"Social: {e}")
+        img_bytes = img_buf.getvalue()
+        image_url = upload_to_imgbb(img_bytes)
+        if not image_url:
+            log.error("Social: imgbb upload failed, skipping")
+            return
+
+        # Strip HTML for social platforms
+        clean = re.sub(r'<[^>]+>', '', caption).replace('&amp;', '&').strip()
+
+        # Extract article URL from caption
+        link_match = re.search(r"href='([^']+)'", caption)
+        article_url = link_match.group(1) if link_match else ""
+
+        # FB/IG: full text + link
+        fb_ig = clean
+        if article_url and article_url not in fb_ig:
+            fb_ig = fb_ig + "\n\n" + article_url
+        fb_ig = fb_ig[:2200]
+
+        # Twitter: title only + link (280 char limit)
+        title_line = [l.strip() for l in clean.split('\n') if l.strip()]
+        tw = (title_line[0] if title_line else clean)[:220]
+        if article_url:
+            tw = tw + "\n\n" + article_url
+        tw = tw[:280]
+
+        for cid, cap, name in [
+            (BUFFER_FB_ID, fb_ig, "Facebook"),
+            (BUFFER_IG_ID, fb_ig, "Instagram"),
+            (BUFFER_TW_ID, tw, "Twitter"),
+        ]:
+            if not cid:
+                log.warning(f"Skipping {name} — no channel ID")
+                continue
+            post_to_buffer(image_url, cap, [cid])
+            time.sleep(1)
+
+        log.info("✅ Social posting done!")
+    except Exception as e:
+        log.error(f"Social: {e}")
 
 # ── Post Article ──────────────────────────────────────────────────────────────
 def post_article(article, seen, social_only=False):
