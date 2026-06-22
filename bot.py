@@ -620,34 +620,62 @@ def is_dhivehi(text):
     """Check if text contains Thaana script (Dhivehi)"""
     return any('\u0780' <= c <= '\u07BF' for c in text)
 
-def chat_with_gemini_dhivehi(user_message, context=""):
-    """Handle Dhivehi chat using Claude with strong Dhivehi prompt"""
+def chat_with_gemini_dhivehi(user_message, context="", conversation_history=None):
+    """Handle Dhivehi chat using actual Gemini API (native Dhivehi support)"""
+    if not GEMINI_API_KEY:
+        log.warning("No GEMINI_API_KEY — falling back to Claude for Dhivehi")
+        return None
     try:
-        system = f"""You are Samuga AI, a Maldivian news assistant. The user is writing in Dhivehi.
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
 
-YOU MUST reply ONLY in Dhivehi (Thaana script). Do not write any English words at all.
+        system_prompt = f"""ތިބާއީ ސަމޫގާ އޭއައި — ސަމޫގާ މީޑިއާގެ ހޭލުންތެރި ދިވެހި ނިއުސް އެސިސްޓެންޓް.
 
-{"Latest news: " + context if context else ""}
+You are Samuga AI, a Maldivian news assistant. Always reply in natural Dhivehi (Thaana script) only.
 
-Samuga Media is a Maldivian news outlet. Channel: @samugacommunity
-Founder: Abdul Muhsin (Manchii). Co-Founder: Mariyam Ulya (Uly).
+ABOUT SAMUGA:
+- Samuga Media: Maldivian digital news outlet
+- Channel: @samugacommunity
+- Founder: Abdul Muhsin (Manchii) | Co-Founder: Mariyam Ulya (Uly)
 
-Rules:
-- Reply in natural conversational Dhivehi only
-- Max 3 sentences
-- Mention @samugacommunity if relevant"""
+{("LATEST NEWS CONTEXT:\n" + context) if context else ""}
 
-        msg = ai.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=400,
-            system=system,
-            messages=[{"role":"user","content":user_message}]
-        )
-        reply = msg.content[0].text.strip()
-        log.info("✅ Dhivehi reply done")
-        return reply
+RULES:
+- Reply ONLY in Dhivehi Thaana script
+- Natural, conversational tone like a friendly Maldivian
+- Max 3-4 sentences
+- Mention @samugacommunity when relevant
+- Never write in English or Latin script"""
+
+        # Build contents array with history for multi-turn
+        contents = []
+
+        # Add conversation history if available
+        if conversation_history:
+            for turn in conversation_history[-6:]:  # last 3 exchanges
+                role = "user" if turn["role"] == "user" else "model"
+                contents.append({"role": role, "parts": [{"text": turn["content"]}]})
+
+        # Add current message
+        contents.append({"role": "user", "parts": [{"text": user_message}]})
+
+        payload = {
+            "system_instruction": {"parts": [{"text": system_prompt}]},
+            "contents": contents,
+            "generationConfig": {
+                "maxOutputTokens": 400,
+                "temperature": 0.7,
+            }
+        }
+
+        resp = requests.post(url, json=payload, timeout=15)
+        if resp.status_code == 200:
+            reply = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            log.info("✅ Gemini Dhivehi chat reply done")
+            return reply
+        else:
+            log.error(f"Gemini Dhivehi chat HTTP {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
-        log.error(f"Dhivehi chat error: {e}")
+        log.error(f"Gemini Dhivehi chat error: {e}")
     return None
 
 def chat_with_claude(user_message, user_id=None):
@@ -747,8 +775,12 @@ def handle_updates():
                             log.info("🇲🇻 Dhivehi detected — using Gemini")
                             headlines = get_local_headlines()
                             context = "\n".join(headlines[:5]) if headlines else ""
-                            reply = chat_with_gemini_dhivehi(text, context)
-                            if not reply:
+                            history = get_conversation(user_id)
+                            reply = chat_with_gemini_dhivehi(text, context, history)
+                            if reply:
+                                add_to_conversation(user_id, "user", text)
+                                add_to_conversation(user_id, "assistant", reply)
+                            else:
                                 reply = chat_with_claude(text, user_id)
                         else:
                             reply = chat_with_claude(text, user_id)
@@ -763,7 +795,13 @@ def handle_updates():
                                 log.info("🇲🇻 Dhivehi group mention — using Gemini")
                                 headlines = get_local_headlines()
                                 context = "\n".join(headlines[:5]) if headlines else ""
-                                reply = chat_with_gemini_dhivehi(clean, context) or chat_with_claude(clean, user_id)
+                                history = get_conversation(user_id)
+                                reply = chat_with_gemini_dhivehi(clean, context, history)
+                                if reply:
+                                    add_to_conversation(user_id, "user", clean)
+                                    add_to_conversation(user_id, "assistant", reply)
+                                else:
+                                    reply = chat_with_claude(clean, user_id)
                             else:
                                 reply = chat_with_claude(clean, user_id)
                             send_text(chat_id, reply, reply_to=msg_id)
@@ -772,7 +810,7 @@ def handle_updates():
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("🚀 Samuga News Bot v3.0 starting...")
+    log.info("🚀 Samuga News Bot v3.1 starting...")
     log.info("📅 7AM-6PM: every 30min | Night: social only")
     log.info("🌅 7AM Morning Brief | 🌙 12AM Night Summary | 📊 Friday Weekly Digest")
     log.info("💬 Smart chat with history, Tavily search, Dhivehi support")
