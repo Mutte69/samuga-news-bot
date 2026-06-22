@@ -411,9 +411,23 @@ def upload_to_imgbb(img_bytes):
     except Exception as e: log.error(f"imgbb: {e}")
     return None
 
-def post_to_buffer(image_url, caption, channel_ids):
-    if not BUFFER_TOKEN: return False
-    clean = re.sub(r'<[^>]+>', '', caption).replace('&amp;', '&').strip()[:2200]
+def resolve_url(url):
+    """Follow redirects to get the real URL (fixes Google News RSS links)"""
+    if not url: return url
+    try:
+        if "news.google.com" in url or "feedproxy" in url:
+            r = requests.get(url, allow_redirects=True, timeout=10)
+            real = r.url
+            log.info(f"🔗 Resolved URL: {real[:80]}")
+            return real
+    except Exception as e:
+        log.warning(f"URL resolve failed: {e}")
+    return url
+
+def post_to_buffer(image_url, caption, channel_id, media_type=None):
+    """Post to a single Buffer channel with optional mediaType"""
+    if not BUFFER_TOKEN or not channel_id: return False
+    clean = re.sub(r'<[^>]+>', '', caption).replace('&amp;', '&').strip()
 
     query = """
 mutation CreatePost($input: CreatePostInput!) {
@@ -427,46 +441,45 @@ mutation CreatePost($input: CreatePostInput!) {
   }
 }"""
 
-    for cid in channel_ids:
-        if not cid: continue
-        try:
-            variables = {
-                "input": {
-                    "text": clean,
-                    "channelId": cid,
-                    "schedulingType": "automatic",
-                    "mode": "addToQueue",
-                    "assets": [{"image": {"url": image_url}}]
-                }
-            }
-            resp = requests.post(
-                "https://api.buffer.com",
-                json={"query": query, "variables": variables},
-                headers={
-                    "Authorization": f"Bearer {BUFFER_TOKEN}",
-                    "Content-Type": "application/json"
-                },
-                timeout=20
-            )
-            log.info(f"Buffer raw [{cid[:8]}]: {resp.status_code} | {resp.text[:400]}")
-            if resp.status_code == 200:
-                data = resp.json()
-                if "errors" in data:
-                    log.error(f"Buffer GraphQL error [{cid[:8]}]: {data['errors']}")
-                else:
-                    result = data.get("data", {}).get("createPost", {})
-                    err_msg = result.get("message", "")
-                    if err_msg:
-                        log.error(f"Buffer mutation error [{cid[:8]}]: {err_msg}")
-                    else:
-                        post_id = result.get("post", {}).get("id", "?")
-                        log.info(f"✅ Buffer posted [{cid[:8]}] id={post_id}")
-            else:
-                log.error(f"Buffer HTTP {resp.status_code}: {resp.text[:300]}")
-        except Exception as e:
-            log.error(f"Buffer exception [{cid[:8]}]: {e}")
-        time.sleep(2)
-    return True
+    try:
+        post_input = {
+            "text": clean,
+            "channelId": channel_id,
+            "schedulingType": "automatic",
+            "mode": "addToQueue",
+            "assets": [{"image": {"url": image_url}}]
+        }
+        if media_type:
+            post_input["mediaType"] = media_type
+
+        resp = requests.post(
+            "https://api.buffer.com",
+            json={"query": query, "variables": {"input": post_input}},
+            headers={
+                "Authorization": f"Bearer {BUFFER_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            timeout=20
+        )
+        log.info(f"Buffer raw [{channel_id[:8]}]: {resp.status_code} | {resp.text[:400]}")
+        if resp.status_code == 200:
+            data = resp.json()
+            if "errors" in data:
+                log.error(f"Buffer GraphQL error [{channel_id[:8]}]: {data['errors']}")
+                return False
+            result = data.get("data", {}).get("createPost", {})
+            err_msg = result.get("message", "")
+            if err_msg:
+                log.error(f"Buffer mutation error [{channel_id[:8]}]: {err_msg}")
+                return False
+            post_id = result.get("post", {}).get("id", "?")
+            log.info(f"✅ Buffer posted [{channel_id[:8]}] id={post_id}")
+            return True
+        else:
+            log.error(f"Buffer HTTP {resp.status_code}: {resp.text[:300]}")
+    except Exception as e:
+        log.error(f"Buffer exception [{channel_id[:8]}]: {e}")
+    return False
 
 def post_to_social(img_buf, caption):
     if not BUFFER_TOKEN: return
@@ -480,33 +493,35 @@ def post_to_social(img_buf, caption):
         # Strip HTML for social platforms
         clean = re.sub(r'<[^>]+>', '', caption).replace('&amp;', '&').strip()
 
-        # Extract article URL from caption
+        # Extract and resolve article URL (fixes Google News redirect URLs)
         link_match = re.search(r"href='([^']+)'", caption)
-        article_url = link_match.group(1) if link_match else ""
+        raw_url = link_match.group(1) if link_match else ""
+        article_url = resolve_url(raw_url) if raw_url else ""
 
-        # FB/IG: full text + link
+        # FB/IG caption: full text + real link
         fb_ig = clean
         if article_url and article_url not in fb_ig:
             fb_ig = fb_ig + "\n\n" + article_url
         fb_ig = fb_ig[:2200]
 
-        # Twitter: title only + link (280 char limit)
-        title_line = [l.strip() for l in clean.split('\n') if l.strip()]
-        tw = (title_line[0] if title_line else clean)[:220]
+        # Twitter caption: first line only + link (280 char hard limit)
+        lines = [l.strip() for l in clean.split('\n') if l.strip()]
+        tw = (lines[0] if lines else clean)[:220]
         if article_url:
             tw = tw + "\n\n" + article_url
         tw = tw[:280]
 
-        for cid, cap, name in [
-            (BUFFER_FB_ID, fb_ig, "Facebook"),
-            (BUFFER_IG_ID, fb_ig, "Instagram"),
-            (BUFFER_TW_ID, tw, "Twitter"),
+        # Post to each platform with correct mediaType
+        for cid, cap, name, mtype in [
+            (BUFFER_FB_ID, fb_ig, "Facebook", "post"),
+            (BUFFER_IG_ID, fb_ig, "Instagram", "post"),
+            (BUFFER_TW_ID, tw,    "Twitter",   None),
         ]:
             if not cid:
-                log.warning(f"Skipping {name} — no channel ID")
+                log.warning(f"Skipping {name} — no channel ID set")
                 continue
-            post_to_buffer(image_url, cap, [cid])
-            time.sleep(1)
+            post_to_buffer(image_url, cap, cid, media_type=mtype)
+            time.sleep(2)
 
         log.info("✅ Social posting done!")
     except Exception as e:
