@@ -920,18 +920,47 @@ IMAGE: [specific keyword]"""
         return title, DEFAULT_KEYWORDS.get(cat,"maldives")
 
 # ── Pexels ────────────────────────────────────────────────────────────────────
-def fetch_background_image(keyword):
+# Category-specific Pexels keyword pools for manual cards with no photo attached
+CAT_BG_KEYWORDS = {
+    "BREAKING":  ["emergency lights dark", "crisis night city", "dark dramatic sky", "police lights night", "siren emergency"],
+    "LOCAL":     ["maldives aerial ocean", "male maldives cityscape", "maldives island aerial", "tropical island drone", "maldives lagoon blue"],
+    "POLITICAL": ["parliament building architecture", "government building columns", "official meeting room", "flag government building", "diplomatic hall"],
+    "LIFESTYLE": ["maldives resort overwater", "maldives sunset beach", "tropical luxury resort", "maldives turquoise water", "maldives bungalow ocean"],
+    "SPORTS":    ["football stadium lights night", "soccer field aerial", "athlete stadium crowd", "sport arena lights", "football pitch green"],
+    "DISASTER":  ["emergency lights dark", "crisis rescue night", "dark storm dramatic", "fire rescue dark", "disaster rescue"],
+    "WORLD":     ["world globe dark", "city skyline night", "international airport", "global city lights", "urban skyline dramatic"],
+    "TOURISM":   ["maldives resort luxury", "tropical beach aerial", "maldives overwater villa", "island paradise blue", "resort pool tropical"],
+    "WEATHER":   ["storm clouds dramatic", "tropical rain dark", "monsoon ocean waves", "dark clouds sea", "storm lightning ocean"],
+    "FOOTBALL":  ["football stadium lights night", "soccer field green aerial", "football match crowd", "sport arena lights", "football pitch"],
+}
+DEFAULT_BG_KEYWORDS = ["maldives ocean aerial", "island blue lagoon", "tropical dark dramatic", "maldives night city", "ocean waves dark"]
+
+def fetch_background_image(keyword, cat=None):
+    """Fetch background from Pexels. If cat is given, uses category keyword pool for variety."""
     if not PEXELS_API_KEY: return None
+    import random as _rand
     try:
-        resp = requests.get(f"https://api.pexels.com/v1/search?query={keyword}&per_page=5&orientation=square", headers={"Authorization":PEXELS_API_KEY}, timeout=15)
+        # Use category pool for manual cards (more variety, category-appropriate)
+        if cat and cat in CAT_BG_KEYWORDS:
+            search_kw = _rand.choice(CAT_BG_KEYWORDS[cat])
+        elif not keyword or keyword in ["maldives news", "news"]:
+            search_kw = _rand.choice(DEFAULT_BG_KEYWORDS)
+        else:
+            search_kw = keyword
+        resp = requests.get(
+            f"https://api.pexels.com/v1/search?query={search_kw}&per_page=10&orientation=square",
+            headers={"Authorization": PEXELS_API_KEY}, timeout=15)
         if resp.status_code == 200:
-            photos = resp.json().get("photos",[])
+            photos = resp.json().get("photos", [])
             if photos:
-                r = requests.get(photos[0]["src"]["large"], timeout=20)
+                # Pick randomly from results — no more same photo every time
+                photo = _rand.choice(photos)
+                r = requests.get(photo["src"]["large"], timeout=20)
                 if r.status_code == 200:
-                    log.info(f"✅ Pexels: {keyword}")
+                    log.info(f"✅ Pexels: {search_kw}")
                     return Image.open(BytesIO(r.content)).convert("RGB")
-    except Exception as e: log.error(f"Pexels: {e}")
+    except Exception as e:
+        log.error(f"Pexels: {e}")
     return None
 
 # ── Generate Card ─────────────────────────────────────────────────────────────
@@ -2754,7 +2783,7 @@ def handle_updates():
                                         bg = download_telegram_photo(photo)
                                         log.info("🖼️ Using uploaded photo as card background")
                                     else:
-                                        bg = fetch_background_image("maldives news")
+                                        bg = fetch_background_image(None, cat=manual_cat)
 
                                     ts_now = (datetime.utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
                                     card = generate_card(content_text, "Samuga Media", ts_now, manual_cat, bg)
