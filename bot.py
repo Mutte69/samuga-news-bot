@@ -125,8 +125,10 @@ CORE_TEAM_PROACTIVE_TRIGGERS = [
 BREAKING_KEYWORDS = [
     "killed","dead","dies","murder","shot","stabbed","explosion","bomb","attack",
     "tsunami","earthquake","flood","disaster","sinking","collapsed","hostage",
-    "emergency","missing person","arrested","raided","fire broke","crash landed"
+    "missing person","fire broke","crash landed","emergency landing","gas leak",
+    "capsized","swept away","search and rescue"
 ]
+# Note: "arrested" and "raided" removed — those go through normal news flow
 
 # Keywords that should NEVER be breaking news
 BREAKING_BLACKLIST = [
@@ -248,6 +250,26 @@ def can_post_regular():
     global last_regular_post_time
     if not last_regular_post_time: return True
     return (datetime.utcnow()-last_regular_post_time).total_seconds() >= 5400  # 1hr 30min
+
+# ── Social filter — only quality LOCAL/DISASTER/relevant WORLD goes to socials ─
+def allowed_for_social(article):
+    """Only high-value articles go to Facebook/Instagram/X."""
+    cat = article["cat"]
+    # Never post these to social
+    if cat in ["SPORTS", "FOOTBALL", "WEATHER", "TOURISM"]:
+        return False
+    if cat == "WORLD":
+        # Only Maldives-relevant world news
+        text = (article["title"] + " " + article.get("summary","")).lower()
+        mv_terms = ["maldives","indian ocean","south asia","india","china","un ","dollar","oil price","global economy"]
+        return any(t in text for t in mv_terms)
+    # LOCAL and DISASTER always allowed
+    return True
+
+# ── Pending article queue — best article waiting for 90min window ─────────────
+# Instead of posting to social every scan, we store the best article and post
+# it only when the 90min Telegram window opens.
+_pending_article = None  # holds the best unseen article between scans
 
 # ── Social post daily counter (MVT based) ─────────────────────────────────────
 social_post_counts = {"date": None, "count": 0}
@@ -1045,13 +1067,10 @@ def post_article(article, seen, social_only=False, allow_social=True):
         seen.add(article["id"]); save_seen(seen); remember_post(article["title"], cat, ts)
         log.info(f"📱 Social only [{cat}]"); return True
 
-    # Telegram throttle for regular posts — still post to socials every 30min
+    # Throttle check — run_job already guards this before calling post_article,
+    # but as a safety net: if somehow called while throttled, just skip entirely.
     if not breaking and not can_post_regular():
-        mins = int((5400 - (datetime.utcnow() - last_regular_post_time).total_seconds()) / 60)
-        log.info(f"⏳ [{cat}] Telegram throttled {mins}m — posting to socials only")
-        card.seek(0)
-        threading.Thread(target=post_to_social, args=(card, social_caption), daemon=True).start()
-        seen.add(article["id"]); save_seen(seen); remember_post(article["title"], cat, ts)
+        log.info(f"⛔ post_article: throttle guard hit for [{cat}] — skipping (no social either)")
         return False
 
     # Day mode — post to Telegram + socials
@@ -1117,18 +1136,23 @@ def score_article(a):
     return score
 
 def run_job(social_only=False, breaking_only=False):
-    global daily_sports_count, daily_world_count, daily_tourism_count
+    """
+    Every 15-min scan:
+      - Post 1 breaking article immediately (Telegram + social) if found
+      - If 90-min regular window is OPEN: post 1 best regular article (Telegram + social)
+      - If 90-min window is CLOSED: do NOT post anything — no social-only spillover
+    Social media ONLY posts alongside Telegram. Never independently on a timer.
+    """
+    global daily_sports_count, daily_world_count, daily_tourism_count, _pending_article
     h = get_mvt_hour()
-    log.info(f"🕐 MVT {h:02d}:xx | {'SOCIAL ONLY' if social_only else 'DAY' if is_day_mode() else 'NIGHT'}")
+    log.info(f"🕐 MVT {h:02d}:xx | {'DAY' if is_day_mode() else 'NIGHT'}")
     seen = load_seen()
     articles = fetch_news()
 
-    # Filter unseen
     fresh = [a for a in articles if a["id"] not in seen]
     if not fresh:
         log.info("No fresh articles."); return
 
-    # Sort by score descending
     fresh.sort(key=score_article, reverse=True)
 
     breaking_articles = [a for a in fresh if is_breaking(a["title"], a.get("summary",""), a["cat"])]
@@ -1139,82 +1163,73 @@ def run_job(social_only=False, breaking_only=False):
 
     log.info(f"🔴 {len(breaking_articles)} breaking | 🟡 {len(regular_articles)} regular")
 
-    posted = 0
-    social_posted = 0
-    MAX_SOCIAL_PER_RUN = 2
-
-    # ── Breaking: max 1 per run (fast check handles the rest every 5 min) ──
+    # ── 1. Breaking news: post immediately, no throttle, Telegram + social ──
     if breaking_articles:
         a = breaking_articles[0]
-        can_social = social_posted < MAX_SOCIAL_PER_RUN
-        if post_article(a, seen, social_only, allow_social=can_social):
-            posted += 1
-            social_posted += 1
+        log.info(f"🔴 BREAKING in run_job: {a['title'][:60]}")
+        post_article(a, seen, social_only=False, allow_social=True)
 
     if breaking_only:
-        log.info(f"✅ Breaking-only run done. Posted {posted}.")
         return
 
-    # ── Regular: max 1 per run, throttle checked BEFORE expensive AI call ──
+    # ── 2. Regular news: ONLY post if 90-min Telegram window is open ──────
     if not can_post_regular():
-        secs_left = 5400 - (datetime.utcnow() - last_regular_post_time).total_seconds()
-        log.info(f"⏳ Regular Telegram throttled — {int(secs_left/60)}m left. Socials only.")
-        # Still push best unseen article to socials
-        for a in regular_articles:
-            cat = a["cat"]
-            if cat in ["SPORTS","FOOTBALL"] and not can_post_cat_today(daily_sports_count, 1): continue
-            if cat == "WORLD" and not can_post_cat_today(daily_world_count, 2): continue
-            if cat == "TOURISM" and not can_post_cat_today(daily_tourism_count, 3): continue
-            if social_posted < MAX_SOCIAL_PER_RUN:
-                post_article(a, seen, social_only=True, allow_social=True)
-                social_posted += 1
-                if cat in ["SPORTS","FOOTBALL"]: increment_cat_count(daily_sports_count)
-                elif cat == "WORLD": increment_cat_count(daily_world_count)
-                elif cat == "TOURISM": increment_cat_count(daily_tourism_count)
-            break
-        log.info(f"✅ Run done. Posted {posted} to Telegram, {social_posted} to socials.")
-        return
+        secs_left = int(5400 - (datetime.utcnow() - last_regular_post_time).total_seconds())
+        log.info(f"⏳ Telegram throttled — {secs_left//60}m left. No social posting either. Waiting.")
+        return  # Nothing. No social. No exceptions.
 
-    # Throttle open — pick the single best regular article for Telegram
-    mv_kws = ["maldives","male","dhivehi","raajje","atoll","parliament","minister","police","court","president"]
+    # Window is open — find the single best article
     for a in regular_articles:
         cat = a["cat"]
         text_lower = (a["title"] + " " + a.get("summary","")).lower()
 
-        # Strict per-category daily limits
-        if cat in ["SPORTS","FOOTBALL"]:
+        # Sports: Maldives national team only, max 1/day
+        if cat in ["SPORTS", "FOOTBALL"]:
+            mv_sports = ["maldives","dhivehi","raajje","national team","team maldives"]
+            if not any(kw in text_lower for kw in mv_sports):
+                log.info(f"⛔ Non-Maldives sports — skipping: {a['title'][:50]}")
+                continue
             if not can_post_cat_today(daily_sports_count, 1):
-                log.info(f"⛔ Sports daily limit reached — skipping")
-                continue
-        elif cat == "WORLD":
-            if not can_post_cat_today(daily_world_count, 2):
-                log.info(f"⛔ World daily limit reached — skipping")
-                continue
-            # Strict Maldives/region relevance for WORLD
-            if not any(kw in text_lower for kw in ["maldives","indian ocean","south asia","india","china","un","dollar","oil","global"]):
-                log.info(f"⛔ WORLD not Maldives-relevant — skipping: {a['title'][:50]}")
-                continue
-        elif cat == "TOURISM":
-            if not can_post_cat_today(daily_tourism_count, 3):
-                log.info(f"⛔ Tourism daily limit reached — skipping")
+                log.info("⛔ Sports daily limit (1) reached")
                 continue
 
-        can_social = social_posted < MAX_SOCIAL_PER_RUN
-        if post_article(a, seen, social_only, allow_social=can_social):
-            posted += 1
-            social_posted += 1
+        # World: Maldives-relevant only, max 2/day
+        elif cat == "WORLD":
+            mv_world = ["maldives","indian ocean","south asia","india","china","un ","dollar","oil","global economy"]
+            if not any(kw in text_lower for kw in mv_world):
+                log.info(f"⛔ Non-relevant world news — skipping: {a['title'][:50]}")
+                continue
+            if not can_post_cat_today(daily_world_count, 2):
+                log.info("⛔ World daily limit (2) reached")
+                continue
+
+        # Tourism: max 2/day
+        elif cat == "TOURISM":
+            if not can_post_cat_today(daily_tourism_count, 2):
+                log.info("⛔ Tourism daily limit (2) reached")
+                continue
+
+        # Weather: never post as regular article (weather card handles this)
+        elif cat == "WEATHER":
+            log.info("⛔ Weather — skipping (weather card handles this)")
+            continue
+
+        # Post to Telegram. Social only fires if article passes social filter.
+        allow_social = allowed_for_social(a)
+        log.info(f"🟡 REGULAR [{cat}] social={'yes' if allow_social else 'no'}: {a['title'][:55]}")
+        if post_article(a, seen, social_only=False, allow_social=allow_social):
             if cat in ["SPORTS","FOOTBALL"]: increment_cat_count(daily_sports_count)
             elif cat == "WORLD": increment_cat_count(daily_world_count)
             elif cat == "TOURISM": increment_cat_count(daily_tourism_count)
-        break  # ONE regular article per run, full stop
+        break  # ONE article per run, always
 
-    log.info(f"✅ Run done. Posted {posted} to Telegram, {social_posted} to socials.")
+    log.info("✅ run_job done.")
 
 # Sources scanned in the fast breaking-news check (5 min cycle)
 BREAKING_SOURCES = [
     {"url": "https://sunonline.mv/feed",              "cat": "LOCAL", "lang": "dv"},
     {"url": "https://psmnews.mv/en/feed",             "cat": "LOCAL", "lang": "en"},
-    {"url": "https://visitmaldives.com/feed",         "cat": "TOURISM","lang": "en"},
+    # visitmaldives removed from breaking sources — tourism is never breaking news
     {"url": "https://maldivesvoice.com/feed",         "cat": "LOCAL", "lang": "en"},
     {"url": "https://english.sun.mv/feed",            "cat": "LOCAL", "lang": "en"},
     {"url": "https://edition.mv/feed",                "cat": "LOCAL", "lang": "en"},
@@ -1262,7 +1277,7 @@ def breaking_news_check():
         articles = fetch_breaking_sources()
         for a in articles:
             if a["id"] in seen: continue
-            if a["cat"] not in ["LOCAL", "DISASTER", "TOURISM"]: continue
+            if a["cat"] not in ["LOCAL", "DISASTER"]: continue
             if not is_breaking(a["title"], a.get("summary",""), a["cat"]): continue
             # Score for Maldives relevance
             if score_article(a) < 60: continue
