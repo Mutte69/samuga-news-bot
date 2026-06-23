@@ -536,8 +536,11 @@ def generate_card(text, source, timestamp, cat, bg_image=None, morning=False, _s
         if cur: lines.append(cur)
         return lines
 
+    # Convert Western digits to Arabic-Indic for RTL Thaana rendering
+    if has_thaana:
+        text = text.translate(str.maketrans("0123456789", "\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669"))
+
     # For Thaana text — don't split on '. ' as it breaks Dhivehi sentences
-    # Instead treat first ~120 chars as headline, rest as body
     if has_thaana:
         words = text.split()
         headline_words = []
