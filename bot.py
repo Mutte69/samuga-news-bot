@@ -304,7 +304,153 @@ def fetch_background_image(keyword):
 # ── Generate Card ─────────────────────────────────────────────────────────────
 WHITE=(255,255,255); LIGHT_GRAY=(200,215,230); BG_TOP=(10,40,75); BG_BOTTOM=(5,20,45)
 
+
+# ── Dhivehi Card Generator (Pango/Cairo — proper Thaana shaping) ──────────────
+def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
+    """Generate card with proper Thaana shaping using Pango/Cairo"""
+    try:
+        import gi
+        gi.require_version("Pango", "1.0")
+        gi.require_version("PangoCairo", "1.0")
+        from gi.repository import Pango, PangoCairo
+        import cairo
+    except Exception as e:
+        log.error(f"Pango not available: {e}")
+        return generate_card(text, source, timestamp, cat, bg_image)
+
+    import numpy as np
+
+    W, H = 1080, 1080
+    DV_CAT = {
+        "LOCAL":   {"label": "ލޯކަލް ނިއުސް", "color": (0, 180, 255)},
+        "DISASTER":{"label": "ހާދިސާ",        "color": (220, 50, 50)},
+        "WORLD":   {"label": "ދުނިޔެ",         "color": (50, 180, 100)},
+        "FOOTBALL":{"label": "ފުޓްބޯޅަ",      "color": (255, 140, 0)},
+        "TOURISM": {"label": "ފަތުރުވެރިކަން","color": (160, 80, 220)},
+        "WEATHER": {"label": "މޫސުން",         "color": (0, 200, 200)},
+        "SPORTS":  {"label": "ކުޅިވަރު",       "color": (0, 180, 100)},
+    }
+    cfg = DV_CAT.get(cat, DV_CAT["LOCAL"])
+    accent = cfg["color"]
+    label_dv = cfg["label"]
+
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, W, H)
+    ctx = cairo.Context(surface)
+
+    # Background
+    if bg_image:
+        try:
+            bg = bg_image.copy().convert("RGB")
+            r = bg.width / bg.height
+            nh, nw = (H, int(H*r)) if r > 1 else (int(W/r), W)
+            bg = bg.resize((nw, nh), Image.LANCZOS)
+            bg = bg.crop(((nw-W)//2, (nh-H)//2, (nw-W)//2+W, (nh-H)//2+H))
+            bg = ImageEnhance.Brightness(bg).enhance(0.32)
+            navy = Image.new("RGB", (W, H), (8, 30, 65))
+            bg = Image.blend(bg, navy, 0.45).convert("RGBA")
+            bg_arr = np.array(bg)
+            bg_bgra = np.ascontiguousarray(bg_arr[:, :, [2, 1, 0, 3]])
+            bg_surf = cairo.ImageSurface.create_for_data(bg_bgra, cairo.FORMAT_ARGB32, W, H)
+            ctx.set_source_surface(bg_surf, 0, 0)
+            ctx.paint()
+        except Exception as e:
+            log.error(f"BG paste: {e}")
+            ctx.set_source_rgb(0.008, 0.047, 0.107)
+            ctx.paint()
+    else:
+        ctx.set_source_rgb(0.008, 0.047, 0.107)
+        ctx.paint()
+
+    # Gradients
+    grad = cairo.LinearGradient(0, H//2, 0, H)
+    grad.add_color_stop_rgba(0, 0.02, 0.08, 0.2, 0)
+    grad.add_color_stop_rgba(1, 0.02, 0.08, 0.2, 0.85)
+    ctx.set_source(grad); ctx.rectangle(0, 0, W, H); ctx.fill()
+
+    grad2 = cairo.LinearGradient(0, 0, 0, 170)
+    grad2.add_color_stop_rgba(0, 0.02, 0.08, 0.2, 0.75)
+    grad2.add_color_stop_rgba(1, 0, 0, 0, 0)
+    ctx.set_source(grad2); ctx.rectangle(0, 0, W, H); ctx.fill()
+
+    # Accent bar
+    ctx.set_source_rgb(accent[0]/255, accent[1]/255, accent[2]/255)
+    ctx.rectangle(0, 0, W, 5); ctx.fill()
+
+    # PIL overlay for logo + footer
+    from PIL import ImageDraw as _ID, ImageFont as _IF
+    ov = Image.new("RGBA", (W, H), (0,0,0,0))
+    od = _ID.Draw(ov)
+    try:
+        logo = Image.open("logo.png").convert("RGBA")
+        lh = 72; lw = int(logo.width * lh / logo.height)
+        logo = logo.resize((lw, lh), Image.LANCZOS)
+        ov.paste(logo, (50, 38), logo)
+    except: pass
+    try:
+        f_sm = _IF.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 21)
+        od.text((W-310, 50), "t.me/samugacommunity", font=f_sm, fill=(200,230,255,220))
+        od.text((50, H-52), f"Source: {source}", font=f_sm, fill=(180,200,220,220))
+        tw = od.textlength(timestamp, font=f_sm)
+        od.text((W-50-int(tw), H-52), timestamp, font=f_sm, fill=(180,200,220,220))
+        od.line([(0, H-65),(W, H-65)], fill=(255,255,255,50), width=1)
+    except: pass
+    ov_arr = np.array(ov)
+    ov_bgra = np.ascontiguousarray(ov_arr[:, :, [2, 1, 0, 3]])
+    ov_surf = cairo.ImageSurface.create_for_data(ov_bgra, cairo.FORMAT_ARGB32, W, H)
+    ctx.set_source_surface(ov_surf, 0, 0); ctx.paint()
+
+    # Category label (Dhivehi Pango)
+    tag_y = 580
+    cat_lo = PangoCairo.create_layout(ctx)
+    cat_lo.set_text(label_dv, -1)
+    cat_lo.set_font_description(Pango.FontDescription("Noto Sans Thaana Bold 20"))
+    tw, _ = cat_lo.get_pixel_size()
+    ctx.set_source_rgb(accent[0]/255, accent[1]/255, accent[2]/255)
+    ctx.rectangle(50, tag_y, tw+26, 36); ctx.fill()
+    ctx.set_source_rgb(1,1,1)
+    ctx.move_to(63, tag_y+6); PangoCairo.show_layout(ctx, cat_lo)
+
+    # Headline
+    words = text.split()
+    hw, bw = [], []
+    cc = 0
+    for i, w in enumerate(words):
+        if cc < 80: hw.append(w); cc += len(w)+1
+        else: bw = words[i:]; break
+    headline = " ".join(hw)
+    body = " ".join(bw)
+
+    h_lo = PangoCairo.create_layout(ctx)
+    h_lo.set_width(980 * Pango.SCALE)
+    h_lo.set_alignment(Pango.Alignment.RIGHT)
+    h_fd = Pango.FontDescription("Noto Sans Thaana 50")
+    h_fd.set_weight(Pango.Weight.ULTRABOLD)
+    h_lo.set_font_description(h_fd)
+    h_lo.set_text(headline, -1)
+    ctx.set_source_rgb(1,1,1)
+    ctx.move_to(50, tag_y+44); PangoCairo.show_layout(ctx, h_lo)
+
+    if body:
+        _, hh = h_lo.get_pixel_size()
+        b_lo = PangoCairo.create_layout(ctx)
+        b_lo.set_width(980 * Pango.SCALE)
+        b_lo.set_alignment(Pango.Alignment.RIGHT)
+        b_lo.set_font_description(Pango.FontDescription("Noto Sans Thaana 26"))
+        b_lo.set_text(body, -1)
+        ctx.set_source_rgba(0.78, 0.86, 1, 0.85)
+        ctx.move_to(50, tag_y+44+hh+8); PangoCairo.show_layout(ctx, b_lo)
+
+    # Export
+    png_buf = io.BytesIO()
+    surface.write_to_png(png_buf)
+    png_buf.seek(0)
+    return png_buf
+
 def generate_card(text, source, timestamp, cat, bg_image=None, morning=False):
+    # Route Dhivehi text to Pango-based card generator
+    if not morning and any('\u0780' <= ch <= '\u07BF' for ch in text):
+        return generate_dhivehi_card(text, source, timestamp, cat, bg_image)
+
     W, H = 1080, 1080
     accent = (255,180,0) if morning else CAT_CONFIG.get(cat,CAT_CONFIG["LOCAL"])["color"]
     label  = "🌅  MORNING BRIEF" if morning else CAT_CONFIG.get(cat,CAT_CONFIG["LOCAL"])["label"]
