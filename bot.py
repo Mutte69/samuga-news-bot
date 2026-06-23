@@ -402,7 +402,9 @@ def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
     # Category label (Dhivehi Pango)
     tag_y = 580
     cat_lo = PangoCairo.create_layout(ctx)
-    cat_lo.set_text(label_dv, -1)
+    # Use English label if no Thaana chars, otherwise use Dhivehi label
+    cat_text = label_dv if any("\u0780" <= ch <= "\u07BF" for ch in label_dv) else label_dv
+    cat_lo.set_text(cat_text, -1)
     cat_lo.set_font_description(Pango.FontDescription("Noto Sans Thaana Bold 20"))
     tw, _ = cat_lo.get_pixel_size()
     ctx.set_source_rgb(accent[0]/255, accent[1]/255, accent[2]/255)
@@ -422,19 +424,17 @@ def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
 
     import re as _re
 
-    def make_pango_markup(t, size, bold=False):
-        """Wrap numbers in LTR spans for proper RTL+number rendering"""
-        weight = ' weight="ultrabold"' if bold else ''
-        # Escape XML special chars
-        t = t.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-        # Wrap digit sequences in LTR span
-        t = _re.sub(r"(\d+)", r'<span dir="ltr">\1</span>', t)
-        return f'<span font="Noto Sans Thaana {size}"{weight}>{t}</span>'
+    def fix_numbers_rtl(t):
+        """Wrap numbers in LTR Unicode embedding marks for proper RTL rendering"""
+        return _re.sub(r"(\d+)", "\u202a\\1\u202c", t)
 
     h_lo = PangoCairo.create_layout(ctx)
     h_lo.set_width(980 * Pango.SCALE)
     h_lo.set_alignment(Pango.Alignment.RIGHT)
-    h_lo.set_markup(make_pango_markup(headline, 50, bold=True), -1)
+    h_fd = Pango.FontDescription("Noto Sans Thaana 50")
+    h_fd.set_weight(Pango.Weight.ULTRABOLD)
+    h_lo.set_font_description(h_fd)
+    h_lo.set_text(fix_numbers_rtl(headline), -1)
     ctx.set_source_rgb(1,1,1)
     ctx.move_to(50, tag_y+44); PangoCairo.show_layout(ctx, h_lo)
 
@@ -443,7 +443,8 @@ def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
         b_lo = PangoCairo.create_layout(ctx)
         b_lo.set_width(980 * Pango.SCALE)
         b_lo.set_alignment(Pango.Alignment.RIGHT)
-        b_lo.set_markup(make_pango_markup(body, 26), -1)
+        b_lo.set_font_description(Pango.FontDescription("Noto Sans Thaana 26"))
+        b_lo.set_text(fix_numbers_rtl(body), -1)
         ctx.set_source_rgba(0.78, 0.86, 1, 0.85)
         ctx.move_to(50, tag_y+44+hh+8); PangoCairo.show_layout(ctx, b_lo)
 
