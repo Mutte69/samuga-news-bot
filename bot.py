@@ -2731,14 +2731,11 @@ def handle_updates():
 
                             # Detect category from command
                             manual_cat = "LOCAL"
-                            if any(w in cl for w in ["breaking", "breaking news"]): manual_cat = "DISASTER"
-                            elif any(w in cl for w in ["political", "politics", "government", "parliament"]): manual_cat = "LOCAL"
-                            elif any(w in cl for w in ["sports", "sport"]): manual_cat = "SPORTS"
-                            elif any(w in cl for w in ["football", "soccer"]): manual_cat = "FOOTBALL"
-                            elif any(w in cl for w in ["lifestyle", "culture", "health"]): manual_cat = "TOURISM"
-                            elif any(w in cl for w in ["world", "international", "global"]): manual_cat = "WORLD"
-                            elif any(w in cl for w in ["tourism", "travel", "resort"]): manual_cat = "TOURISM"
-                            elif any(w in cl for w in ["weather", "storm", "rain"]): manual_cat = "WEATHER"
+                            if any(w in cl for w in ["breaking", "breaking news"]):          manual_cat = "BREAKING"
+                            elif any(w in cl for w in ["political", "politics", "parliament", "government"]): manual_cat = "POLITICAL"
+                            elif any(w in cl for w in ["lifestyle", "culture", "health", "tourism", "travel", "resort", "weather", "storm"]): manual_cat = "LIFESTYLE"
+                            elif any(w in cl for w in ["sports", "sport", "football", "soccer"]): manual_cat = "SPORTS"
+                            elif any(w in cl for w in ["world", "international", "global"]): manual_cat = "LOCAL"
 
                             # Extract the content text (everything before @SamugaNewsBot)
                             # The text comes from the photo caption or message, minus the command
@@ -2787,8 +2784,8 @@ def handle_updates():
 
                                     ts_now = (datetime.utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
                                     card = generate_card(content_text, "Samuga Media", ts_now, manual_cat, bg)
-                                    cat_emoji = {"LOCAL":"🇲🇻","FOOTBALL":"⚽","SPORTS":"🏅","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(manual_cat,"📰")
-                                    breaking_prefix = "🚨 <b>BREAKING NEWS</b>\n\n" if manual_cat == "DISASTER" else ""
+                                    cat_emoji = {"BREAKING":"🚨","LOCAL":"🇲🇻","POLITICAL":"🏛️","LIFESTYLE":"🌴","SPORTS":"🏅","FOOTBALL":"⚽","DISASTER":"🚨","WORLD":"🌍","WEATHER":"🌤️","TOURISM":"✈️"}.get(manual_cat,"📰")
+                                    breaking_prefix = "🚨 <b>BREAKING NEWS</b>\n\n" if manual_cat in ["BREAKING", "DISASTER"] else ""
                                     full_caption = (
                                         breaking_prefix + cat_emoji + " " + content_text + "\n\n"
                                         "📡 <b>Samuga Media</b> | @samugacommunity"
