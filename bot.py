@@ -85,7 +85,8 @@ core_team_session_context = {}  # user_id -> stored context
 # ── Universal Approval Queue (in-memory) ─────────────────────────────────────
 # Every card (English + Dhivehi) waits here for Content Lab approval before posting.
 # Cards expire after 2 hours if not approved.
-APPROVAL_EXPIRY_SECONDS = 7200  # 2 hours
+ENGLISH_AUTOPOST_SECONDS = 1800   # English: auto-post after 30 min if not approved
+DHIVEHI_EXPIRY_SECONDS   = 7200   # Dhivehi: expire (delete) after 2h if not approved
 
 approval_queue = {}  # key -> {card_bytes, caption, title, link, cat, lang, dv_text, created_at, ...}
 _approval_counter = [0]
@@ -118,16 +119,43 @@ def store_pending_approval(card_bytes, caption, title, link, cat="LOCAL", lang="
     return key
 
 def expire_old_approvals():
-    """Remove approval cards older than 2 hours. Runs on a scheduler."""
+    """
+    Runs every few minutes:
+      - English cards not approved within 30 min → AUTO-POST to community + social
+      - Dhivehi cards not approved within 2 hours → DELETE (never auto-post unreviewed Dhivehi)
+    """
     now = datetime.utcnow()
-    expired = [k for k, v in approval_queue.items()
-               if (now - v["created_at"]).total_seconds() > APPROVAL_EXPIRY_SECONDS]
-    for k in expired:
-        title = approval_queue[k].get("title", "")[:40]
+
+    # English auto-post after 30 min
+    en_due = [k for k, v in approval_queue.items()
+              if v["lang"] == "en" and (now - v["created_at"]).total_seconds() > ENGLISH_AUTOPOST_SECONDS]
+    for k in en_due:
+        item = approval_queue.pop(k)
+        title = item.get("title","")[:50]
+        log.info(f"⏰ English {k} not approved in 30min — auto-posting: {title}")
+        try:
+            ok = _publish_now(
+                item["card_bytes"], item["caption"], item["cat"],
+                item["title"], item["link"],
+                is_breaking_flag=item.get("is_breaking", False),
+                allow_social=item.get("allow_social", True),
+                rewritten=item.get("rewritten",""),
+                summary=item.get("summary","")
+            )
+            if ok:
+                send_text(CORE_TEAM_CHAT_ID,
+                          f"⏰ <b>Auto-posted</b> (no approval in 30min):\n{item['title'][:80]}",
+                          thread_id=CONTENT_LAB_THREAD_ID)
+        except Exception as e:
+            log.error(f"Auto-post {k} failed: {e}")
+
+    # Dhivehi expire (delete) after 2h
+    dv_due = [k for k, v in approval_queue.items()
+              if v["lang"] == "dv" and (now - v["created_at"]).total_seconds() > DHIVEHI_EXPIRY_SECONDS]
+    for k in dv_due:
+        title = approval_queue[k].get("title","")[:40]
         del approval_queue[k]
-        log.info(f"⏰ Approval {k} expired (2h, not approved): {title}")
-    if expired:
-        log.info(f"⏰ Expired {len(expired)} unapproved cards")
+        log.info(f"⏰ Dhivehi {k} expired (2h, not approved, deleted): {title}")
 
 # Backwards-compat alias (old code references dhivehi_pending)
 dhivehi_pending = approval_queue
@@ -1132,7 +1160,12 @@ def _send_approval_card(key, item):
     )
     if item["lang"] == "dv":
         footer += f"✏️ Edit & post: <code>/approved {key} [corrected dhivehi text]</code>\n"
-    footer += f"❌ Reject: <code>/reject {key}</code>"
+    footer += f"❌ Reject: <code>/reject {key}</code>\n\n"
+    # Tell the team the auto-post / expiry behaviour
+    if item["lang"] == "en":
+        footer += "<i>⏰ Auto-posts in 30 min if not reviewed</i>"
+    else:
+        footer += "<i>⏰ Expires in 2h if not approved (Dhivehi never auto-posts)</i>"
     msg = header + footer
 
     # If we have a finished card image, send it as a photo with the caption
@@ -2308,8 +2341,8 @@ if __name__ == "__main__":
     scheduler.add_job(scheduled_check, "interval", minutes=15)
     # Breaking news fast check every 5 min (LOCAL/DISASTER only)
     scheduler.add_job(breaking_news_check, "interval", minutes=5)
-    # Expire unapproved cards older than 2 hours — check every 15 min
-    scheduler.add_job(expire_old_approvals, "interval", minutes=15)
+    # Approval lifecycle — English auto-posts at 30min, Dhivehi expires at 2h. Check every 5 min.
+    scheduler.add_job(expire_old_approvals, "interval", minutes=5)
     # Morning brief 7AM MVT = 2AM UTC
     scheduler.add_job(send_morning_brief, "cron", hour=1, minute=0)  # 6AM MVT
     # Night summary 12AM MVT = 7PM UTC
