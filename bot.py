@@ -343,12 +343,23 @@ def generate_card(text, source, timestamp, cat, bg_image=None, morning=False):
         img.paste(logo,(50,38),logo)
     except: pass
 
+    # Detect Thaana script and use Noto Sans Thaana font for Dhivehi
+    has_thaana = any('\u0780' <= ch <= '\u07BF' for ch in text)
+    THAANA_FONT = "/data/NotoSansThaana.ttf"
     try:
-        f_tag  =ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",22)
-        f_title=ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",46)
-        f_body =ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",27)
-        f_sm   =ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",21)
-    except: f_tag=f_title=f_body=f_sm=ImageFont.load_default()
+        if has_thaana and os.path.exists(THAANA_FONT):
+            f_tag  = ImageFont.truetype(THAANA_FONT, 22)
+            f_title= ImageFont.truetype(THAANA_FONT, 46)
+            f_body = ImageFont.truetype(THAANA_FONT, 27)
+            f_sm   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 21)
+            log.info("🇲🇻 Thaana font loaded for card")
+        else:
+            f_tag  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+            f_title= ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 46)
+            f_body = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 27)
+            f_sm   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 21)
+    except:
+        f_tag=f_title=f_body=f_sm=ImageFont.load_default()
 
     draw.text((W-310,50),"t.me/samugacommunity",font=f_sm,fill=(200,230,255))
     tag_y=590; tw=draw.textbbox((0,0),label,font=f_tag)[2]+26
@@ -1678,6 +1689,15 @@ def handle_updates():
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("🚀 Samuga News Bot v3.2 starting...")
+    # Download Thaana font if not present
+    THAANA_FONT = "/data/NotoSansThaana.ttf"
+    if not os.path.exists(THAANA_FONT):
+        try:
+            r = requests.get("https://github.com/google/fonts/raw/main/ofl/notosansthaana/NotoSansThaana%5Bwght%5D.ttf", timeout=20)
+            with open(THAANA_FONT, "wb") as f: f.write(r.content)
+            log.info("✅ Thaana font downloaded")
+        except Exception as e:
+            log.warning(f"Thaana font download failed: {e}")
     log.info("📅 7AM-6PM: every 30min | Night: social only")
     log.info("🌅 7AM Brief | 🌙 12AM Summary | 🌤️ 8AM/8PM Weather | 📊 Friday Digest")
     log.info("💬 Smart chat with history, Tavily search, Dhivehi support")
