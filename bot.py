@@ -383,9 +383,26 @@ def generate_card(text, source, timestamp, cat, bg_image=None, morning=False):
         if cur: lines.append(cur)
         return lines
 
-    sentences=text.split('. ')
-    headline=sentences[0]+('.' if len(sentences)>1 else '')
-    body='. '.join(sentences[1:]) if len(sentences)>1 else ''
+    # For Thaana text — don't split on '. ' as it breaks Dhivehi sentences
+    # Instead treat first ~120 chars as headline, rest as body
+    if has_thaana:
+        words = text.split()
+        headline_words = []
+        body_words = []
+        char_count = 0
+        for i, w in enumerate(words):
+            if char_count < 80:
+                headline_words.append(w)
+                char_count += len(w) + 1
+            else:
+                body_words = words[i:]
+                break
+        headline = ' '.join(headline_words)
+        body = ' '.join(body_words)
+    else:
+        sentences=text.split('. ')
+        headline=sentences[0]+('.' if len(sentences)>1 else '')
+        body='. '.join(sentences[1:]) if len(sentences)>1 else ''
 
     y=tag_y+48
     for line in wrap(headline,f_title,W-100)[:4]:
