@@ -56,6 +56,26 @@ CAT_CONFIG = {
 # ── Core Team Session Context (in-memory only, clears on restart) ────────────
 core_team_session_context = {}  # user_id -> stored context
 
+# ── Dhivehi Approval Queue (in-memory) ───────────────────────────────────────
+dhivehi_pending = {}  # key -> {card_buf, caption, article_title, link}
+dhivehi_pending_counter = [0]
+
+def store_pending_dhivehi(card_buf, dv_text, title, link, keyword="maldives news", source="LOCAL", cat="LOCAL"):
+    dhivehi_pending_counter[0] += 1
+    key = f"dv{dhivehi_pending_counter[0]}"
+    dhivehi_pending[key] = {
+        "dv_text": dv_text,
+        "title": title,
+        "link": link,
+        "keyword": keyword,
+        "source": source,
+        "cat": cat,
+    }
+    if len(dhivehi_pending) > 20:
+        oldest = list(dhivehi_pending.keys())[0]
+        del dhivehi_pending[oldest]
+    return key
+
 # ── Core Team Config ──────────────────────────────────────────────────────────
 CORE_TEAM_CHAT_ID = "-1002829230299"
 
@@ -104,9 +124,25 @@ def save_seen(seen):
 recent_posts = []
 user_conversations = {}
 
+# Analytics counters (reset weekly)
+analytics = {"posts_by_cat": {}, "breaking_count": 0, "social_success": 0, "social_fail": 0, "week_start": None}
+
+def track_analytics(cat, is_breaking=False, social_ok=None):
+    global analytics
+    from datetime import timezone as _tz
+    week = (datetime.now(_tz.utc) + timedelta(hours=5)).isocalendar()[1]
+    if analytics["week_start"] != week:
+        analytics = {"posts_by_cat": {}, "breaking_count": 0, "social_success": 0, "social_fail": 0, "week_start": week}
+    if cat != "SOCIAL":
+        analytics["posts_by_cat"][cat] = analytics["posts_by_cat"].get(cat, 0) + 1
+    if is_breaking: analytics["breaking_count"] += 1
+    if social_ok is True: analytics["social_success"] += 1
+    if social_ok is False: analytics["social_fail"] += 1
+
 def remember_post(title, cat, timestamp):
     recent_posts.append({"title":title,"cat":cat,"time":timestamp})
     if len(recent_posts) > 50: recent_posts.pop(0)
+    track_analytics(cat)
 
 def get_conversation(uid):
     if uid not in user_conversations: user_conversations[uid] = []
@@ -358,6 +394,40 @@ def send_to_telegram(buf, caption):
         resp.raise_for_status(); log.info("✅ Posted to Telegram"); return True
     except Exception as e: log.error(f"Telegram: {e}"); return False
 
+def download_telegram_photo(photo_list):
+    """Download the highest quality photo from a Telegram photo array"""
+    try:
+        # Get largest photo (last in list)
+        file_id = photo_list[-1]["file_id"]
+        # Get file path
+        resp = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
+            params={"file_id": file_id}, timeout=10
+        )
+        file_path = resp.json()["result"]["file_path"]
+        # Download the file
+        img_resp = requests.get(
+            f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}",
+            timeout=20
+        )
+        from PIL import Image
+        img = Image.open(io.BytesIO(img_resp.content)).convert("RGB")
+        # Resize to 1080x1080 crop
+        w, h = img.size
+        min_side = min(w, h)
+        left = (w - min_side) // 2
+        top = (h - min_side) // 2
+        img = img.crop((left, top, left + min_side, top + min_side))
+        img = img.resize((1080, 1080), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        log.info("✅ Telegram photo downloaded and cropped to 1080x1080")
+        return buf
+    except Exception as e:
+        log.error(f"Photo download: {e}")
+        return None
+
 def send_photo(chat_id, buf, caption):
     """Send a photo to any Telegram chat/channel"""
     try:
@@ -597,7 +667,10 @@ def post_to_social(img_buf, caption):
         if ok:
             log.info(f"✅ Social posted to: {', '.join(ok)}")
             increment_social_count()
-        if fail: log.error(f"❌ Social failed for: {', '.join(fail)}")
+            track_analytics("SOCIAL", social_ok=True)
+        if fail:
+            log.error(f"❌ Social failed for: {', '.join(fail)}")
+            track_analytics("SOCIAL", social_ok=False)
     except Exception as e:
         log.error(f"Social: {e}")
 
@@ -619,6 +692,29 @@ def post_article(article, seen, social_only=False, allow_social=True):
                f"{rewritten}\n\n"
                f"🔗 <a href='{article['link']}'>Read more</a>\n\n"
                f"📡 <b>Samuga Media</b> | @samugacommunity")
+
+    # Dhivehi workflow — for dv sources, generate Dhivehi TEXT and send to core team for review
+    # NO card created yet — card only made after team approves
+    is_dv_source = article.get("lang") == "dv"
+    if is_dv_source and CORE_TEAM_CHAT_ID:
+        try:
+            dv_text = make_dhivehi_caption(rewritten, article["title"])
+            if dv_text:
+                key = store_pending_dhivehi(None, dv_text, article["title"], article["link"], keyword=keyword, source=article.get("source","LOCAL"), cat=cat)
+                approval_msg = (
+                    "🇲🇻 <b>Dhivehi Writing — Review Needed</b>\n\n"
+                    f"<b>Article:</b> {article['title']}\n\n"
+                    "<b>Bot wrote:</b>\n"
+                    f"{dv_text}\n\n"
+                    f"<b>Key:</b> <code>{key}</code>\n\n"
+                    f"✅ Approve: <code>@SamugaNewsBot post {key}</code>\n"
+                    f"✏️ Correct: <code>@SamugaNewsBot post {key} ތިޔަ ތަން ރަނގަޅު ކޮށްފައި...</code>\n"
+                    f"❌ Reject: <code>@SamugaNewsBot reject {key}</code>"
+                )
+                send_text(CORE_TEAM_CHAT_ID, approval_msg)
+                log.info(f"📨 Dhivehi text sent to core team for review: {key}")
+        except Exception as e:
+            log.error(f"Dhivehi workflow: {e}")
 
     social_caption = caption
 
@@ -732,6 +828,23 @@ def run_job(social_only=False):
         if posted > 1: time.sleep(300)
 
     log.info(f"✅ Posted {posted} articles ({social_posted} to socials).")
+
+def breaking_news_check():
+    """Fast check every 5 min — Maldives breaking news only, no throttle"""
+    try:
+        seen = load_seen()
+        articles = fetch_news()
+        for a in articles:
+            if a["id"] in seen: continue
+            if a["cat"] not in ["LOCAL", "DISASTER"]: continue
+            if not is_breaking(a["title"], a.get("summary",""), a["cat"]): continue
+            # Score for Maldives relevance
+            if score_article(a) < 60: continue
+            log.info(f"🔴 BREAKING FAST: {a['title'][:60]}")
+            post_article(a, seen, social_only=False, allow_social=True)
+            break  # one at a time
+    except Exception as e:
+        log.error(f"Breaking check: {e}")
 
 def scheduled_check():
     h=get_mvt_hour()
@@ -1020,6 +1133,40 @@ Today's posts: {posts_text}
         log.info("✅ Night summary sent!")
     except Exception as e: log.error(f"Night summary: {e}")
 
+# ── Weekly Analytics Report to Core Team ─────────────────────────────────────
+def send_weekly_analytics():
+    log.info("📊 Weekly analytics report...")
+    try:
+        from datetime import timezone
+        mvt = datetime.now(timezone.utc) + timedelta(hours=5)
+        week_str = mvt.strftime("Week of %d %B %Y")
+
+        total = sum(v for k, v in analytics["posts_by_cat"].items() if k != "SOCIAL")
+        by_cat = analytics["posts_by_cat"]
+
+        lines = []
+        for cat in ["LOCAL","WORLD","FOOTBALL","TOURISM","WEATHER","DISASTER"]:
+            if cat in by_cat:
+                lines.append(f"  • {cat}: {by_cat[cat]} posts")
+
+        cat_lines = chr(10).join([f"  - {c}: {by_cat[c]} posts" for c in ["LOCAL","WORLD","FOOTBALL","TOURISM","WEATHER","DISASTER"] if c in by_cat])
+        report = (
+            "<b>Samuga Media Weekly Report</b>" + chr(10)
+            + week_str + chr(10) + chr(10)
+            + "<b>Total Articles:</b> " + str(total) + chr(10)
+            + (cat_lines if cat_lines else "  No posts yet") + chr(10) + chr(10)
+            + "<b>Breaking News:</b> " + str(analytics["breaking_count"]) + chr(10) + chr(10)
+            + "<b>Social Posting:</b>" + chr(10)
+            + "  Success: " + str(analytics["social_success"]) + chr(10)
+            + "  Failed: " + str(analytics["social_fail"]) + chr(10) + chr(10)
+            + "<b>Bot:</b> Samuga News Bot v3.2" + chr(10)
+            + "Samuga Media | @samugacommunity"
+        )
+        send_text(CORE_TEAM_CHAT_ID, report)
+        log.info("✅ Analytics report sent to core team")
+    except Exception as e:
+        log.error(f"Analytics report: {e}")
+
 # ── Weekly Digest (Friday 6PM MVT) ───────────────────────────────────────────
 def send_weekly_digest():
     log.info("📊 Weekly digest...")
@@ -1300,8 +1447,10 @@ def handle_updates():
                 offset=update["update_id"]+1
                 msg=update.get("message",{})
                 if not msg: continue
-                text=msg.get("text","")
-                if not text: continue
+                text=msg.get("text","") or msg.get("caption","")
+                photo=msg.get("photo")  # list of photo sizes if message has photo
+                if not text and not photo: continue
+                if not text: text=""
                 chat_id=msg["chat"]["id"]
                 msg_id=msg["message_id"]
                 thread_id=msg.get("message_thread_id")  # for forum/topic groups
@@ -1352,8 +1501,122 @@ def handle_updates():
                         sender_info = get_sender_info(display_name, first_name)
                         history = get_conversation(user_id)
 
+                        # @SamugaNewsBot post <key> [optional corrected dhivehi text]
+                        if tagged and clean.lower().startswith("post "):
+                            parts = clean[5:].strip().split(" ", 1)
+                            key = parts[0].strip()
+                            corrected = parts[1].strip() if len(parts) > 1 else None
+                            if key in dhivehi_pending:
+                                pending = dhivehi_pending.pop(key)
+                                final_dv_text = corrected if corrected else pending["dv_text"]
+                                # NOW generate the card with approved Dhivehi text
+                                try:
+                                    send_text(chat_id, f"⏳ Creating card for {key}...", thread_id=thread_id)
+                                    kw = pending.get("keyword", pending["cat"].lower())
+                                    bg = fetch_background_image(kw)
+                                    ts_now = datetime.now().strftime("%d %b %Y • %H:%M")
+                                    card = generate_card(final_dv_text, pending["source"], ts_now, pending["cat"], bg)
+                                    full_caption = (
+                                        f"🇲🇻 <b>{pending['title']}</b>\n\n"
+                                        f"{final_dv_text}\n\n"
+                                        f"🔗 <a href='{pending['link']}'>ތަފްސީލް ކިޔާ</a>\n\n"
+                                        f"📡 <b>ސަމޫގާ މީޑިއާ</b> | @samugacommunity"
+                                    )
+                                    if send_to_telegram(card, full_caption):
+                                        send_text(chat_id, f"✅ Posted to community! ({key})", reply_to=msg_id, thread_id=thread_id)
+                                        log.info(f"✅ Dhivehi card {key} posted to community")
+                                    else:
+                                        send_text(chat_id, f"❌ Telegram post failed.", reply_to=msg_id, thread_id=thread_id)
+                                except Exception as e:
+                                    log.error(f"Dhivehi card post error: {e}")
+                                    send_text(chat_id, f"❌ Error creating card: {e}", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                send_text(chat_id, f"Key {key} not found or already posted.", reply_to=msg_id, thread_id=thread_id)
+
+                        # @SamugaNewsBot reject <key>
+                        elif tagged and clean.lower().startswith("reject "):
+                            key = clean[7:].strip()
+                            if key in dhivehi_pending:
+                                title = dhivehi_pending[key]["title"]
+                                del dhivehi_pending[key]
+                                send_text(chat_id, f"🗑️ Rejected: {key} ({title[:40]})", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                send_text(chat_id, f"Key {key} not found.", reply_to=msg_id, thread_id=thread_id)
+
+                        # @SamugaNewsBot card [dhivehi text] — manual card creation
+                        elif tagged and (
+                            "create card and post" in clean.lower() or
+                            "create card and send to community" in clean.lower() or
+                            "create card and send to core team" in clean.lower()
+                        ):
+                            # Determine destination
+                            cl = clean.lower()
+                            if "send to core team" in cl:
+                                destination = "coreteam"
+                            elif "send to community" in cl:
+                                destination = "community"
+                            else:
+                                destination = "all"  # create card and post = all platforms
+
+                            # Extract the content text (everything before @SamugaNewsBot)
+                            # The text comes from the photo caption or message, minus the command
+                            raw_text = text  # original full text including caption
+                            # Remove the bot mention and command suffix
+                            for cmd in ["create card and post", "create card and send to community", "create card and send to core team"]:
+                                raw_text = raw_text.replace(f"@{BOT_USERNAME} {cmd}", "").replace(f"@{BOT_USERNAME.lower()} {cmd}", "")
+                            raw_text = raw_text.replace(f"@{BOT_USERNAME}", "").strip()
+
+                            if not raw_text and not photo:
+                                send_text(chat_id, "Send a photo with caption text, or just text, then add the command at the end.", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                content_text = raw_text or "Samuga Media"
+                                try:
+                                    send_text(chat_id, "⏳ Creating card...", thread_id=thread_id)
+
+                                    # Use uploaded photo as background if available
+                                    if photo:
+                                        bg = download_telegram_photo(photo)
+                                        log.info("🖼️ Using uploaded photo as card background")
+                                    else:
+                                        bg = fetch_background_image("maldives news")
+
+                                    ts_now = datetime.now().strftime("%d %b %Y • %H:%M")
+                                    card = generate_card(content_text, "Samuga Media", ts_now, "LOCAL", bg)
+                                    full_caption = (
+                                        "🇲🇻 " + content_text + "\n\n"
+                                        "📡 <b>Samuga Media</b> | @samugacommunity"
+                                    )
+
+                                    posted = []
+
+                                    if destination in ["community", "all"]:
+                                        card.seek(0)
+                                        if send_to_telegram(card, full_caption):
+                                            posted.append("Community")
+
+                                    if destination == "coreteam":
+                                        card.seek(0)
+                                        if send_photo(CORE_TEAM_CHAT_ID, card, full_caption):
+                                            posted.append("Core Team")
+
+                                    if destination == "all":
+                                        card.seek(0)
+                                        buf_copy = io.BytesIO(card.getvalue())
+                                        threading.Thread(target=post_to_social, args=(buf_copy, full_caption), daemon=True).start()
+                                        posted.append("FB + IG + Twitter")
+
+                                    if posted:
+                                        send_text(chat_id, "✅ Posted to: " + ", ".join(posted), reply_to=msg_id, thread_id=thread_id)
+                                        log.info(f"✅ Manual card posted to: {posted}")
+                                    else:
+                                        send_text(chat_id, "❌ Failed to post.", reply_to=msg_id, thread_id=thread_id)
+
+                                except Exception as e:
+                                    log.error(f"Manual card: {e}")
+                                    send_text(chat_id, f"❌ Error: {e}", reply_to=msg_id, thread_id=thread_id)
+
                         # /read command — store context for this session
-                        if text.strip().lower().startswith("/read"):
+                        elif text.strip().lower().startswith("/read"):
                             context_text = text.strip()[5:].strip()
                             if context_text:
                                 core_team_session_context[chat_id] = context_text
@@ -1363,7 +1626,7 @@ def handle_updates():
                                 send_text(chat_id, "Send it like this: /read [paste your content here]", reply_to=msg_id, thread_id=thread_id)
 
                         # Respond if tagged OR proactive trigger detected
-                        elif tagged or should_respond_proactively(text):
+                        elif (not (tagged and (clean.lower().startswith("post ") or clean.lower().startswith("reject ")))) and (tagged or should_respond_proactively(text)):
                             if not clean: clean = text.strip()
                             log.info(f"🧠 Core team {'[tagged]' if tagged else '[proactive]'} {display_name}: {clean[:50]}")
                             session_ctx = core_team_session_context.get(chat_id, "")
@@ -1416,12 +1679,16 @@ if __name__ == "__main__":
 
     scheduler=BlockingScheduler(timezone="UTC")
     scheduler.add_job(scheduled_check, "interval", minutes=30)
+    # Breaking news fast check every 5 min (LOCAL/DISASTER only)
+    scheduler.add_job(breaking_news_check, "interval", minutes=5)
     # Morning brief 7AM MVT = 2AM UTC
     scheduler.add_job(send_morning_brief, "cron", hour=2, minute=0)
     # Night summary 12AM MVT = 7PM UTC
     scheduler.add_job(send_night_summary, "cron", hour=19, minute=0)
     # Weekly digest Friday 6PM MVT = 1PM UTC Friday
     scheduler.add_job(send_weekly_digest, "cron", day_of_week="fri", hour=13, minute=0)
+    # Weekly analytics report Friday 6:30PM MVT = 1:30PM UTC Friday
+    scheduler.add_job(send_weekly_analytics, "cron", day_of_week="fri", hour=13, minute=30)
     # Weather update 8AM MVT = 3AM UTC
     scheduler.add_job(lambda: send_weather_update("morning"), "cron", hour=3, minute=0)
     # Weather update 8PM MVT = 3PM UTC
