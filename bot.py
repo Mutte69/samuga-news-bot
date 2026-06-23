@@ -412,18 +412,8 @@ def download_telegram_photo(photo_list):
         )
         from PIL import Image
         img = Image.open(io.BytesIO(img_resp.content)).convert("RGB")
-        # Resize to 1080x1080 crop
-        w, h = img.size
-        min_side = min(w, h)
-        left = (w - min_side) // 2
-        top = (h - min_side) // 2
-        img = img.crop((left, top, left + min_side, top + min_side))
-        img = img.resize((1080, 1080), Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
-        log.info("✅ Telegram photo downloaded and cropped to 1080x1080")
-        return buf
+        log.info("✅ Telegram photo downloaded — returning PIL Image for card generation")
+        return img  # generate_card expects PIL Image, not BytesIO
     except Exception as e:
         log.error(f"Photo download: {e}")
         return None
