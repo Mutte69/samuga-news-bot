@@ -1618,10 +1618,13 @@ def handle_updates():
                                     raw_text = raw_text[:idx].strip()
                                     raw_lower = raw_text.lower()
                                     break
-                            # Also remove category keywords and bot mention
-                            for kw in ["breaking", "sports", "football", "world", "tourism", "weather", "local", "political"]:
-                                raw_text = re.sub(rf"\b{kw}\b", "", raw_text, flags=re.IGNORECASE).strip()
+                            # Remove bot mention
                             raw_text = re.sub(r"@\w+", "", raw_text).strip()
+                            # Only strip English category keywords if not Thaana text
+                            # (regex \b breaks on Unicode/Thaana characters)
+                            if not any('\u0780' <= ch <= '\u07BF' for ch in raw_text):
+                                for kw in ["breaking", "sports", "football", "world", "tourism", "weather", "local", "political"]:
+                                    raw_text = re.sub(rf"\b{kw}\b", "", raw_text, flags=re.IGNORECASE).strip()
                             raw_text = raw_text.strip()
 
                             if video and not photo:
