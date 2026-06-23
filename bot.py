@@ -116,6 +116,7 @@ def store_pending_approval(card_bytes, caption, title, link, cat="LOCAL", lang="
     if len(approval_queue) > 40:
         oldest = list(approval_queue.keys())[0]
         del approval_queue[oldest]
+    persist_state()
     return key
 
 def expire_old_approvals():
@@ -156,6 +157,9 @@ def expire_old_approvals():
         title = approval_queue[k].get("title","")[:40]
         del approval_queue[k]
         log.info(f"⏰ Dhivehi {k} expired (2h, not approved, deleted): {title}")
+
+    if en_due or dv_due:
+        persist_state()
 
 # Backwards-compat alias (old code references dhivehi_pending)
 dhivehi_pending = approval_queue
@@ -212,19 +216,141 @@ BREAKING_BLACKLIST = [
 # ── Storage ───────────────────────────────────────────────────────────────────
 DATA_DIR  = "/data"
 os.makedirs(DATA_DIR, exist_ok=True)
-SEEN_FILE = os.path.join(DATA_DIR, "seen_articles.json")
+SEEN_FILE  = os.path.join(DATA_DIR, "seen_articles.json")
+STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
 
 def load_seen():
     try:
         if os.path.exists(SEEN_FILE):
             with open(SEEN_FILE) as f: return set(json.load(f))
-    except: pass
+    except Exception as e:
+        log.error(f"load_seen: {e}")
     return set()
 
 def save_seen(seen):
     try:
         with open(SEEN_FILE,"w") as f: json.dump(list(seen)[-1000:], f)
-    except: pass
+    except Exception as e:
+        log.error(f"save_seen: {e}")
+
+# ── Generic State Persistence (survives Railway restarts) ─────────────────────
+# Saves volatile state (dedup memory, daily counters, analytics, throttle timer,
+# approval queue metadata) to /data so a restart doesn't wipe everything.
+_state_lock = threading.Lock()
+
+def _load_state():
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                return json.load(f)
+    except Exception as e:
+        log.error(f"load_state: {e}")
+    return {}
+
+def _save_state(state):
+    try:
+        with _state_lock:
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, STATE_FILE)  # atomic write — no half-written files
+    except Exception as e:
+        log.error(f"save_state: {e}")
+
+def persist_state():
+    """Snapshot all volatile state to disk. Called after any meaningful change."""
+    try:
+        state = {
+            "recent_story_titles": [(t, ts.isoformat()) for (t, ts) in recent_story_titles],
+            "recent_posts": recent_posts[-50:],
+            "analytics": analytics,
+            "daily_sports_count": daily_sports_count,
+            "daily_world_count": daily_world_count,
+            "daily_tourism_count": daily_tourism_count,
+            "social_post_counts": _serialize_social_counts(),
+            "polls_today": polls_today,
+            "last_regular_post_time": last_regular_post_time.isoformat() if last_regular_post_time else None,
+            "approval_counter": _approval_counter[0],
+            "approval_queue": _serialize_approval_queue(),
+        }
+        _save_state(state)
+    except Exception as e:
+        log.error(f"persist_state: {e}")
+
+def _serialize_social_counts():
+    sc = dict(social_post_counts)
+    if sc.get("date") and not isinstance(sc["date"], str):
+        sc["date"] = sc["date"].isoformat()
+    return sc
+
+def _serialize_approval_queue():
+    """Approval queue minus the heavy card image bytes (those are rebuilt on approval)."""
+    import base64
+    out = {}
+    for k, v in approval_queue.items():
+        item = dict(v)
+        # Encode card bytes as base64 so English cards survive restart with their image
+        if item.get("card_bytes"):
+            try:
+                item["card_bytes"] = base64.b64encode(item["card_bytes"]).decode()
+                item["_card_b64"] = True
+            except Exception:
+                item["card_bytes"] = None
+                item["_card_b64"] = False
+        item["created_at"] = item["created_at"].isoformat() if item.get("created_at") else None
+        out[k] = item
+    return out
+
+def restore_state():
+    """Load persisted state back into memory on startup."""
+    global recent_story_titles, recent_posts, analytics
+    global daily_sports_count, daily_world_count, daily_tourism_count
+    global social_post_counts, polls_today, last_regular_post_time
+    state = _load_state()
+    if not state:
+        log.info("📦 No saved state — starting fresh")
+        return
+    import base64
+    try:
+        # Dedup memory
+        recent_story_titles.clear()
+        for (t, ts) in state.get("recent_story_titles", []):
+            try: recent_story_titles.append((t, datetime.fromisoformat(ts)))
+            except Exception: pass
+
+        recent_posts.clear()
+        recent_posts.extend(state.get("recent_posts", []))
+
+        analytics.update(state.get("analytics", {}))
+
+        daily_sports_count.update(state.get("daily_sports_count", {}))
+        daily_world_count.update(state.get("daily_world_count", {}))
+        daily_tourism_count.update(state.get("daily_tourism_count", {}))
+        social_post_counts.update(state.get("social_post_counts", {}))
+        polls_today.update(state.get("polls_today", {}))
+
+        lrt = state.get("last_regular_post_time")
+        if lrt:
+            try: last_regular_post_time = datetime.fromisoformat(lrt)
+            except Exception: pass
+
+        _approval_counter[0] = state.get("approval_counter", 0)
+
+        # Restore approval queue (with card images)
+        for k, item in state.get("approval_queue", {}).items():
+            try:
+                if item.get("_card_b64") and item.get("card_bytes"):
+                    item["card_bytes"] = base64.b64decode(item["card_bytes"])
+                item.pop("_card_b64", None)
+                item["created_at"] = datetime.fromisoformat(item["created_at"]) if item.get("created_at") else datetime.utcnow()
+                approval_queue[k] = item
+            except Exception as e:
+                log.error(f"restore approval {k}: {e}")
+
+        log.info(f"📦 State restored: {len(recent_story_titles)} dedup titles, "
+                 f"{len(approval_queue)} pending cards, {len(recent_posts)} recent posts")
+    except Exception as e:
+        log.error(f"restore_state: {e}")
 
 # ── Memory ────────────────────────────────────────────────────────────────────
 recent_posts = []
@@ -296,6 +422,7 @@ def remember_story_title(title):
     recent_story_titles.append((title, datetime.utcnow()))
     if len(recent_story_titles) > 200:
         recent_story_titles.pop(0)
+    persist_state()
 
 # ── Source Reliability Scoring ────────────────────────────────────────────────
 # Higher = more trusted. Used as a tie-breaker and a scoring boost so a direct
@@ -348,6 +475,7 @@ def remember_post(title, cat, timestamp):
     recent_posts.append({"title":title,"cat":cat,"time":timestamp})
     if len(recent_posts) > 50: recent_posts.pop(0)
     track_analytics(cat)
+    persist_state()
 
 def get_conversation(uid):
     if uid not in user_conversations: user_conversations[uid] = []
@@ -415,6 +543,7 @@ def increment_cat_count(counter_dict):
         counter_dict["date"] = today
         counter_dict["count"] = 0
     counter_dict["count"] += 1
+    persist_state()
 
 def can_post_regular():
     global last_regular_post_time
@@ -469,6 +598,7 @@ def increment_social_count():
     if social_post_counts["date"] != today:
         social_post_counts = {"date": today, "count": 0}
     social_post_counts["count"] += 1
+    persist_state()
     log.info(f"📊 Social posts today: {social_post_counts['count']} ({'day' if is_day_social() else 'night'} limit: {20 if is_day_social() else 3})")
 
 # ── Gemini Translate ──────────────────────────────────────────────────────────
@@ -1014,6 +1144,7 @@ def increment_poll_count():
     if polls_today["date"] != today:
         polls_today = {"date": today, "count": 0}
     polls_today["count"] += 1
+    persist_state()
     log.info(f"🗳️ Polls today: {polls_today['count']}/3")
 
 def should_create_poll(title, summary, cat):
@@ -1241,6 +1372,7 @@ def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_
         remember_post(title, cat, ts)
         if not is_breaking_flag:
             last_regular_post_time = datetime.utcnow()
+            persist_state()
             log.info("🕐 Regular timer reset — next Telegram post in 90min")
         else:
             log.info("🔴 Breaking posted!")
@@ -2230,6 +2362,7 @@ def handle_updates():
                             corrected = parts[1].strip() if len(parts) > 1 else None
                             if key in approval_queue:
                                 item = approval_queue.pop(key)
+                                persist_state()
                                 action = "edited" if corrected else "approved"
                                 try:
                                     send_text(chat_id, f"Got it {first_name} 🙌 Your {action} card is being posted... ⏳", reply_to=msg_id, thread_id=thread_id)
@@ -2282,6 +2415,7 @@ def handle_updates():
                             if key in approval_queue:
                                 rej_title = approval_queue[key].get("title","")[:70]
                                 del approval_queue[key]
+                                persist_state()
                                 import random as _r
                                 send_text(chat_id, f"❌ <b>{key.upper()}</b> rejected — {rej_title}\n\n{_r.choice(REJECT_RESPONSES)}", reply_to=msg_id, thread_id=thread_id)
                                 log.info(f"🗑️ {key} rejected by {first_name}")
@@ -2485,6 +2619,7 @@ if __name__ == "__main__":
     log.info("🌅 7AM Brief | 🌙 12AM Summary | 🌤️ 8AM/8PM Weather | 📊 Friday Digest")
     log.info("💬 Smart chat with history, Tavily search, Dhivehi support")
 
+    restore_state()  # bring back dedup memory, daily counters, pending cards, analytics
     seen_on_start=load_seen()
     log.info(f"📚 Loaded {len(seen_on_start)} seen articles")
 
