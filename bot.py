@@ -315,7 +315,8 @@ def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
         from gi.repository import Pango, PangoCairo
         import cairo
     except Exception as e:
-        log.error(f"Pango not available: {e}")
+        log.error(f"Pango not available (falling back to PIL): {e}")
+        log.info("Tip: ensure python3-gi is installed in Dockerfile")
         return generate_card(text, source, timestamp, cat, bg_image, _skip_dhivehi=True)
 
     import numpy as np
@@ -859,7 +860,7 @@ def post_article(article, seen, social_only=False, allow_social=True):
 
     rewritten, keyword = rewrite_news(article["title"],article["summary"],cat)
     bg = fetch_background_image(keyword)
-    ts = datetime.now().strftime("%d %b %Y • %H:%M")
+    ts = (datetime.utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
     card = generate_card(rewritten, article["source"], ts, cat, bg)
 
     cat_emoji={"LOCAL":"🇲🇻","FOOTBALL":"⚽","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(cat,"📰")
@@ -1694,7 +1695,7 @@ def handle_updates():
                                     send_text(chat_id, f"⏳ Creating card for {key}...", thread_id=thread_id)
                                     kw = pending.get("keyword", pending["cat"].lower())
                                     bg = fetch_background_image(kw)
-                                    ts_now = datetime.now().strftime("%d %b %Y • %H:%M")
+                                    ts_now = (datetime.utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
                                     card = generate_card(final_dv_text, pending["source"], ts_now, pending["cat"], bg)
                                     full_caption = (
                                         f"🇲🇻 <b>{pending['title']}</b>\n\n"
@@ -1797,7 +1798,7 @@ def handle_updates():
                                     else:
                                         bg = fetch_background_image("maldives news")
 
-                                    ts_now = datetime.now().strftime("%d %b %Y • %H:%M")
+                                    ts_now = (datetime.utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
                                     card = generate_card(content_text, "Samuga Media", ts_now, manual_cat, bg)
                                     cat_emoji = {"LOCAL":"🇲🇻","FOOTBALL":"⚽","SPORTS":"🏅","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(manual_cat,"📰")
                                     breaking_prefix = "🚨 <b>BREAKING NEWS</b>\n\n" if manual_cat == "DISASTER" else ""
