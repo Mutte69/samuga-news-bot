@@ -345,14 +345,15 @@ def generate_card(text, source, timestamp, cat, bg_image=None, morning=False):
 
     # Detect Thaana script and use Noto Sans Thaana font for Dhivehi
     has_thaana = any('\u0780' <= ch <= '\u07BF' for ch in text)
-    THAANA_FONT = "/data/NotoSansThaana.ttf"
+    THAANA_BOLD = "/usr/share/fonts/truetype/noto/NotoSansThaana-Bold.ttf"
+    THAANA_REG  = "/usr/share/fonts/truetype/noto/NotoSansThaana-Regular.ttf"
     try:
-        if has_thaana and os.path.exists(THAANA_FONT):
-            f_tag  = ImageFont.truetype(THAANA_FONT, 22)
-            f_title= ImageFont.truetype(THAANA_FONT, 46)
-            f_body = ImageFont.truetype(THAANA_FONT, 27)
+        if has_thaana and os.path.exists(THAANA_BOLD):
+            f_tag  = ImageFont.truetype(THAANA_BOLD, 22)
+            f_title= ImageFont.truetype(THAANA_BOLD, 46)
+            f_body = ImageFont.truetype(THAANA_REG, 27)
             f_sm   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 21)
-            log.info("🇲🇻 Thaana font loaded for card")
+            log.info("🇲🇻 Noto Sans Thaana font loaded for Dhivehi card")
         else:
             f_tag  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
             f_title= ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 46)
@@ -1578,10 +1579,28 @@ def handle_updates():
                             # Extract the content text (everything before @SamugaNewsBot)
                             # The text comes from the photo caption or message, minus the command
                             raw_text = text  # original full text including caption
-                            # Remove the bot mention and command suffix
-                            for cmd in ["create card and post", "create card and send to community", "create card and send to core team"]:
-                                raw_text = raw_text.replace(f"@{BOT_USERNAME} {cmd}", "").replace(f"@{BOT_USERNAME.lower()} {cmd}", "")
-                            raw_text = raw_text.replace(f"@{BOT_USERNAME}", "").strip()
+                            # Remove the bot mention and ALL command variants
+                            cmd_variants = [
+                                "create card and post to coreteam",
+                                "create card and post to core team",
+                                "create card and send to coreteam",
+                                "create card and send to core team",
+                                "create card and post to community",
+                                "create card and send to community",
+                                "create card and post",
+                            ]
+                            raw_lower = raw_text.lower()
+                            for cmd in cmd_variants:
+                                idx = raw_lower.find(cmd)
+                                if idx != -1:
+                                    raw_text = raw_text[:idx].strip()
+                                    raw_lower = raw_text.lower()
+                                    break
+                            # Also remove category keywords and bot mention
+                            for kw in ["breaking", "sports", "football", "world", "tourism", "weather", "local", "political"]:
+                                raw_text = re.sub(rf"\b{kw}\b", "", raw_text, flags=re.IGNORECASE).strip()
+                            raw_text = re.sub(r"@\w+", "", raw_text).strip()
+                            raw_text = raw_text.strip()
 
                             if video and not photo:
                                 send_text(chat_id, "Videos are not supported for cards — please send a photo instead 📸", reply_to=msg_id, thread_id=thread_id)
@@ -1689,15 +1708,14 @@ def handle_updates():
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("🚀 Samuga News Bot v3.2 starting...")
-    # Download Thaana font if not present
-    THAANA_FONT = "/data/NotoSansThaana.ttf"
-    if not os.path.exists(THAANA_FONT):
+    # Install Noto Sans Thaana system font if not present
+    if not os.path.exists("/usr/share/fonts/truetype/noto/NotoSansThaana-Bold.ttf"):
         try:
-            r = requests.get("https://github.com/google/fonts/raw/main/ofl/notosansthaana/NotoSansThaana%5Bwght%5D.ttf", timeout=20)
-            with open(THAANA_FONT, "wb") as f: f.write(r.content)
-            log.info("✅ Thaana font downloaded")
+            import subprocess
+            subprocess.run(["apt-get", "install", "-y", "fonts-noto"], capture_output=True)
+            log.info("✅ Noto fonts installed")
         except Exception as e:
-            log.warning(f"Thaana font download failed: {e}")
+            log.warning(f"Noto font install failed: {e}")
     log.info("📅 7AM-6PM: every 30min | Night: social only")
     log.info("🌅 7AM Brief | 🌙 12AM Summary | 🌤️ 8AM/8PM Weather | 📊 Friday Digest")
     log.info("💬 Smart chat with history, Tavily search, Dhivehi support")
