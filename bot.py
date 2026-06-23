@@ -230,6 +230,73 @@ def save_seen(seen):
 recent_posts = []
 user_conversations = {}
 
+# ── Duplicate Story Detection ─────────────────────────────────────────────────
+# Tracks recently posted/queued story titles so the same event from different
+# sources (Mihaaru / Sun / PSM) doesn't get posted multiple times.
+recent_story_titles = []  # list of (title, timestamp)
+DUP_WINDOW_HOURS = 18     # consider stories within this window for dedup
+DUP_THRESHOLD = 0.55      # similarity above which two stories are "the same"
+
+_DUP_STOPWORDS = {
+    "the","a","an","of","in","on","at","to","for","and","or","is","are","was","were",
+    "has","have","had","with","by","from","as","that","this","it","its","their","they",
+    "maldives","maldivian","male","reported","says","said","after","over","amid","new",
+    "breaking","news","update","live","video","photo","watch","near","into","out","be","will"
+}
+
+# Synonym groups — different outlets use different words for the same event
+_DUP_SYNONYMS = {
+    "parliament":"majlis","majlis":"majlis",
+    "passes":"approve","approves":"approve","approved":"approve","passed":"approve","endorses":"approve","endorsed":"approve",
+    "crash":"accident","accident":"accident","collision":"accident","collide":"accident",
+    "injures":"injured","injured":"injured","hurt":"injured","wounded":"injured",
+    "visits":"visit","visit":"visit","arrives":"visit","arrival":"visit","trip":"visit","arrived":"visit",
+    "dies":"dead","died":"dead","killed":"dead","death":"dead","dead":"dead","passes away":"dead",
+    "fire":"fire","blaze":"fire",
+    "boat":"boat","speedboat":"boat","vessel":"boat","dhoni":"boat","launch":"boat","ferry":"boat",
+    "arrested":"arrest","arrest":"arrest","detained":"arrest","held":"arrest",
+    "minister":"minister","ministry":"minister",
+    "president":"president","raees":"president",
+}
+
+def _dup_canon(word):
+    return _DUP_SYNONYMS.get(word, word)
+
+def _dup_keywords(title):
+    """Extract canonicalized meaningful keywords from a title."""
+    import re as _re
+    t = title.lower()
+    t = _re.sub(r"[^a-z0-9\u0780-\u07bf ]", " ", t)  # keep latin, digits, thaana
+    return set(_dup_canon(w) for w in t.split() if w not in _DUP_STOPWORDS and len(w) > 2)
+
+def _title_similarity(a, b):
+    """Similarity 0-1 using canonicalized keyword overlap + containment."""
+    ka, kb = _dup_keywords(a), _dup_keywords(b)
+    if not ka or not kb:
+        return 0.0
+    overlap = len(ka & kb) / max(1, len(ka | kb))          # Jaccard
+    contain = len(ka & kb) / max(1, min(len(ka), len(kb))) # smaller-set containment
+    return max(overlap, contain * 0.85)
+
+def is_duplicate_story(title):
+    """True if a very similar story was posted/queued within the dedup window."""
+    global recent_story_titles
+    now = datetime.utcnow()
+    recent_story_titles = [(t, ts) for (t, ts) in recent_story_titles
+                           if (now - ts).total_seconds() < DUP_WINDOW_HOURS * 3600]
+    for (past_title, _ts) in recent_story_titles:
+        sim = _title_similarity(title, past_title)
+        if sim >= DUP_THRESHOLD:
+            log.info(f"🔁 Duplicate ({sim:.2f}): '{title[:45]}' ≈ '{past_title[:45]}'")
+            return True
+    return False
+
+def remember_story_title(title):
+    """Record a title so future similar stories are flagged as duplicates."""
+    recent_story_titles.append((title, datetime.utcnow()))
+    if len(recent_story_titles) > 200:
+        recent_story_titles.pop(0)
+
 # Analytics counters (reset weekly)
 analytics = {"posts_by_cat": {}, "breaking_count": 0, "social_success": 0, "social_fail": 0, "week_start": None}
 
@@ -1192,6 +1259,13 @@ def post_article(article, seen, social_only=False, allow_social=True):
 
     # Mark seen now so the same article isn't re-processed on the next scan
     seen.add(article["id"]); save_seen(seen)
+
+    # ── Duplicate story check — skip if same event already posted/queued ──
+    if is_duplicate_story(article["title"]):
+        log.info(f"⏭️ Skipping duplicate: {article['title'][:55]}")
+        return False
+    # Record this title so later similar stories are caught
+    remember_story_title(article["title"])
 
     # ── English BREAKING: publish instantly, no approval ──
     if breaking and not is_dv:
