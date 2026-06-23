@@ -51,6 +51,7 @@ CAT_CONFIG = {
     "DISASTER":{"label": "🚨  DISASTER ALERT", "color": (220,120,0)},
     "WEATHER": {"label": "🌤️  WEATHER",        "color": (100,180,240)},
     "TOURISM": {"label": "✈️  TOURISM",        "color": (160,80,220)},
+    "SPORTS":  {"label": "🏅  SPORTS",          "color": (0,180,100)},
 }
 
 # ── Core Team Session Context (in-memory only, clears on restart) ────────────
@@ -314,8 +315,8 @@ def generate_card(text, source, timestamp, cat, bg_image=None, morning=False):
         r = bg.width/bg.height
         nh,nw = (H,int(H*r)) if r>1 else (int(W/r),W)
         bg = bg.resize((nw,nh),Image.LANCZOS).crop(((nw-W)//2,(nh-H)//2,(nw-W)//2+W,(nh-H)//2+H))
-        bg = ImageEnhance.Brightness(bg).enhance(0.22)
-        img = Image.blend(bg, Image.new("RGB",(W,H),(8,30,65)), 0.55)
+        bg = ImageEnhance.Brightness(bg).enhance(0.32)
+        img = Image.blend(bg, Image.new("RGB",(W,H),(8,30,65)), 0.45)
     else:
         d = ImageDraw.Draw(img)
         for y in range(H):
@@ -324,7 +325,7 @@ def generate_card(text, source, timestamp, cat, bg_image=None, morning=False):
 
     ov=Image.new("RGBA",(W,H),(0,0,0,0)); od=ImageDraw.Draw(ov)
     for y in range(H//2,H):
-        t=(y-H//2)/(H//2); od.line([(0,y),(W,y)],fill=(5,20,50,int(215*t)))
+        t=(y-H//2)/(H//2); od.line([(0,y),(W,y)],fill=(5,20,50,int(185*t)))
     img=Image.alpha_composite(img.convert("RGBA"),ov).convert("RGB")
 
     ov2=Image.new("RGBA",(W,H),(0,0,0,0)); od2=ImageDraw.Draw(ov2)
@@ -1545,12 +1546,23 @@ def handle_updates():
                             "create card and post to community" in clean.lower()
                         ):
                             cl = clean.lower()
-                            if "to core team" in cl:
+                            if "core team" in cl or "coreteam" in cl:
                                 destination = "coreteam"
-                            elif "to community" in cl or "send to community" in cl:
+                            elif "community" in cl:
                                 destination = "community"
                             else:
                                 destination = "all"
+
+                            # Detect category from command
+                            manual_cat = "LOCAL"
+                            if any(w in cl for w in ["breaking", "breaking news"]): manual_cat = "DISASTER"
+                            elif any(w in cl for w in ["political", "politics", "government", "parliament"]): manual_cat = "LOCAL"
+                            elif any(w in cl for w in ["sports", "sport"]): manual_cat = "SPORTS"
+                            elif any(w in cl for w in ["football", "soccer"]): manual_cat = "FOOTBALL"
+                            elif any(w in cl for w in ["lifestyle", "culture", "health"]): manual_cat = "TOURISM"
+                            elif any(w in cl for w in ["world", "international", "global"]): manual_cat = "WORLD"
+                            elif any(w in cl for w in ["tourism", "travel", "resort"]): manual_cat = "TOURISM"
+                            elif any(w in cl for w in ["weather", "storm", "rain"]): manual_cat = "WEATHER"
 
                             # Extract the content text (everything before @SamugaNewsBot)
                             # The text comes from the photo caption or message, minus the command
@@ -1577,9 +1589,11 @@ def handle_updates():
                                         bg = fetch_background_image("maldives news")
 
                                     ts_now = datetime.now().strftime("%d %b %Y • %H:%M")
-                                    card = generate_card(content_text, "Samuga Media", ts_now, "LOCAL", bg)
+                                    card = generate_card(content_text, "Samuga Media", ts_now, manual_cat, bg)
+                                    cat_emoji = {"LOCAL":"🇲🇻","FOOTBALL":"⚽","SPORTS":"🏅","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(manual_cat,"📰")
+                                    breaking_prefix = "🚨 <b>BREAKING NEWS</b>\n\n" if manual_cat == "DISASTER" else ""
                                     full_caption = (
-                                        "🇲🇻 " + content_text + "\n\n"
+                                        breaking_prefix + cat_emoji + " " + content_text + "\n\n"
                                         "📡 <b>Samuga Media</b> | @samugacommunity"
                                     )
 
