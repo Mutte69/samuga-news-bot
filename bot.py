@@ -8,6 +8,12 @@ from io import BytesIO
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
+# ── Timezone-aware UTC helper (replaces deprecated utcnow()) ─────────
+from datetime import timezone as _tz
+def utcnow():
+    """Naive UTC datetime — same value as the old utcnow() but not deprecated."""
+    return datetime.now(_tz.utc).replace(tzinfo=None)
+
 # ── Config ────────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "@samugacommunity")
@@ -143,7 +149,7 @@ def store_pending_approval(card_bytes, caption, title, link, cat="LOCAL", lang="
         "source": source,
         "is_breaking": is_breaking,
         "allow_social": allow_social,
-        "created_at": datetime.utcnow(),
+        "created_at": utcnow(),
     }
     # Cap queue size
     if len(approval_queue) > 40:
@@ -158,7 +164,7 @@ def expire_old_approvals():
       - English cards not approved within 30 min → AUTO-POST to community + social
       - Dhivehi cards not approved within 2 hours → DELETE (never auto-post unreviewed Dhivehi)
     """
-    now = datetime.utcnow()
+    now = utcnow()
 
     # English auto-post after 30 min
     en_due = [k for k, v in approval_queue.items()
@@ -364,6 +370,84 @@ def db_mark_status(article_id, status, posted=False):
     else:
         db_execute("UPDATE articles SET status=%s WHERE id=%s", (status, article_id))
 
+# ── TREND DETECTOR (v6 Intelligence) ─────────────────────────────────────────
+# Reads the Postgres archive, extracts topics from article titles, counts how
+# often each topic appears in 24h. 5+ mentions = a trending story.
+# This is the "Understand + Rank" layer — the bot starts to see patterns.
+
+# Topic keywords grouped by theme — what Maldives actually talks about.
+# Each theme has trigger words; an article counts toward a theme if any match.
+TREND_THEMES = {
+    "Cost of Living":     ["cost of living","price","prices","inflation","expensive","rufiyaa","dollar rate","import","grocery","staple"],
+    "Housing":            ["housing","flat","flats","land","plot","gedhoru","apartment","rent","hiya","vinares","social housing"],
+    "Corruption":         ["corruption","bribe","embezzle","graft","acc ","anti-corruption","scandal","misuse","fraud","laundering"],
+    "Drugs":              ["drug","drugs","narcotic","trafficking","heroin","cannabis","addict","rehab"],
+    "Politics":           ["parliament","majlis","president","minister","cabinet","mp ","party","election","vote","impeach","no-confidence"],
+    "Tourism":            ["tourism","resort","arrival","occupancy","tourist","visitor","bed night","travel"],
+    "Fishing":            ["fishing","fisheries","fishermen","tuna","catch","mifco","masveriya"],
+    "Crime":              ["murder","stabbing","assault","robbery","theft","arrested","police","gang","violence"],
+    "Economy":            ["economy","gdp","budget","debt","loan","reserve","imf","world bank","deficit","sovereign"],
+    "Weather/Disaster":   ["storm","flood","rain","swell","udha","fire","accident","sinking","capsize","rescue"],
+    "Health":             ["hospital","health","disease","dengue","outbreak","aasandha","medical","clinic","doctor"],
+    "Infrastructure":     ["bridge","harbour","airport","road","construction","project","development","sewerage","water"],
+    "Education":          ["school","education","student","university","exam","teacher","scholarship"],
+    "India/Foreign":      ["india","china","indian","chinese","foreign","diplomatic","embassy","bilateral","agreement"],
+}
+
+def _detect_themes(text):
+    """Return the set of themes an article touches based on its text."""
+    t = text.lower()
+    hits = set()
+    for theme, kws in TREND_THEMES.items():
+        if any(kw in t for kw in kws):
+            hits.add(theme)
+    return hits
+
+def detect_trends(hours=24, min_mentions=3):
+    """
+    Analyze the article archive for trending themes.
+    Returns a sorted list of (theme, count, sample_titles) for themes with
+    >= min_mentions in the time window. DB-only — returns [] if no Postgres.
+    """
+    if not DB_ENABLED:
+        return []
+    rows = db_execute(
+        "SELECT title, summary FROM articles WHERE found_at > NOW() - INTERVAL %s",
+        (f"{hours} hours",), fetch="all")
+    if not rows:
+        return []
+    theme_counts = {}
+    theme_titles = {}
+    for title, summary in rows:
+        text = f"{title or ''} {summary or ''}"
+        for theme in _detect_themes(text):
+            theme_counts[theme] = theme_counts.get(theme, 0) + 1
+            theme_titles.setdefault(theme, [])
+            if title and len(theme_titles[theme]) < 3:
+                theme_titles[theme].append(title[:70])
+    trends = [(th, c, theme_titles.get(th, []))
+              for th, c in theme_counts.items() if c >= min_mentions]
+    trends.sort(key=lambda x: x[1], reverse=True)
+    return trends
+
+def is_trending_topic(title, summary="", min_mentions=4):
+    """
+    Quick check: does this article belong to a currently-trending theme?
+    Used to BOOST scoring for stories about hot topics.
+    Returns (is_trending, theme_name, mention_count) or (False, None, 0).
+    """
+    if not DB_ENABLED:
+        return (False, None, 0)
+    themes = _detect_themes(f"{title} {summary}")
+    if not themes:
+        return (False, None, 0)
+    trends = {t[0]: t[1] for t in detect_trends(hours=24, min_mentions=min_mentions)}
+    for theme in themes:
+        if theme in trends:
+            return (True, theme, trends[theme])
+    return (False, None, 0)
+
+
 # ── Storage ───────────────────────────────────────────────────────────────────
 DATA_DIR  = "/data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -493,7 +577,7 @@ def restore_state():
                 if item.get("_card_b64") and item.get("card_bytes"):
                     item["card_bytes"] = base64.b64decode(item["card_bytes"])
                 item.pop("_card_b64", None)
-                item["created_at"] = datetime.fromisoformat(item["created_at"]) if item.get("created_at") else datetime.utcnow()
+                item["created_at"] = datetime.fromisoformat(item["created_at"]) if item.get("created_at") else utcnow()
                 approval_queue[k] = item
             except Exception as e:
                 log.error(f"restore approval {k}: {e}")
@@ -558,7 +642,7 @@ def _title_similarity(a, b):
 def is_duplicate_story(title):
     """True if a very similar story was posted/queued within the dedup window."""
     global recent_story_titles
-    now = datetime.utcnow()
+    now = utcnow()
     recent_story_titles = [(t, ts) for (t, ts) in recent_story_titles
                            if (now - ts).total_seconds() < DUP_WINDOW_HOURS * 3600]
     for (past_title, _ts) in recent_story_titles:
@@ -570,10 +654,82 @@ def is_duplicate_story(title):
 
 def remember_story_title(title):
     """Record a title so future similar stories are flagged as duplicates."""
-    recent_story_titles.append((title, datetime.utcnow()))
+    recent_story_titles.append((title, utcnow()))
     if len(recent_story_titles) > 200:
         recent_story_titles.pop(0)
     persist_state()
+
+# ── Story Clustering (v6) — group same event from multiple sources ───────────
+# When 3 outlets report the same fire, the bot doesn't post 3 times. It detects
+# they're the same story and posts ONCE as "🔥 Multiple sources reporting...".
+# story_clusters: cluster_key -> {"sources": set, "first_title": str, "ts": datetime}
+story_clusters = {}
+
+def _cluster_key(title):
+    """A stable-ish key for a story so the same event maps to the same cluster."""
+    kws = sorted(_dup_keywords(title))
+    return " ".join(kws[:6])  # top keywords as the signature
+
+# Maldivian place names + event types — strong signals two stories are the same event
+_CLUSTER_PLACES = ["hulhumale","male","male'","villingili","addu","fuvahmulah","kulhudhuffushi",
+    "thinadhoo","gan","hithadhoo","naifaru","dharavandhoo","maafushi","guraidhoo","thulusdhoo",
+    "vilimale","gulhi","dhiffushi","raa","baa","laamu","gaafu","seenu","haa","noonu","thaa"]
+_CLUSTER_EVENTS = {
+    "fire":["fire","blaze","burn"], "accident":["accident","crash","collision"],
+    "death":["dies","died","dead","killed","death","passed away"], "arrest":["arrest","arrested","detained"],
+    "drowning":["drown","drowned"], "sinking":["sink","sank","capsize","capsized"],
+    "robbery":["robbery","theft","stolen","burgle"], "stabbing":["stab","stabbed","stabbing"],
+    "protest":["protest","demonstration","rally"], "storm":["storm","flood","swell","udha"],
+}
+
+def _cluster_similarity(a, b):
+    """Looser similarity for clustering: same PLACE + same EVENT TYPE = same story."""
+    base = _title_similarity(a, b)
+    ta, tb = a.lower(), b.lower()
+    # Shared place?
+    place_a = next((p for p in _CLUSTER_PLACES if p in ta), None)
+    place_b = next((p for p in _CLUSTER_PLACES if p in tb), None)
+    same_place = place_a and place_a == place_b
+    # Shared event type?
+    def event_of(t):
+        for ev, kws in _CLUSTER_EVENTS.items():
+            if any(k in t for k in kws): return ev
+        return None
+    ev_a, ev_b = event_of(ta), event_of(tb)
+    same_event = ev_a and ev_a == ev_b
+    # Same place AND same event = almost certainly the same story
+    if same_place and same_event:
+        return max(base, 0.75)
+    # Same event + decent word overlap
+    if same_event and base >= 0.25:
+        return max(base, 0.60)
+    return base
+
+def register_in_cluster(title, source):
+    """
+    Record that `source` is reporting this story. Returns (cluster_size, sources_list).
+    If multiple sources report the same event, cluster_size > 1 = a corroborated story.
+    """
+    now = utcnow()
+    # Clean old clusters
+    expired = [k for k, v in story_clusters.items()
+               if (now - v["ts"]).total_seconds() > DUP_WINDOW_HOURS * 3600]
+    for k in expired:
+        del story_clusters[k]
+
+    # Find an existing cluster this title belongs to (cluster-aware fuzzy match)
+    matched_key = None
+    for k, v in story_clusters.items():
+        if _cluster_similarity(title, v["first_title"]) >= 0.58:
+            matched_key = k
+            break
+    if matched_key is None:
+        matched_key = _cluster_key(title)
+        story_clusters[matched_key] = {"sources": set(), "first_title": title, "ts": now}
+
+    story_clusters[matched_key]["sources"].add(source or "Unknown")
+    srcs = sorted(story_clusters[matched_key]["sources"])
+    return (len(srcs), srcs)
 
 # ── Source Reliability Scoring ────────────────────────────────────────────────
 # Higher = more trusted. Used as a tie-breaker and a scoring boost so a direct
@@ -638,7 +794,7 @@ def add_to_conversation(uid, role, content):
     if len(conv) > 10: user_conversations[uid] = conv[-10:]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def get_mvt_hour(): return (datetime.utcnow().hour + 5) % 24
+def get_mvt_hour(): return (utcnow().hour + 5) % 24
 def is_day_mode(): return 6 <= get_mvt_hour() < 22
 
 def is_fresh(entry, hours=24):
@@ -647,8 +803,8 @@ def is_fresh(entry, hours=24):
         if pub:
             dt = parsedate_to_datetime(pub)
             if dt.tzinfo: dt = dt.replace(tzinfo=None)
-            return datetime.utcnow() - dt < timedelta(hours=hours)
-    except: pass
+            return utcnow() - dt < timedelta(hours=hours)
+    except Exception as e: log.debug(f"is_fresh parse: {e}")
     return True
 
 def is_breaking(title, summary="", cat=""):
@@ -678,7 +834,7 @@ last_regular_post_time = None
 
 # ── Daily posting counters (reset at midnight MVT) ────────────────────────────
 def _mvt_today():
-    return (datetime.utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+    return (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
 
 daily_sports_count  = {"date": None, "count": 0}
 daily_world_count   = {"date": None, "count": 0}
@@ -702,7 +858,7 @@ def increment_cat_count(counter_dict):
 def can_post_regular():
     global last_regular_post_time
     if not last_regular_post_time: return True
-    return (datetime.utcnow()-last_regular_post_time).total_seconds() >= 5400  # 1hr 30min
+    return (utcnow()-last_regular_post_time).total_seconds() >= 5400  # 1hr 30min
 
 # ── Social filter — only quality LOCAL/DISASTER/relevant WORLD goes to socials ─
 def allowed_for_social(article):
@@ -816,7 +972,7 @@ def fetch_mvcrisis():
                 "source": "MvCrisis",
                 "cat": "LOCAL",   # was DISASTER — fixed: not everything is an emergency
                 "lang": lang,
-                "published": datetime.utcnow()
+                "published": utcnow()
             })
         log.info(f"📡 MvCrisis: {len(articles)} news kept, {skipped_ads} ads skipped")
         return articles
@@ -886,7 +1042,7 @@ def get_local_headlines():
                 if title and is_fresh(entry, hours=12):
                     headlines.append(f"• [{fc['cat']}] {title}")
             if len(headlines) >= 10: break
-    except: pass
+    except Exception as e: log.debug(f"get_local_headlines: {e}")
     return headlines[:10]
 
 # ── Rewrite with Claude ───────────────────────────────────────────────────────
@@ -1052,7 +1208,7 @@ def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
         lh = 72; lw = int(logo.width * lh / logo.height)
         logo = logo.resize((lw, lh), Image.LANCZOS)
         ov.paste(logo, (50, 38), logo)
-    except: pass
+    except Exception as e: log.debug(f"logo overlay: {e}")
     try:
         f_sm = _IF.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 21)
         od.text((W-310, 50), "t.me/samugacommunity", font=f_sm, fill=(200,230,255,220))
@@ -1060,7 +1216,7 @@ def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
         tw = od.textlength(timestamp, font=f_sm)
         od.text((W-50-int(tw), H-52), timestamp, font=f_sm, fill=(180,200,220,220))
         od.line([(0, H-65),(W, H-65)], fill=(255,255,255,50), width=1)
-    except: pass
+    except Exception as e: log.debug(f"timestamp draw: {e}")
     ov_arr = np.array(ov)
     ov_bgra = np.ascontiguousarray(ov_arr[:, :, [2, 1, 0, 3]])
     ov_surf = cairo.ImageSurface.create_for_data(ov_bgra, cairo.FORMAT_ARGB32, W, H)
@@ -1160,7 +1316,7 @@ def generate_card(text, source, timestamp, cat, bg_image=None, morning=False, _s
         lh=72; lw=int(logo.width*lh/logo.height)
         logo=logo.resize((lw,lh),Image.LANCZOS)
         img.paste(logo,(50,38),logo)
-    except: pass
+    except Exception as e: log.debug(f"logo paste: {e}")
 
     # Detect Thaana script and use Noto Sans Thaana font for Dhivehi
     has_thaana = any('\u0780' <= ch <= '\u07BF' for ch in text)
@@ -1183,7 +1339,8 @@ def generate_card(text, source, timestamp, cat, bg_image=None, morning=False, _s
             f_title= ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 46)
             f_body = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 27)
             f_sm   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 21)
-    except:
+    except Exception as e:
+        log.debug(f"font load fallback: {e}")
         f_tag=f_title=f_body=f_sm=ImageFont.load_default()
 
     draw.text((W-310,50),"t.me/samugacommunity",font=f_sm,fill=(200,230,255))
@@ -1344,14 +1501,14 @@ polls_today = {"date": None, "count": 0}
 
 def can_post_poll():
     global polls_today
-    today = (datetime.utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
     if polls_today["date"] != today:
         polls_today = {"date": today, "count": 0}
     return polls_today["count"] < 3
 
 def increment_poll_count():
     global polls_today
-    today = (datetime.utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
     if polls_today["date"] != today:
         polls_today = {"date": today, "count": 0}
     polls_today["count"] += 1
@@ -1563,12 +1720,16 @@ def _build_card_and_caption(article):
         display_cat = canonical_category(raw_cat, article["title"], article.get("summary",""))
     rewritten, keyword = rewrite_news(article["title"], article["summary"], raw_cat)
     bg = fetch_background_image(keyword)
-    ts = (datetime.utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+    ts = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
     card = generate_card(rewritten, article["source"], ts, display_cat, bg)
     card_bytes = card.getvalue()
 
     cat_emoji = {"BREAKING":"🚨","LOCAL":"🇲🇻","POLITICAL":"🏛️","LIFESTYLE":"🌴","SPORTS":"🏅"}.get(display_cat,"📰")
     breaking_tag = "🚨 <b>BREAKING NEWS</b>\n\n" if breaking else ""
+
+    # Clustering boosts a story's importance internally (more outlets covering it
+    # = bigger story = higher score), but we NEVER credit competitors on the card.
+    # Samuga sees everything, merges it, rewrites it, and posts it as its own.
     caption = (f"{breaking_tag}{cat_emoji} <b>{article['title']}</b>\n\n"
                f"{rewritten}\n\n"
                f"📡 <b>Samuga Media</b> | @samugacommunity")
@@ -1579,14 +1740,14 @@ def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_
     """Actually post a finished card to Telegram + (optionally) social. Returns True on Telegram success."""
     global last_regular_post_time
     buf = io.BytesIO(card_bytes)
-    ts = (datetime.utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+    ts = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
 
     log.info(f"📰 [{'🔴BREAKING' if is_breaking_flag else '🟡REGULAR'}][{cat}] {title[:60]}...")
     buf.seek(0)
     if send_to_telegram(buf, caption):
         remember_post(title, cat, ts)
         if not is_breaking_flag:
-            last_regular_post_time = datetime.utcnow()
+            last_regular_post_time = utcnow()
             persist_state()
             log.info("🕐 Regular timer reset — next Telegram post in 90min")
         else:
@@ -1666,13 +1827,19 @@ def post_article(article, seen, social_only=False, allow_social=True):
                       reliability=source_reliability(article.get("source","")),
                       status="seen", is_breaking=breaking)
 
+    # ── Story clustering — track which sources report this event ──
+    cluster_size, cluster_sources = register_in_cluster(article["title"], article.get("source",""))
+
     # ── Duplicate story check — skip if same event already posted/queued ──
     if is_duplicate_story(article["title"]):
-        log.info(f"⏭️ Skipping duplicate: {article['title'][:55]}")
+        log.info(f"⏭️ Skipping duplicate ({cluster_size} sources): {article['title'][:55]}")
         db_mark_status(article["id"], "duplicate")
         return False
     # Record this title so later similar stories are caught
     remember_story_title(article["title"])
+    # Stash cluster info on the article so the card can show "X sources reporting"
+    article["_cluster_size"] = cluster_size
+    article["_cluster_sources"] = cluster_sources
 
     # ── English BREAKING: publish instantly, no approval ──
     if breaking and not is_dv:
@@ -1758,6 +1925,20 @@ def score_article(a):
     # Source reliability — trusted sources rank higher (0-25 boost)
     rel = source_reliability(a.get("source",""))
     score += int((rel - 50) / 2)  # 100→+25, 55→+2, 60→+5
+    # Trending boost — stories about hot topics rank higher (+30 if trending)
+    try:
+        trending, theme, count = is_trending_topic(a["title"], a.get("summary",""))
+        if trending:
+            score += 30
+            a["_trend_theme"] = theme  # stash for display
+    except Exception as e:
+        log.debug(f"trend check in score: {e}")
+    # Corroboration boost — if multiple outlets are covering the same event,
+    # it's a bigger story. +12 per extra source (capped at +36). The bot SEES
+    # the consensus and ranks accordingly — but never credits competitors publicly.
+    cluster_size = a.get("_cluster_size", 1)
+    if cluster_size >= 2:
+        score += min((cluster_size - 1) * 12, 36)
     return score
 
 def run_job(social_only=False, breaking_only=False):
@@ -1777,6 +1958,14 @@ def run_job(social_only=False, breaking_only=False):
     fresh = [a for a in articles if a["id"] not in seen]
     if not fresh:
         log.info("No fresh articles."); return
+
+    # ── Pre-build story clusters: register every fresh article's source FIRST ──
+    # This way, by the time we pick the best one, we already know how many
+    # sources are reporting the same event (corroboration = stronger story).
+    for a in fresh:
+        size, srcs = register_in_cluster(a["title"], a.get("source",""))
+        a["_cluster_size"] = size
+        a["_cluster_sources"] = srcs
 
     fresh.sort(key=score_article, reverse=True)
 
@@ -1799,14 +1988,25 @@ def run_job(social_only=False, breaking_only=False):
 
     # ── 2. Regular news: ONLY post if 90-min Telegram window is open ──────
     if not can_post_regular():
-        secs_left = int(5400 - (datetime.utcnow() - last_regular_post_time).total_seconds())
+        secs_left = int(5400 - (utcnow() - last_regular_post_time).total_seconds())
         log.info(f"⏳ Telegram throttled — {secs_left//60}m left. No social posting either. Waiting.")
         return  # Nothing. No social. No exceptions.
 
-    # Window is open — find the single best article
+    # ── Window is open — post the BEST articles ──
+    # Top story always goes. Additional stories (#2-5) post too IF they score
+    # high enough AND are a different category (no two LOCAL in a row).
+    # This means a big day (election + crime + economy) isn't bottlenecked to 1.
+    MAX_PER_RUN = 5
+    STRONG_SCORE = 120   # #2+ must clear this to ride along with the top story
+    posted_count = 0
+    posted_cats = set()
+
     for a in regular_articles:
+        if posted_count >= MAX_PER_RUN:
+            break
         cat = a["cat"]
         text_lower = (a["title"] + " " + a.get("summary","")).lower()
+        a_score = score_article(a)
 
         # Sports: Maldives national team only, max 1/day
         if cat in ["SPORTS", "FOOTBALL"]:
@@ -1839,16 +2039,28 @@ def run_job(social_only=False, breaking_only=False):
             log.info("⛔ Weather — skipping (weather card handles this)")
             continue
 
+        # ── Multi-post gating ──
+        # First article (top story) always posts. Extras must be STRONG + new category.
+        if posted_count >= 1:
+            disp_cat = canonical_category(cat, a["title"], a.get("summary",""))
+            if a_score < STRONG_SCORE:
+                log.info(f"⏹️ Stopping extras — next best score {a_score} < {STRONG_SCORE}")
+                break  # articles are sorted, so nothing below will qualify either
+            if disp_cat in posted_cats:
+                log.info(f"⏭️ Already posted a {disp_cat} this run — skipping for variety")
+                continue
+
         # Post to Telegram. Social only fires if article passes social filter.
         allow_social = allowed_for_social(a)
-        log.info(f"🟡 REGULAR [{cat}] social={'yes' if allow_social else 'no'}: {a['title'][:55]}")
+        log.info(f"🟡 REGULAR [{cat}] score={a_score} social={'yes' if allow_social else 'no'}: {a['title'][:55]}")
         if post_article(a, seen, social_only=False, allow_social=allow_social):
+            posted_count += 1
+            posted_cats.add(canonical_category(cat, a["title"], a.get("summary","")))
             if cat in ["SPORTS","FOOTBALL"]: increment_cat_count(daily_sports_count)
             elif cat == "WORLD": increment_cat_count(daily_world_count)
             elif cat == "TOURISM": increment_cat_count(daily_tourism_count)
-        break  # ONE article per run, always
 
-    log.info("✅ run_job done.")
+    log.info(f"✅ run_job done — {posted_count} article(s) queued/posted this run.")
 
 # Sources scanned in the fast breaking-news check (5 min cycle)
 BREAKING_SOURCES = [
@@ -2075,7 +2287,8 @@ def generate_weather_card(weather_data):
         font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
         font_tiny  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
         font_xs    = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
-    except:
+    except Exception as e:
+        log.debug(f"weather font fallback: {e}")
         font_huge = font_large = font_med = font_small = font_tiny = font_xs = ImageFont.load_default()
 
     from datetime import timezone
@@ -2124,7 +2337,7 @@ def generate_weather_card(weather_data):
     for i, (h_str, t, c, p) in enumerate(zip(hours, temps, codes, precip)):
         try:
             h_hour = int(h_str.split("T")[1][:2])
-        except: continue
+        except Exception: continue
         if h_hour < now_hour: continue
         if displayed >= 8: break
 
@@ -2210,6 +2423,75 @@ Today's posts: {posts_text}
         send_text(TELEGRAM_CHANNEL_ID, caption)
         log.info("✅ Night summary sent!")
     except Exception as e: log.error(f"Night summary: {e}")
+
+# ── AI Nightly Journalist (v6) — the bot that THINKS ──────────────────────────
+# At ~10:30PM, Claude reviews the entire day's article archive and writes a real
+# editorial brief for the team: what mattered today, what it means for Maldivians,
+# and a ready-to-shoot TikTok angle for Thooma. Lands in Content Lab, not public.
+def send_ai_journalist_brief():
+    log.info("🧠 AI Journalist brief generating...")
+    try:
+        # Pull today's articles from the archive (richer than recent_posts)
+        articles_text = ""
+        trends_text = ""
+        if DB_ENABLED:
+            rows = db_execute(
+                """SELECT title, category, source, status FROM articles
+                   WHERE found_at > NOW() - INTERVAL '18 hours'
+                   ORDER BY score DESC LIMIT 40""", fetch="all")
+            if rows:
+                articles_text = "\n".join(
+                    [f"• [{cat}] {title} ({src}) — {status}" for title, cat, src, status in rows])
+            # Today's trends
+            trends = detect_trends(hours=24, min_mentions=3)
+            if trends:
+                trends_text = "\n".join([f"• {theme}: {count} stories" for theme, count, _ in trends[:6]])
+        # Fallback to recent_posts if no DB
+        if not articles_text and recent_posts:
+            articles_text = "\n".join([f"• [{p['cat']}] {p['title']}" for p in recent_posts[-20:]])
+        if not articles_text:
+            log.info("AI Journalist: no articles to review"); return
+
+        from datetime import timezone as _tzx
+        mvt = datetime.now(_tzx.utc) + timedelta(hours=5)
+        today_str = mvt.strftime("%A, %d %B %Y")
+
+        prompt = f"""You are the senior editor at Samuga Media, a sharp Maldivian news outlet. It's the end of the day ({today_str}). Review today's news and write a private editorial brief for the team (Manchii, Uly, Thooma). Be insightful and specific to the Maldives — not generic.
+
+TODAY'S ARTICLES:
+{articles_text}
+
+TRENDING THEMES TODAY:
+{trends_text or "(not enough data yet)"}
+
+Write a brief with EXACTLY these sections (use the emoji headers):
+
+📰 TOP 3 STORIES TODAY
+(The 3 most important stories, 1 line each, ranked by what matters to ordinary Maldivians — not by what's flashy.)
+
+🇲🇻 WHAT THIS MEANS
+(2-3 sentences: the real significance for everyday people in the Maldives. Connect the dots between stories if there's a pattern.)
+
+🔮 WHAT TO WATCH TOMORROW
+(1-2 things likely to develop or worth following up on.)
+
+🎬 TIKTOK ANGLE FOR THOOMA
+(One specific, punchy video idea based on today's biggest story — give a hook line she could open with.)
+
+Keep it tight, smart, and in English. Max 280 words. Write like a real editor talking to their team, not a robot."""
+
+        msg = ai.messages.create(model="claude-haiku-4-5-20251001", max_tokens=700,
+                                 messages=[{"role": "user", "content": prompt}])
+        brief = msg.content[0].text.strip()
+        caption = (f"🧠 <b>SAMUGA NIGHTLY BRIEF</b>\n"
+                   f"<i>{today_str}</i>\n\n"
+                   f"{brief}\n\n"
+                   f"━━━━━━━━━━━━━━\n"
+                   f"<i>Auto-generated by Samuga AI. Not posted publicly — for the team only.</i>")
+        send_text(CORE_TEAM_CHAT_ID, caption, thread_id=CONTENT_LAB_THREAD_ID)
+        log.info("🧠 ✅ AI Journalist brief sent to Content Lab!")
+    except Exception as e:
+        log.error(f"AI Journalist brief: {e}")
 
 # ── Weekly Analytics Report to Core Team ─────────────────────────────────────
 def send_weekly_analytics():
@@ -2369,7 +2651,7 @@ def chat_with_claude(user_message, user_id=None):
 
         def fetch_headlines():
             try: results["headlines"] = get_local_headlines()
-            except: results["headlines"] = []
+            except Exception as e: log.debug(f"fetch_headlines: {e}"); results["headlines"] = []
 
         def fetch_web():
             try:
@@ -2465,7 +2747,7 @@ def chat_with_coreteam(message, sender_name, sender_info=None, conversation_hist
         # Get recent headlines for context
         headlines = []
         try: headlines = get_local_headlines()
-        except: pass
+        except Exception as e: log.debug(f"headlines ctx: {e}")
         news_ctx = "\n".join(headlines[:5]) if headlines else ""
 
         news_line = ("LATEST MALDIVES NEWS:\n" + news_ctx) if news_ctx else ""
@@ -2599,7 +2881,7 @@ def handle_updates():
                                         final_dv = corrected if corrected else item["dv_text"]
                                         kw = item.get("keyword", item["cat"].lower())
                                         bg = fetch_background_image(kw)
-                                        ts_now = (datetime.utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+                                        ts_now = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
                                         card = generate_card(final_dv, item["source"], ts_now, item["cat"], bg)
                                         full_caption = (
                                             f"🇲🇻 <b>{item['title']}</b>\n\n"
@@ -2690,13 +2972,38 @@ def handle_updates():
                                     log.error(f"/stats: {e}")
                                     send_text(chat_id, f"❌ Stats error: {e}", reply_to=msg_id, thread_id=thread_id)
 
+                        # /trends — what Maldives is talking about right now
+                        elif text.strip().lower() in ["/trends", "/trending"]:
+                            if not DB_ENABLED:
+                                send_text(chat_id, "🗄️ Database not connected — trends unavailable.", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                try:
+                                    trends = detect_trends(hours=24, min_mentions=3)
+                                    if not trends:
+                                        send_text(chat_id, "📊 No clear trends yet — archive is still filling up. Check back after a few hours of news.", reply_to=msg_id, thread_id=thread_id)
+                                    else:
+                                        lines = ["🔥 <b>Trending in Maldives — Last 24h</b>\n"]
+                                        medals = ["🥇","🥈","🥉"] + ["🔹"]*20
+                                        for i, (theme, count, titles) in enumerate(trends[:8]):
+                                            lines.append(f"{medals[i]} <b>{theme}</b> — {count} stories")
+                                        lines.append("\n<i>The bot boosts stories about these hot topics automatically.</i>")
+                                        send_text(chat_id, "\n".join(lines), reply_to=msg_id, thread_id=thread_id)
+                                except Exception as e:
+                                    log.error(f"/trends: {e}")
+                                    send_text(chat_id, f"❌ Trends error: {e}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /brief — generate the AI nightly editorial brief on demand
+                        elif text.strip().lower() in ["/brief", "/journalist", "/editor"]:
+                            send_text(chat_id, "🧠 Generating editorial brief from today's news... give me a moment ⏳", reply_to=msg_id, thread_id=thread_id)
+                            threading.Thread(target=send_ai_journalist_brief, daemon=True).start()
+
                         # /pending — list all cards waiting for approval
                         elif text.strip().lower() in ["/pending", "/queue", "/list"]:
                             if not approval_queue:
                                 send_text(chat_id, "📭 No cards waiting for approval right now.", reply_to=msg_id, thread_id=thread_id)
                             else:
                                 lines = ["📋 <b>Cards waiting for approval:</b>\n"]
-                                now_ = datetime.utcnow()
+                                now_ = utcnow()
                                 for k, v in approval_queue.items():
                                     age_min = int((now_ - v["created_at"]).total_seconds() / 60)
                                     lang_flag = "🇲🇻" if v["lang"] == "dv" else "🇬🇧"
@@ -2780,7 +3087,7 @@ def handle_updates():
                                     else:
                                         bg = fetch_background_image(None, cat=manual_cat)
 
-                                    ts_now = (datetime.utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+                                    ts_now = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
                                     card = generate_card(content_text, "Samuga Media", ts_now, manual_cat, bg)
                                     cat_emoji = {"BREAKING":"🚨","LOCAL":"🇲🇻","POLITICAL":"🏛️","LIFESTYLE":"🌴","SPORTS":"🏅","FOOTBALL":"⚽","DISASTER":"🚨","WORLD":"🌍","WEATHER":"🌤️","TOURISM":"✈️"}.get(manual_cat,"📰")
                                     breaking_prefix = "🚨 <b>BREAKING NEWS</b>\n\n" if manual_cat in ["BREAKING", "DISASTER"] else ""
@@ -2899,6 +3206,8 @@ if __name__ == "__main__":
     scheduler.add_job(expire_old_approvals, "interval", minutes=5)
     # Morning brief 7AM MVT = 2AM UTC
     scheduler.add_job(send_morning_brief, "cron", hour=1, minute=0)  # 6AM MVT
+    # AI Nightly Journalist brief 10:30PM MVT = 5:30PM UTC (before night summary)
+    scheduler.add_job(send_ai_journalist_brief, "cron", hour=17, minute=30)  # 10:30PM MVT
     # Night summary 12AM MVT = 7PM UTC
     scheduler.add_job(send_night_summary, "cron", hour=18, minute=0)  # 11PM MVT
     # Weekly digest Friday 6PM MVT = 1PM UTC Friday
