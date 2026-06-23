@@ -297,6 +297,38 @@ def remember_story_title(title):
     if len(recent_story_titles) > 200:
         recent_story_titles.pop(0)
 
+# ── Source Reliability Scoring ────────────────────────────────────────────────
+# Higher = more trusted. Used as a tie-breaker and a scoring boost so a direct
+# Mihaaru/MvCrisis story outranks a Google News scrape of the same topic.
+SOURCE_RELIABILITY = {
+    "mvcrisis":   100,  # #1 Maldives breaking source
+    "mihaaru":     95,
+    "sun":         92,
+    "sunonline":   92,
+    "psm":         90,
+    "psmnews":     90,
+    "presidency":  90,  # official gov source
+    "edition":     88,
+    "avas":        85,
+    "see":         82,
+    "maldivesindependent": 82,
+    "oneonline":   80,
+    "maldivesvoice": 78,
+    "visitmaldives": 75,
+    "google news": 55,  # aggregator — least trusted, often duplicates
+}
+DEFAULT_RELIABILITY = 60
+
+def source_reliability(source_name):
+    """Return a 0-100 reliability score for a source string."""
+    if not source_name:
+        return DEFAULT_RELIABILITY
+    s = source_name.lower()
+    for key, val in SOURCE_RELIABILITY.items():
+        if key in s:
+            return val
+    return DEFAULT_RELIABILITY
+
 # Analytics counters (reset weekly)
 analytics = {"posts_by_cat": {}, "breaking_count": 0, "social_success": 0, "social_fail": 0, "week_start": None}
 
@@ -485,6 +517,24 @@ def fetch_mvcrisis():
         log.error(f"MvCrisis fetch: {e}")
         return []
 
+def _feed_source_name(url):
+    """Map a feed URL to a clean source name for reliability scoring + display."""
+    u = url.lower()
+    if "news.google.com" in u: return "Google News"
+    if "mihaaru" in u:         return "Mihaaru"
+    if "sunonline" in u:       return "SunOnline"
+    if "sun.mv" in u:          return "Sun"
+    if "psmnews" in u:         return "PSM News"
+    if "presidency" in u:      return "Presidency"
+    if "edition" in u:         return "Edition"
+    if "avas" in u:            return "Avas"
+    if "see.mv" in u:          return "See"
+    if "maldivesindependent" in u: return "Maldives Independent"
+    if "oneonline" in u:       return "One Online"
+    if "maldivesvoice" in u:   return "Maldives Voice"
+    if "visitmaldives" in u:   return "Visit Maldives"
+    return ""
+
 def fetch_news():
     articles, seen_titles = [], set()
     # MvCrisis first — #1 Maldives breaking news source
@@ -504,12 +554,16 @@ def fetch_news():
                 key = title.lower()[:50]
                 if key in seen_titles or not is_fresh(entry): continue
                 seen_titles.add(key)
+                # Derive a clean source name: prefer RSS entry source, else feed domain
+                entry_src = entry.get("source",{}).get("title", "") if isinstance(entry.get("source"), dict) else ""
+                feed_src = _feed_source_name(fc["url"])
+                src_name = entry_src or feed_src or fc["cat"]
                 articles.append({
                     "id": hashlib.md5(entry.get("link",title).encode()).hexdigest(),
                     "title": title, "summary": summary,
                     "link": entry.get("link",""), "cat": fc["cat"],
                     "lang": fc["lang"],
-                    "source": entry.get("source",{}).get("title", fc["cat"]),
+                    "source": src_name,
                 })
         except Exception as e: log.error(f"Feed error: {e}")
     log.info(f"Found {len(articles)} fresh articles")
@@ -1342,6 +1396,9 @@ def score_article(a):
             score -= 20
     # Breaking boost
     if is_breaking(a["title"], a.get("summary",""), cat): score += 80
+    # Source reliability — trusted sources rank higher (0-25 boost)
+    rel = source_reliability(a.get("source",""))
+    score += int((rel - 50) / 2)  # 100→+25, 55→+2, 60→+5
     return score
 
 def run_job(social_only=False, breaking_only=False):
