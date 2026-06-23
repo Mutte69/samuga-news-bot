@@ -64,7 +64,7 @@ LIFESTYLE_FEEDS = [
     {"url": "https://visitmaldives.com/feed",                                                                   "cat": "TOURISM", "lang": "en"},  # NEW: Visit Maldives official
     {"url": "https://news.google.com/rss/search?q=maldives+tourism+travel+resort&hl=en-MV&gl=MV&ceid=MV:en", "cat": "TOURISM", "lang": "en"},
     {"url": "https://news.google.com/rss/search?q=maldives+weather+storm&hl=en-MV&gl=MV&ceid=MV:en",         "cat": "WEATHER", "lang": "en"},
-    {"url": "https://rss.accuweather.com/rss/liveweather_rss.asp?metric=1&locCode=MV",                        "cat": "WEATHER", "lang": "en"},  # NEW: AccuWeather Maldives
+    # AccuWeather RSS removed — weather handled by 8AM/8PM weather cards instead
 ]
 
 RSS_FEEDS = LOCAL_FEEDS + SPORTS_FEEDS + WORLD_FEEDS + LIFESTYLE_FEEDS
@@ -82,25 +82,55 @@ CAT_CONFIG = {
 # ── Core Team Session Context (in-memory only, clears on restart) ────────────
 core_team_session_context = {}  # user_id -> stored context
 
-# ── Dhivehi Approval Queue (in-memory) ───────────────────────────────────────
-dhivehi_pending = {}  # key -> {card_buf, caption, article_title, link}
-dhivehi_pending_counter = [0]
+# ── Universal Approval Queue (in-memory) ─────────────────────────────────────
+# Every card (English + Dhivehi) waits here for Content Lab approval before posting.
+# Cards expire after 2 hours if not approved.
+APPROVAL_EXPIRY_SECONDS = 7200  # 2 hours
 
-def store_pending_dhivehi(card_buf, dv_text, title, link, keyword="maldives news", source="LOCAL", cat="LOCAL"):
-    dhivehi_pending_counter[0] += 1
-    key = f"dv{dhivehi_pending_counter[0]}"
-    dhivehi_pending[key] = {
-        "dv_text": dv_text,
+approval_queue = {}  # key -> {card_bytes, caption, title, link, cat, lang, dv_text, created_at, ...}
+_approval_counter = [0]
+
+def store_pending_approval(card_bytes, caption, title, link, cat="LOCAL", lang="en",
+                           dv_text=None, keyword="maldives news", source="LOCAL",
+                           is_breaking=False, allow_social=True):
+    """Store a fully-built card awaiting approval. Returns the key."""
+    _approval_counter[0] += 1
+    prefix = "dv" if lang == "dv" else "en"
+    key = f"{prefix}{_approval_counter[0]}"
+    approval_queue[key] = {
+        "card_bytes": card_bytes,   # PNG bytes of the finished card (None for dv until approved)
+        "caption": caption,          # full telegram caption
         "title": title,
         "link": link,
+        "cat": cat,
+        "lang": lang,
+        "dv_text": dv_text,          # Dhivehi text (for dv cards, editable)
         "keyword": keyword,
         "source": source,
-        "cat": cat,
+        "is_breaking": is_breaking,
+        "allow_social": allow_social,
+        "created_at": datetime.utcnow(),
     }
-    if len(dhivehi_pending) > 20:
-        oldest = list(dhivehi_pending.keys())[0]
-        del dhivehi_pending[oldest]
+    # Cap queue size
+    if len(approval_queue) > 40:
+        oldest = list(approval_queue.keys())[0]
+        del approval_queue[oldest]
     return key
+
+def expire_old_approvals():
+    """Remove approval cards older than 2 hours. Runs on a scheduler."""
+    now = datetime.utcnow()
+    expired = [k for k, v in approval_queue.items()
+               if (now - v["created_at"]).total_seconds() > APPROVAL_EXPIRY_SECONDS]
+    for k in expired:
+        title = approval_queue[k].get("title", "")[:40]
+        del approval_queue[k]
+        log.info(f"⏰ Approval {k} expired (2h, not approved): {title}")
+    if expired:
+        log.info(f"⏰ Expired {len(expired)} unapproved cards")
+
+# Backwards-compat alias (old code references dhivehi_pending)
+dhivehi_pending = approval_queue
 
 # ── Core Team Config ──────────────────────────────────────────────────────────
 CORE_TEAM_CHAT_ID = "-1002829230299"
@@ -1031,91 +1061,146 @@ def post_to_social(img_buf, caption):
         log.error(f"Social: {e}")
 
 # ── Post Article ──────────────────────────────────────────────────────────────
-def post_article(article, seen, social_only=False, allow_social=True):
-    global last_regular_post_time
-    cat=article["cat"]
-    breaking=is_breaking(article["title"],article["summary"],cat)
-
-    rewritten, keyword = rewrite_news(article["title"],article["summary"],cat)
+def _build_card_and_caption(article):
+    """Build the card image + caption for an article. Returns (card_bytes, caption, rewritten, keyword)."""
+    cat = article["cat"]
+    breaking = is_breaking(article["title"], article["summary"], cat)
+    rewritten, keyword = rewrite_news(article["title"], article["summary"], cat)
     bg = fetch_background_image(keyword)
     ts = (datetime.utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
     card = generate_card(rewritten, article["source"], ts, cat, bg)
+    card_bytes = card.getvalue()
 
-    cat_emoji={"LOCAL":"🇲🇻","FOOTBALL":"⚽","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(cat,"📰")
-    breaking_tag="🚨 <b>BREAKING NEWS</b>\n\n" if breaking else ""
-
+    cat_emoji = {"LOCAL":"🇲🇻","FOOTBALL":"⚽","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(cat,"📰")
+    breaking_tag = "🚨 <b>BREAKING NEWS</b>\n\n" if breaking else ""
     caption = (f"{breaking_tag}{cat_emoji} <b>{article['title']}</b>\n\n"
                f"{rewritten}\n\n"
                f"🔗 <a href='{article['link']}'>Read more</a>\n\n"
                f"📡 <b>Samuga Media</b> | @samugacommunity")
+    return card_bytes, caption, rewritten, keyword
 
-    # Dhivehi workflow — for dv sources, generate Dhivehi TEXT and send to core team for review
-    # NO card created yet — card only made after team approves
-    is_dv_source = article.get("lang") == "dv"
-    if is_dv_source and CORE_TEAM_CHAT_ID:
-        try:
-            dv_text = make_dhivehi_caption(rewritten, article["title"])
-            if dv_text:
-                key = store_pending_dhivehi(None, dv_text, article["title"], article["link"], keyword=keyword, source=article.get("source","LOCAL"), cat=cat)
-                approval_msg = (
-                    "🇲🇻 <b>Dhivehi Writing — Review Needed</b>\n\n"
-                    f"<b>Article:</b> {article['title']}\n\n"
-                    "<b>Bot wrote:</b>\n"
-                    f"{dv_text}\n\n"
-                    f"<b>Key:</b> <code>{key}</code>\n\n"
-                    f"✅ Approve: <code>/approved {key}</code>\n"
-                    f"✏️ Edit & post: <code>/approved {key} [corrected dhivehi text]</code>\n"
-                    f"❌ Reject: <code>/reject {key}</code>"
-                )
-                send_text(CORE_TEAM_CHAT_ID, approval_msg, thread_id=CONTENT_LAB_THREAD_ID)
-                log.info(f"📨 Dhivehi approval sent to Content Lab: {key}")
-        except Exception as e:
-            log.error(f"Dhivehi workflow: {e}")
 
-    social_caption = caption
+def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_social, rewritten="", summary=""):
+    """Actually post a finished card to Telegram + (optionally) social. Returns True on Telegram success."""
+    global last_regular_post_time
+    buf = io.BytesIO(card_bytes)
+    ts = (datetime.utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
 
-    # Social only (night mode) — always post to socials, skip Telegram
-    if social_only:
-        if allow_social:
-            card.seek(0)
-            threading.Thread(target=post_to_social, args=(card, social_caption), daemon=True).start()
-        seen.add(article["id"]); save_seen(seen); remember_post(article["title"], cat, ts)
-        log.info(f"📱 Social only [{cat}]"); return True
-
-    # Throttle check — run_job already guards this before calling post_article,
-    # but as a safety net: if somehow called while throttled, just skip entirely.
-    if not breaking and not can_post_regular():
-        log.info(f"⛔ post_article: throttle guard hit for [{cat}] — skipping (no social either)")
-        return False
-
-    # Day mode — post to Telegram + socials
-    log.info(f"📰 [{'🔴BREAKING' if breaking else '🟡REGULAR'}][{cat}] {article['title'][:60]}...")
-    if send_to_telegram(card, caption):
-        seen.add(article["id"]); save_seen(seen); remember_post(article["title"], cat, ts)
-        if not breaking:
+    log.info(f"📰 [{'🔴BREAKING' if is_breaking_flag else '🟡REGULAR'}][{cat}] {title[:60]}...")
+    buf.seek(0)
+    if send_to_telegram(buf, caption):
+        remember_post(title, cat, ts)
+        if not is_breaking_flag:
             last_regular_post_time = datetime.utcnow()
             log.info("🕐 Regular timer reset — next Telegram post in 90min")
         else:
             log.info("🔴 Breaking posted!")
-        card.seek(0)
-        threading.Thread(target=post_to_social, args=(card, social_caption), daemon=True).start()
-
-        # Auto poll for political/government news
-        if should_create_poll(article["title"], article["summary"], cat):
+        # Social
+        if allow_social:
+            social_buf = io.BytesIO(card_bytes)
+            threading.Thread(target=post_to_social, args=(social_buf, caption), daemon=True).start()
+        # Poll for political news
+        if should_create_poll(title, summary, cat):
             log.info("🗳️ Generating poll...")
-            question, options = generate_poll_question(article["title"], rewritten)
+            question, options = generate_poll_question(title, rewritten or title)
             if question and options:
                 time.sleep(3)
                 send_poll(question, options)
                 increment_poll_count()
-
         return True
-    # Telegram failed — still post to socials
-    log.warning(f"Telegram failed for [{cat}] — posting to socials anyway")
-    card.seek(0)
-    threading.Thread(target=post_to_social, args=(card, social_caption), daemon=True).start()
-    seen.add(article["id"]); save_seen(seen)
+    log.warning(f"Telegram failed for [{cat}]")
+    if allow_social:
+        social_buf = io.BytesIO(card_bytes)
+        threading.Thread(target=post_to_social, args=(social_buf, caption), daemon=True).start()
     return False
+
+
+def _send_approval_card(key, item):
+    """Send a card preview to Content Lab with approve/reject buttons."""
+    cat = item["cat"]
+    lang_tag = "🇲🇻 Dhivehi" if item["lang"] == "dv" else "🇬🇧 English"
+    brk = "🚨 BREAKING " if item["is_breaking"] else ""
+    header = (
+        f"{brk}<b>{lang_tag} Card — Review Needed</b>\n\n"
+        f"<b>Article:</b> {item['title']}\n\n"
+    )
+    if item["lang"] == "dv" and item.get("dv_text"):
+        header += f"<b>Bot wrote:</b>\n{item['dv_text']}\n\n"
+    footer = (
+        f"<b>Key:</b> <code>{key}</code>\n\n"
+        f"✅ Approve: <code>/approved {key}</code>\n"
+    )
+    if item["lang"] == "dv":
+        footer += f"✏️ Edit & post: <code>/approved {key} [corrected dhivehi text]</code>\n"
+    footer += f"❌ Reject: <code>/reject {key}</code>"
+    msg = header + footer
+
+    # If we have a finished card image, send it as a photo with the caption
+    if item.get("card_bytes"):
+        buf = io.BytesIO(item["card_bytes"])
+        send_photo(CORE_TEAM_CHAT_ID, buf, msg, thread_id=CONTENT_LAB_THREAD_ID)
+    else:
+        send_text(CORE_TEAM_CHAT_ID, msg, thread_id=CONTENT_LAB_THREAD_ID)
+    log.info(f"📨 Approval card sent to Content Lab: {key} ({item['lang']})")
+
+
+def post_article(article, seen, social_only=False, allow_social=True):
+    """
+    New v5 flow:
+      - English BREAKING → publish instantly (1 at a time, no approval)
+      - Everything else (English regular + ALL Dhivehi) → queue for Content Lab approval
+    Marks article as seen immediately so it isn't re-queued every scan.
+    """
+    cat = article["cat"]
+    breaking = is_breaking(article["title"], article["summary"], cat)
+    is_dv = article.get("lang") == "dv"
+
+    # Mark seen now so the same article isn't re-processed on the next scan
+    seen.add(article["id"]); save_seen(seen)
+
+    # ── English BREAKING: publish instantly, no approval ──
+    if breaking and not is_dv:
+        card_bytes, caption, rewritten, keyword = _build_card_and_caption(article)
+        return _publish_now(card_bytes, caption, cat, article["title"], article["link"],
+                            is_breaking_flag=True, allow_social=allow_social,
+                            rewritten=rewritten, summary=article.get("summary",""))
+
+    # ── Dhivehi cards: generate Dhivehi text, queue for approval (card built on approval) ──
+    if is_dv:
+        try:
+            rewritten, keyword = rewrite_news(article["title"], article["summary"], cat)
+            dv_text = make_dhivehi_caption(rewritten, article["title"])
+            if not dv_text:
+                log.warning(f"Dhivehi caption failed for: {article['title'][:50]}")
+                return False
+            key = store_pending_approval(
+                None, None, article["title"], article["link"], cat=cat, lang="dv",
+                dv_text=dv_text, keyword=keyword, source=article.get("source","LOCAL"),
+                is_breaking=breaking, allow_social=allow_social
+            )
+            _send_approval_card(key, approval_queue[key])
+            return True
+        except Exception as e:
+            log.error(f"Dhivehi approval queue: {e}")
+            return False
+
+    # ── English regular: build card, queue for approval ──
+    try:
+        card_bytes, caption, rewritten, keyword = _build_card_and_caption(article)
+        key = store_pending_approval(
+            card_bytes, caption, article["title"], article["link"], cat=cat, lang="en",
+            dv_text=None, keyword=keyword, source=article.get("source","LOCAL"),
+            is_breaking=breaking, allow_social=allow_social
+        )
+        # Stash rewritten + summary for poll generation on approval
+        approval_queue[key]["rewritten"] = rewritten
+        approval_queue[key]["summary"] = article.get("summary","")
+        _send_approval_card(key, approval_queue[key])
+        return True
+    except Exception as e:
+        log.error(f"English approval queue: {e}")
+        return False
+
 
 # ── Run Job ───────────────────────────────────────────────────────────────────
 def score_article(a):
@@ -1972,48 +2057,69 @@ def handle_updates():
                         sender_info = get_sender_info(display_name, first_name)
                         history = get_conversation(user_id)
 
-                        # /approved dv1 [optional corrected dhivehi text]
+                        # /approved <key> [optional corrected dhivehi text]
                         if text.strip().lower().startswith("/approved "):
                             parts = text.strip()[10:].strip().split(" ", 1)
                             key = parts[0].strip()
                             corrected = parts[1].strip() if len(parts) > 1 else None
-                            if key in dhivehi_pending:
-                                pending = dhivehi_pending.pop(key)
-                                final_dv_text = corrected if corrected else pending["dv_text"]
+                            if key in approval_queue:
+                                item = approval_queue.pop(key)
                                 action = "edited" if corrected else "approved"
                                 try:
-                                    send_text(chat_id, f"Got it {first_name} 🙌 Your {action} card is being posted...", reply_to=msg_id, thread_id=thread_id)
-                                    kw = pending.get("keyword", pending["cat"].lower())
-                                    bg = fetch_background_image(kw)
-                                    ts_now = (datetime.utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
-                                    card = generate_card(final_dv_text, pending["source"], ts_now, pending["cat"], bg)
-                                    full_caption = (
-                                        f"🇲🇻 <b>{pending['title']}</b>\n\n"
-                                        f"{final_dv_text}\n\n"
-                                        f"🔗 <a href='{pending['link']}'>ތަފްސީލް ކިޔާ</a>\n\n"
-                                        f"📡 <b>ސަމޫގާ މީޑިއާ</b> | @samugacommunity"
-                                    )
-                                    if send_to_telegram(card, full_caption):
-                                        send_text(chat_id, f"✅ Posted to community!", reply_to=msg_id, thread_id=thread_id)
-                                        log.info(f"✅ Dhivehi card {key} posted by {first_name}")
+                                    send_text(chat_id, f"Got it {first_name} 🙌 Your {action} card is being posted... ⏳", reply_to=msg_id, thread_id=thread_id)
+
+                                    if item["lang"] == "dv":
+                                        # Build Dhivehi card now (with optional correction)
+                                        final_dv = corrected if corrected else item["dv_text"]
+                                        kw = item.get("keyword", item["cat"].lower())
+                                        bg = fetch_background_image(kw)
+                                        ts_now = (datetime.utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+                                        card = generate_card(final_dv, item["source"], ts_now, item["cat"], bg)
+                                        full_caption = (
+                                            f"🇲🇻 <b>{item['title']}</b>\n\n"
+                                            f"{final_dv}\n\n"
+                                            f"🔗 <a href='{item['link']}'>ތަފްސީލް ކިޔާ</a>\n\n"
+                                            f"📡 <b>ސަމޫގާ މީޑިއާ</b> | @samugacommunity"
+                                        )
+                                        card.seek(0)
+                                        ok = send_to_telegram(card, full_caption)
+                                        if ok:
+                                            remember_post(item["title"], item["cat"], ts_now)
+                                            if item.get("allow_social"):
+                                                card.seek(0)
+                                                threading.Thread(target=post_to_social, args=(io.BytesIO(card.getvalue()), full_caption), daemon=True).start()
                                     else:
-                                        send_text(chat_id, f"❌ Telegram post failed.", reply_to=msg_id, thread_id=thread_id)
+                                        # English card already built — just publish
+                                        ok = _publish_now(
+                                            item["card_bytes"], item["caption"], item["cat"],
+                                            item["title"], item["link"],
+                                            is_breaking_flag=item.get("is_breaking", False),
+                                            allow_social=item.get("allow_social", True),
+                                            rewritten=item.get("rewritten",""),
+                                            summary=item.get("summary","")
+                                        )
+
+                                    if ok:
+                                        send_text(chat_id, "✅ Posted to community!", reply_to=msg_id, thread_id=thread_id)
+                                        log.info(f"✅ {key} ({item['lang']}) posted by {first_name}")
+                                    else:
+                                        send_text(chat_id, "❌ Telegram post failed.", reply_to=msg_id, thread_id=thread_id)
                                 except Exception as e:
-                                    log.error(f"Dhivehi card post error: {e}")
+                                    log.error(f"Approval post error: {e}")
                                     send_text(chat_id, f"❌ Error: {e}", reply_to=msg_id, thread_id=thread_id)
                             else:
-                                send_text(chat_id, f"Key `{key}` not found or already posted.", reply_to=msg_id, thread_id=thread_id)
+                                send_text(chat_id, f"Key <code>{key}</code> not found — maybe expired (2h), already posted, or rejected.", reply_to=msg_id, thread_id=thread_id)
 
-                        # /reject dv1
+                        # /reject <key>
                         elif text.strip().lower().startswith("/reject "):
                             key = text.strip()[8:].strip()
-                            if key in dhivehi_pending:
-                                del dhivehi_pending[key]
+                            if key in approval_queue:
+                                del approval_queue[key]
                                 import random as _r
                                 send_text(chat_id, _r.choice(REJECT_RESPONSES), reply_to=msg_id, thread_id=thread_id)
                                 log.info(f"🗑️ {key} rejected by {first_name}")
                             else:
-                                send_text(chat_id, f"Key `{key}` not found — maybe already posted or rejected.", reply_to=msg_id, thread_id=thread_id)
+                                send_text(chat_id, f"Key <code>{key}</code> not found — maybe already posted or rejected.", reply_to=msg_id, thread_id=thread_id)
 
                         # @SamugaNewsBot card [dhivehi text] — manual card creation
                         elif tagged and (
@@ -2202,6 +2308,8 @@ if __name__ == "__main__":
     scheduler.add_job(scheduled_check, "interval", minutes=15)
     # Breaking news fast check every 5 min (LOCAL/DISASTER only)
     scheduler.add_job(breaking_news_check, "interval", minutes=5)
+    # Expire unapproved cards older than 2 hours — check every 15 min
+    scheduler.add_job(expire_old_approvals, "interval", minutes=15)
     # Morning brief 7AM MVT = 2AM UTC
     scheduler.add_job(send_morning_brief, "cron", hour=1, minute=0)  # 6AM MVT
     # Night summary 12AM MVT = 7PM UTC
