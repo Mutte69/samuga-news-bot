@@ -104,6 +104,7 @@ def store_pending_dhivehi(card_buf, dv_text, title, link, keyword="maldives news
 
 # ── Core Team Config ──────────────────────────────────────────────────────────
 CORE_TEAM_CHAT_ID = "-1002829230299"
+CONTENT_LAB_THREAD_ID = 9061  # "Content Lab" topic — Dhivehi approvals + manual card creation
 
 CORE_TEAM_MEMBERS = {
     "manchii": {"name": "Manchii", "full": "Abdul Muhsin", "role": "Founder & MD", "notes": "Big ideas, entrepreneur, boss, loves to push boundaries"},
@@ -748,14 +749,16 @@ def download_telegram_photo(photo_list):
         log.error(f"Photo download: {e}")
         return None
 
-def send_photo(chat_id, buf, caption):
-    """Send a photo to any Telegram chat/channel"""
+def send_photo(chat_id, buf, caption, thread_id=None):
+    """Send a photo to any Telegram chat/channel, optionally to a topic thread"""
     try:
         buf.seek(0)
+        data = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
+        if thread_id: data["message_thread_id"] = thread_id
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-            data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
-            files={"photo": ("weather.png", buf, "image/png")},
+            data=data,
+            files={"photo": ("card.png", buf, "image/png")},
             timeout=30
         )
         resp.raise_for_status()
@@ -1052,8 +1055,8 @@ def post_article(article, seen, social_only=False, allow_social=True):
                     f"✏️ Correct: <code>@SamugaNewsBot post {key} ތިޔަ ތަން ރަނގަޅު ކޮށްފައި...</code>\n"
                     f"❌ Reject: <code>@SamugaNewsBot reject {key}</code>"
                 )
-                send_text(CORE_TEAM_CHAT_ID, approval_msg)
-                log.info(f"📨 Dhivehi text sent to core team for review: {key}")
+                send_text(CORE_TEAM_CHAT_ID, approval_msg, thread_id=CONTENT_LAB_THREAD_ID)
+                log.info(f"📨 Dhivehi approval sent to Content Lab: {key}")
         except Exception as e:
             log.error(f"Dhivehi workflow: {e}")
 
@@ -2091,8 +2094,8 @@ def handle_updates():
 
                                     if destination == "coreteam":
                                         card.seek(0)
-                                        if send_photo(CORE_TEAM_CHAT_ID, card, full_caption):
-                                            posted.append("Core Team")
+                                        if send_photo(CORE_TEAM_CHAT_ID, card, full_caption, thread_id=CONTENT_LAB_THREAD_ID):
+                                            posted.append("Content Lab")
 
                                     if destination == "all":
                                         card_bytes = card.getvalue()
