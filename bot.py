@@ -345,15 +345,20 @@ def generate_card(text, source, timestamp, cat, bg_image=None, morning=False):
 
     # Detect Thaana script and use Noto Sans Thaana font for Dhivehi
     has_thaana = any('\u0780' <= ch <= '\u07BF' for ch in text)
-    THAANA_BOLD = "/usr/share/fonts/truetype/noto/NotoSansThaana-Bold.ttf"
-    THAANA_REG  = "/usr/share/fonts/truetype/noto/NotoSansThaana-Regular.ttf"
+    # Look for font in: /app (repo), /data (volume), system
+    def find_thaana_font(name):
+        for path in [f"/app/{name}", f"/data/{name}", f"/usr/share/fonts/truetype/noto/{name}"]:
+            if os.path.exists(path): return path
+        return None
+    THAANA_BOLD = find_thaana_font("NotoSansThaana-Bold.ttf")
+    THAANA_REG  = find_thaana_font("NotoSansThaana-Regular.ttf")
     try:
-        if has_thaana and os.path.exists(THAANA_BOLD):
+        if has_thaana and THAANA_BOLD:
             f_tag  = ImageFont.truetype(THAANA_BOLD, 22)
             f_title= ImageFont.truetype(THAANA_BOLD, 46)
-            f_body = ImageFont.truetype(THAANA_REG, 27)
+            f_body = ImageFont.truetype(THAANA_REG or THAANA_BOLD, 27)
             f_sm   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 21)
-            log.info("🇲🇻 Noto Sans Thaana font loaded for Dhivehi card")
+            log.info(f"🇲🇻 Thaana font loaded: {THAANA_BOLD}")
         else:
             f_tag  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
             f_title= ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 46)
@@ -1708,14 +1713,16 @@ def handle_updates():
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("🚀 Samuga News Bot v3.2 starting...")
-    # Install Noto Sans Thaana system font if not present
-    if not os.path.exists("/usr/share/fonts/truetype/noto/NotoSansThaana-Bold.ttf"):
+    # Install Noto fonts for Thaana/Dhivehi support
+    if not os.path.exists("/usr/share/fonts/truetype/noto/NotoSansThaana-Bold.ttf") and not os.path.exists("/app/NotoSansThaana-Bold.ttf"):
         try:
             import subprocess
-            subprocess.run(["apt-get", "install", "-y", "fonts-noto"], capture_output=True)
-            log.info("✅ Noto fonts installed")
+            subprocess.run(["apt-get", "install", "-y", "fonts-noto"], capture_output=True, timeout=60)
+            log.info("✅ Noto fonts installed via apt")
         except Exception as e:
             log.warning(f"Noto font install failed: {e}")
+    else:
+        log.info("✅ Thaana fonts available")
     log.info("📅 7AM-6PM: every 30min | Night: social only")
     log.info("🌅 7AM Brief | 🌙 12AM Summary | 🌤️ 8AM/8PM Weather | 📊 Friday Digest")
     log.info("💬 Smart chat with history, Tavily search, Dhivehi support")
