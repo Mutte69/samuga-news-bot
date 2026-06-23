@@ -316,7 +316,7 @@ def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
         import cairo
     except Exception as e:
         log.error(f"Pango not available: {e}")
-        return generate_card(text, source, timestamp, cat, bg_image)
+        return generate_card(text, source, timestamp, cat, bg_image, _skip_dhivehi=True)
 
     import numpy as np
 
@@ -446,9 +446,9 @@ def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
     png_buf.seek(0)
     return png_buf
 
-def generate_card(text, source, timestamp, cat, bg_image=None, morning=False):
+def generate_card(text, source, timestamp, cat, bg_image=None, morning=False, _skip_dhivehi=False):
     # Route Dhivehi text to Pango-based card generator
-    if not morning and any('\u0780' <= ch <= '\u07BF' for ch in text):
+    if not morning and not _skip_dhivehi and any('\u0780' <= ch <= '\u07BF' for ch in text):
         return generate_dhivehi_card(text, source, timestamp, cat, bg_image)
 
     W, H = 1080, 1080
