@@ -188,7 +188,7 @@ def add_to_conversation(uid, role, content):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_mvt_hour(): return (datetime.utcnow().hour + 5) % 24
-def is_day_mode(): return 7 <= get_mvt_hour() < 18
+def is_day_mode(): return 6 <= get_mvt_hour() < 22
 
 def is_fresh(entry, hours=24):
     try:
@@ -224,7 +224,7 @@ last_regular_post_time = None
 def can_post_regular():
     global last_regular_post_time
     if not last_regular_post_time: return True
-    return (datetime.utcnow()-last_regular_post_time).total_seconds() >= 7200
+    return (datetime.utcnow()-last_regular_post_time).total_seconds() >= 5400  # 1hr 30min
 
 # ── Social post daily counter (MVT based) ─────────────────────────────────────
 social_post_counts = {"date": None, "count": 0}
@@ -758,9 +758,28 @@ POLL_KEYWORDS = [
     "protest","rally","strike","ban","approve","reject","pass","failed"
 ]
 
+# Poll daily counter (max 3/day MVT)
+polls_today = {"date": None, "count": 0}
+
+def can_post_poll():
+    global polls_today
+    today = (datetime.utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+    if polls_today["date"] != today:
+        polls_today = {"date": today, "count": 0}
+    return polls_today["count"] < 3
+
+def increment_poll_count():
+    global polls_today
+    today = (datetime.utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+    if polls_today["date"] != today:
+        polls_today = {"date": today, "count": 0}
+    polls_today["count"] += 1
+    log.info(f"🗳️ Polls today: {polls_today['count']}/3")
+
 def should_create_poll(title, summary, cat):
-    """Check if news warrants a poll"""
+    """Check if news warrants a poll (max 3/day)"""
     if cat not in ["LOCAL", "WORLD"]: return False
+    if not can_post_poll(): return False
     text = (title + " " + summary).lower()
     return any(kw in text for kw in POLL_KEYWORDS)
 
@@ -1004,7 +1023,7 @@ def post_article(article, seen, social_only=False, allow_social=True):
 
     # Telegram throttle for regular posts — still post to socials every 30min
     if not breaking and not can_post_regular():
-        mins = int((7200 - (datetime.utcnow() - last_regular_post_time).total_seconds()) / 60)
+        mins = int((5400 - (datetime.utcnow() - last_regular_post_time).total_seconds()) / 60)
         log.info(f"⏳ [{cat}] Telegram throttled {mins}m — posting to socials only")
         card.seek(0)
         threading.Thread(target=post_to_social, args=(card, social_caption), daemon=True).start()
@@ -1030,6 +1049,7 @@ def post_article(article, seen, social_only=False, allow_social=True):
             if question and options:
                 time.sleep(3)
                 send_poll(question, options)
+                increment_poll_count()
 
         return True
     # Telegram failed — still post to socials
@@ -1125,14 +1145,59 @@ def run_job(social_only=False, breaking_only=False):
 
     log.info(f"✅ Posted {posted} articles ({social_posted} to socials).")
 
+# Sources scanned in the fast breaking-news check (5 min cycle)
+BREAKING_SOURCES = [
+    {"url": "https://sunonline.mv/feed",              "cat": "LOCAL", "lang": "dv"},
+    {"url": "https://psmnews.mv/en/feed",             "cat": "LOCAL", "lang": "en"},
+    {"url": "https://visitmaldives.com/feed",         "cat": "TOURISM","lang": "en"},
+    {"url": "https://maldivesvoice.com/feed",         "cat": "LOCAL", "lang": "en"},
+    {"url": "https://english.sun.mv/feed",            "cat": "LOCAL", "lang": "en"},
+    {"url": "https://edition.mv/feed",                "cat": "LOCAL", "lang": "en"},
+    {"url": "https://mihaaru.com/rss",                "cat": "LOCAL", "lang": "dv"},
+    {"url": "https://avas.mv/feed",                   "cat": "LOCAL", "lang": "dv"},
+]
+
+def fetch_breaking_sources():
+    """Fetch only the priority breaking-news sources (used by 5-min fast check)."""
+    articles, seen_titles = [], set()
+    # MvCrisis always first
+    for a in fetch_mvcrisis():
+        if a["title"] not in seen_titles:
+            seen_titles.add(a["title"])
+            articles.append(a)
+    for fc in BREAKING_SOURCES:
+        try:
+            feed = feedparser.parse(fc["url"])
+            for entry in feed.entries[:5]:
+                title   = entry.get("title", "")
+                summary = entry.get("summary", title)
+                if fc["lang"] == "dv":
+                    title   = gemini_translate(title)
+                    summary = gemini_translate(summary[:300])
+                key = title.lower()[:50]
+                if key in seen_titles or not is_fresh(entry): continue
+                seen_titles.add(key)
+                articles.append({
+                    "id":      hashlib.md5(entry.get("link", title).encode()).hexdigest(),
+                    "title":   title,
+                    "summary": summary,
+                    "link":    entry.get("link", ""),
+                    "cat":     fc["cat"],
+                    "lang":    fc["lang"],
+                    "source":  entry.get("source", {}).get("title", fc["cat"]),
+                })
+        except Exception as e:
+            log.error(f"Breaking source feed error ({fc['url']}): {e}")
+    return articles
+
 def breaking_news_check():
-    """Fast check every 5 min — Maldives breaking news only, no throttle"""
+    """Fast check every 5 min — priority sources only, no Telegram throttle"""
     try:
         seen = load_seen()
-        articles = fetch_news()
+        articles = fetch_breaking_sources()
         for a in articles:
             if a["id"] in seen: continue
-            if a["cat"] not in ["LOCAL", "DISASTER"]: continue
+            if a["cat"] not in ["LOCAL", "DISASTER", "TOURISM"]: continue
             if not is_breaking(a["title"], a.get("summary",""), a["cat"]): continue
             # Score for Maldives relevance
             if score_article(a) < 60: continue
@@ -1172,6 +1237,18 @@ Headlines: {chr(10).join(headlines[:8])}
         send_text(TELEGRAM_CHANNEL_ID, caption)
         log.info("✅ Morning brief sent!")
     except Exception as e: log.error(f"Morning brief: {e}")
+
+# ── Tip/Story CTA ────────────────────────────────────────────────────────────
+def send_tip_cta():
+    """Send story tip CTA to Telegram channel (8:30AM and 8:30PM MVT)"""
+    msg = (
+        "🚨 <b>Have a story, tip, or news update?</b>\n\n"
+        "Share it with Samuga Media privately and anonymously.\n"
+        "🔒 Your identity stays confidential. 📩 Message us: @Samuga_Media\n\n"
+        "Your voice matters. The people's media starts with you. 💙"
+    )
+    send_text(TELEGRAM_CHANNEL_ID, msg)
+    log.info("📣 Tip CTA sent")
 
 # ── Weather Card ──────────────────────────────────────────────────────────────
 def get_weather_data():
@@ -2030,9 +2107,9 @@ if __name__ == "__main__":
     # Breaking news fast check every 5 min (LOCAL/DISASTER only)
     scheduler.add_job(breaking_news_check, "interval", minutes=5)
     # Morning brief 7AM MVT = 2AM UTC
-    scheduler.add_job(send_morning_brief, "cron", hour=2, minute=0)
+    scheduler.add_job(send_morning_brief, "cron", hour=1, minute=0)  # 6AM MVT
     # Night summary 12AM MVT = 7PM UTC
-    scheduler.add_job(send_night_summary, "cron", hour=19, minute=0)
+    scheduler.add_job(send_night_summary, "cron", hour=18, minute=0)  # 11PM MVT
     # Weekly digest Friday 6PM MVT = 1PM UTC Friday
     scheduler.add_job(send_weekly_digest, "cron", day_of_week="fri", hour=13, minute=0)
     # Weekly analytics report Friday 6:30PM MVT = 1:30PM UTC Friday
@@ -2041,6 +2118,10 @@ if __name__ == "__main__":
     scheduler.add_job(lambda: send_weather_update("morning"), "cron", hour=3, minute=0)
     # Weather update 8PM MVT = 3PM UTC
     scheduler.add_job(lambda: send_weather_update("evening"), "cron", hour=15, minute=0)
+    # Tip/story CTA 8:30AM MVT = 3:30AM UTC
+    scheduler.add_job(send_tip_cta, "cron", hour=3, minute=30)  # 8:30AM MVT
+    # Tip/story CTA 8:30PM MVT = 3:30PM UTC
+    scheduler.add_job(send_tip_cta, "cron", hour=15, minute=30)  # 8:30PM MVT
 
     log.info("⏰ Scheduler started!")
     scheduler.start()
