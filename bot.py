@@ -1579,6 +1579,8 @@ def handle_updates():
                             "create card and post to core team" in clean.lower() or
                             "create card and post to community" in clean.lower()
                         ):
+                            log.info(f"🃏 Manual card — raw text: {repr(text[:200])}")
+                            log.info(f"🃏 Manual card — photo: {bool(photo)}")
                             cl = clean.lower()
                             if "core team" in cl or "coreteam" in cl:
                                 destination = "coreteam"
