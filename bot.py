@@ -124,7 +124,7 @@ core_team_session_context = {}  # user_id -> stored context
 # ── Universal Approval Queue (in-memory) ─────────────────────────────────────
 # Every card (English + Dhivehi) waits here for Content Lab approval before posting.
 # Cards expire after 2 hours if not approved.
-ENGLISH_AUTOPOST_SECONDS = 1800   # English: auto-post after 30 min if not approved
+ENGLISH_AUTOPOST_SECONDS = 900    # English: auto-post after 15 min if not approved
 DHIVEHI_EXPIRY_SECONDS   = 7200   # Dhivehi: expire (delete) after 2h if not approved
 
 approval_queue = {}  # key -> {card_bytes, caption, title, link, cat, lang, dv_text, created_at, ...}
@@ -161,18 +161,18 @@ def store_pending_approval(card_bytes, caption, title, link, cat="LOCAL", lang="
 def expire_old_approvals():
     """
     Runs every few minutes:
-      - English cards not approved within 30 min → AUTO-POST to community + social
+      - English cards not approved within 15 min → AUTO-POST to community + social
       - Dhivehi cards not approved within 2 hours → DELETE (never auto-post unreviewed Dhivehi)
     """
     now = utcnow()
 
-    # English auto-post after 30 min
+    # English auto-post after 15 min
     en_due = [k for k, v in approval_queue.items()
               if v["lang"] == "en" and (now - v["created_at"]).total_seconds() > ENGLISH_AUTOPOST_SECONDS]
     for k in en_due:
         item = approval_queue.pop(k)
         title = item.get("title","")[:50]
-        log.info(f"⏰ English {k} not approved in 30min — auto-posting: {title}")
+        log.info(f"⏰ English {k} not approved in 15min — auto-posting: {title}")
         try:
             ok = _publish_now(
                 item["card_bytes"], item["caption"], item["cat"],
@@ -184,7 +184,7 @@ def expire_old_approvals():
             )
             if ok:
                 send_text(CORE_TEAM_CHAT_ID,
-                          f"⏰ <b>{k.upper()} Auto-posted</b> (no approval in 30min):\n📰 {item['title'][:80]}",
+                          f"⏰ <b>{k.upper()} Auto-posted</b> (no approval in 15min):\n📰 {item['title'][:80]}",
                           thread_id=CONTENT_LAB_THREAD_ID)
         except Exception as e:
             log.error(f"Auto-post {k} failed: {e}")
@@ -1794,7 +1794,7 @@ def _send_approval_card(key, item):
     footer += f"❌ <code>/reject {key}</code>\n\n"
     # Tell the team the auto-post / expiry behaviour
     if item["lang"] == "en":
-        footer += "<i>⏰ Auto-posts in 30 min if not reviewed</i>"
+        footer += "<i>⏰ Auto-posts in 15 min if not reviewed</i>"
     else:
         footer += "<i>⏰ Expires in 2h if not approved (Dhivehi never auto-posts)</i>"
     msg = header + footer
@@ -3202,7 +3202,7 @@ if __name__ == "__main__":
     scheduler.add_job(scheduled_check, "interval", minutes=15)
     # Breaking news fast check every 5 min (LOCAL/DISASTER only)
     scheduler.add_job(breaking_news_check, "interval", minutes=5)
-    # Approval lifecycle — English auto-posts at 30min, Dhivehi expires at 2h. Check every 5 min.
+    # Approval lifecycle — English auto-posts at 15min, Dhivehi expires at 2h. Check every 5 min.
     scheduler.add_job(expire_old_approvals, "interval", minutes=5)
     # Morning brief 7AM MVT = 2AM UTC
     scheduler.add_job(send_morning_brief, "cron", hour=1, minute=0)  # 6AM MVT
