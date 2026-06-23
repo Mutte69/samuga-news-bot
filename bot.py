@@ -53,6 +53,9 @@ CAT_CONFIG = {
     "TOURISM": {"label": "✈️  TOURISM",        "color": (160,80,220)},
 }
 
+# ── Core Team Session Context (in-memory only, clears on restart) ────────────
+core_team_session_context = {}  # user_id -> stored context
+
 # ── Core Team Config ──────────────────────────────────────────────────────────
 CORE_TEAM_CHAT_ID = "-1002829230299"
 
@@ -1225,7 +1228,7 @@ def should_respond_proactively(text):
     t = text.lower()
     return any(trigger in t for trigger in CORE_TEAM_PROACTIVE_TRIGGERS)
 
-def chat_with_coreteam(message, sender_name, sender_info=None, conversation_history=None):
+def chat_with_coreteam(message, sender_name, sender_info=None, conversation_history=None, session_ctx=""):
     """Smart core team chat — creative, funny, knows the team"""
     try:
         # Build sender context
@@ -1254,6 +1257,7 @@ def chat_with_coreteam(message, sender_name, sender_info=None, conversation_hist
             "- Kity (Kit) — Manchii wife, creative contributor, team heart, great at hyping Thooma, brings fresh ideas\n\n"
             f"YOU ARE SPEAKING WITH: {sender_ctx}\n\n"
             + (news_line + "\n\n" if news_line else "")
+            + (("SESSION CONTEXT (team shared this for reference):\n" + session_ctx + "\n\n") if session_ctx else "")
             + "YOUR PERSONALITY IN THIS GROUP:\n"
             "- Casual, warm, feel like a real team member not a bot\n"
             "- Funny and witty — crack jokes when vibe calls for it, especially with Manchii\n"
@@ -1348,24 +1352,34 @@ def handle_updates():
                         sender_info = get_sender_info(display_name, first_name)
                         history = get_conversation(user_id)
 
+                        # /read command — store context for this session
+                        if text.strip().lower().startswith("/read"):
+                            context_text = text.strip()[5:].strip()
+                            if context_text:
+                                core_team_session_context[chat_id] = context_text
+                                send_text(chat_id, "Got it! I have read that and will use it as context for this session 📖", reply_to=msg_id, thread_id=thread_id)
+                                log.info(f"📖 Session context stored: {context_text[:60]}...")
+                            else:
+                                send_text(chat_id, "Send it like this: /read [paste your content here]", reply_to=msg_id, thread_id=thread_id)
+
                         # Respond if tagged OR proactive trigger detected
-                        if tagged or should_respond_proactively(text):
+                        elif tagged or should_respond_proactively(text):
                             if not clean: clean = text.strip()
                             log.info(f"🧠 Core team {'[tagged]' if tagged else '[proactive]'} {display_name}: {clean[:50]}")
+                            session_ctx = core_team_session_context.get(chat_id, "")
 
                             if is_dhivehi(clean):
                                 headlines = get_local_headlines()
                                 ctx = "\n".join(headlines[:5]) if headlines else ""
                                 reply = chat_with_gemini_dhivehi(clean, ctx, history)
                                 if not reply:
-                                    reply = chat_with_coreteam(clean, user_name, sender_info, history)
+                                    reply = chat_with_coreteam(clean, display_name, sender_info, history, session_ctx)
                             else:
-                                reply = chat_with_coreteam(clean, user_name, sender_info, history)
+                                reply = chat_with_coreteam(clean, display_name, sender_info, history, session_ctx)
 
                             if reply:
                                 add_to_conversation(user_id, "user", clean)
                                 add_to_conversation(user_id, "assistant", reply)
-                                # Reply directly if tagged, send without reply if proactive
                                 send_text(chat_id, reply, reply_to=msg_id if tagged else None, thread_id=thread_id)
 
                     # Regular group — only respond when tagged
