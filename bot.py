@@ -422,11 +422,9 @@ def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
     headline = " ".join(hw)
     body = " ".join(bw)
 
-    import re as _re
-
-    def fix_numbers_rtl(t):
-        """Wrap numbers in LTR Unicode embedding marks for proper RTL rendering"""
-        return _re.sub(r"(\d+)", "\u202a\\1\u202c", t)
+    def to_arabic_nums(t):
+        """Convert Western digits to Arabic-Indic numerals for RTL Thaana rendering"""
+        return t.translate(str.maketrans("0123456789", "\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669"))
 
     h_lo = PangoCairo.create_layout(ctx)
     h_lo.set_width(980 * Pango.SCALE)
@@ -434,7 +432,7 @@ def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
     h_fd = Pango.FontDescription("Noto Sans Thaana 50")
     h_fd.set_weight(Pango.Weight.ULTRABOLD)
     h_lo.set_font_description(h_fd)
-    h_lo.set_text(fix_numbers_rtl(headline), -1)
+    h_lo.set_text(to_arabic_nums(headline), -1)
     ctx.set_source_rgb(1,1,1)
     ctx.move_to(50, tag_y+44); PangoCairo.show_layout(ctx, h_lo)
 
@@ -444,7 +442,7 @@ def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
         b_lo.set_width(980 * Pango.SCALE)
         b_lo.set_alignment(Pango.Alignment.RIGHT)
         b_lo.set_font_description(Pango.FontDescription("Noto Sans Thaana 26"))
-        b_lo.set_text(fix_numbers_rtl(body), -1)
+        b_lo.set_text(to_arabic_nums(body), -1)
         ctx.set_source_rgba(0.78, 0.86, 1, 0.85)
         ctx.move_to(50, tag_y+44+hh+8); PangoCairo.show_layout(ctx, b_lo)
 
