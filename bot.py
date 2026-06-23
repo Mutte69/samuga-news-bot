@@ -28,17 +28,21 @@ ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # ── RSS Feeds (v4 Strategy) ───────────────────────────────────────────────────
 # LOCAL (70%) — Maldivian sources, priority order
 LOCAL_FEEDS = [
-    # Tier 1 — Breaking/Crisis
+    # Tier 1 - Breaking/Crisis
     {"url": "https://news.google.com/rss/search?q=maldives+breaking+incident+accident+arrest&hl=en-MV&gl=MV&ceid=MV:en", "cat": "DISASTER", "lang": "en"},
-    # Tier 2 — Politics/Economy
-    {"url": "https://see.mv/feed",                  "cat": "LOCAL", "lang": "en"},
-    {"url": "https://english.sun.mv/feed",           "cat": "LOCAL", "lang": "en"},
-    {"url": "https://edition.mv/feed",               "cat": "LOCAL", "lang": "en"},
-    {"url": "https://maldivesindependent.com/feed",  "cat": "LOCAL", "lang": "en"},
-    {"url": "https://oneonline.mv/en/feed",          "cat": "LOCAL", "lang": "en"},
-    {"url": "https://psmnews.mv/en/feed",            "cat": "LOCAL", "lang": "en"},
-    {"url": "https://mihaaru.com/rss",               "cat": "LOCAL", "lang": "dv"},
-    {"url": "https://avas.mv/feed",                  "cat": "LOCAL", "lang": "dv"},
+    # Tier 2 - English sources
+    {"url": "https://see.mv/feed",                   "cat": "LOCAL",   "lang": "en"},
+    {"url": "https://english.sun.mv/feed",            "cat": "LOCAL",   "lang": "en"},  # already present
+    {"url": "https://edition.mv/feed",                "cat": "LOCAL",   "lang": "en"},  # already present (editon)
+    {"url": "https://maldivesindependent.com/feed",   "cat": "LOCAL",   "lang": "en"},
+    {"url": "https://oneonline.mv/en/feed",           "cat": "LOCAL",   "lang": "en"},
+    {"url": "https://psmnews.mv/en/feed",             "cat": "LOCAL",   "lang": "en"},  # already present (PSM News)
+    {"url": "https://maldivesvoice.com/feed",         "cat": "LOCAL",   "lang": "en"},  # NEW: Maldives Voice
+    {"url": "https://presidency.gov.mv/feed",         "cat": "LOCAL",   "lang": "en"},  # NEW: Presidency
+    # Tier 3 - Dhivehi sources
+    {"url": "https://sunonline.mv/feed",              "cat": "LOCAL",   "lang": "dv"},  # NEW: SunOnline (Dhivehi)
+    {"url": "https://mihaaru.com/rss",                "cat": "LOCAL",   "lang": "dv"},
+    {"url": "https://avas.mv/feed",                   "cat": "LOCAL",   "lang": "dv"},
     {"url": "https://news.google.com/rss/search?q=maldives+politics+parliament+government&hl=en-MV&gl=MV&ceid=MV:en", "cat": "LOCAL", "lang": "en"},
     {"url": "https://news.google.com/rss/search?q=maldives+economy+finance+business&hl=en-MV&gl=MV&ceid=MV:en",       "cat": "LOCAL", "lang": "en"},
 ]
@@ -57,8 +61,10 @@ WORLD_FEEDS = [
 
 # LIFESTYLE (10%)
 LIFESTYLE_FEEDS = [
+    {"url": "https://visitmaldives.com/feed",                                                                   "cat": "TOURISM", "lang": "en"},  # NEW: Visit Maldives official
     {"url": "https://news.google.com/rss/search?q=maldives+tourism+travel+resort&hl=en-MV&gl=MV&ceid=MV:en", "cat": "TOURISM", "lang": "en"},
     {"url": "https://news.google.com/rss/search?q=maldives+weather+storm&hl=en-MV&gl=MV&ceid=MV:en",         "cat": "WEATHER", "lang": "en"},
+    {"url": "https://rss.accuweather.com/rss/liveweather_rss.asp?metric=1&locCode=MV",                        "cat": "WEATHER", "lang": "en"},  # NEW: AccuWeather Maldives
 ]
 
 RSS_FEEDS = LOCAL_FEEDS + SPORTS_FEEDS + WORLD_FEEDS + LIFESTYLE_FEEDS
