@@ -372,9 +372,10 @@ def send_photo(chat_id, buf, caption):
         log.error(f"send_photo: {e}")
         return False
 
-def send_text(chat_id, text, reply_to=None):
+def send_text(chat_id, text, reply_to=None, thread_id=None):
     payload={"chat_id":chat_id,"text":text,"parse_mode":"HTML"}
     if reply_to: payload["reply_to_message_id"]=reply_to
+    if thread_id: payload["message_thread_id"]=thread_id
     try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",json=payload,timeout=15)
     except Exception as e: log.error(f"Send text: {e}")
 
@@ -1299,6 +1300,7 @@ def handle_updates():
                 if not text: continue
                 chat_id=msg["chat"]["id"]
                 msg_id=msg["message_id"]
+                thread_id=msg.get("message_thread_id")  # for forum/topic groups
                 chat_type=msg["chat"]["type"]
                 user_name=msg.get("from",{}).get("username","")
                 first_name=msg.get("from",{}).get("first_name","there")
@@ -1317,7 +1319,7 @@ def handle_updates():
                         log.info(f"🔍 Search: {query}")
                         results=tavily_search(f"{query} maldives")
                         reply=chat_with_claude(f"Tell me about: {query}. Use this info: {results[:400]}", user_id)
-                        send_text(chat_id, reply, reply_to=msg_id)
+                        send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
                     else:
                         log.info(f"💬 DM {display_name}: {text[:50]}")
                         # Route Dhivehi to Gemini
@@ -1334,7 +1336,7 @@ def handle_updates():
                                 reply = chat_with_claude(text, user_id)
                         else:
                             reply = chat_with_claude(text, user_id)
-                        send_text(chat_id, reply, reply_to=msg_id)
+                        send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
 
                 elif chat_type in ["group","supergroup"]:
                     is_core_team = str(chat_id) == CORE_TEAM_CHAT_ID
@@ -1364,7 +1366,7 @@ def handle_updates():
                                 add_to_conversation(user_id, "user", clean)
                                 add_to_conversation(user_id, "assistant", reply)
                                 # Reply directly if tagged, send without reply if proactive
-                                send_text(chat_id, reply, reply_to=msg_id if tagged else None)
+                                send_text(chat_id, reply, reply_to=msg_id if tagged else None, thread_id=thread_id)
 
                     # Regular group — only respond when tagged
                     elif tagged and clean:
@@ -1382,7 +1384,7 @@ def handle_updates():
                                 reply = chat_with_claude(clean, user_id)
                         else:
                             reply = chat_with_claude(clean, user_id)
-                        send_text(chat_id, reply, reply_to=msg_id)
+                        send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
         except Exception as e:
             log.error(f"Update loop: {e}"); time.sleep(5)
 
