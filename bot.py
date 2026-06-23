@@ -1571,7 +1571,6 @@ def _build_card_and_caption(article):
     breaking_tag = "🚨 <b>BREAKING NEWS</b>\n\n" if breaking else ""
     caption = (f"{breaking_tag}{cat_emoji} <b>{article['title']}</b>\n\n"
                f"{rewritten}\n\n"
-               f"🔗 <a href='{article['link']}'>Read more</a>\n\n"
                f"📡 <b>Samuga Media</b> | @samugacommunity")
     return card_bytes, caption, rewritten, keyword
 
@@ -2605,7 +2604,6 @@ def handle_updates():
                                         full_caption = (
                                             f"🇲🇻 <b>{item['title']}</b>\n\n"
                                             f"{final_dv}\n\n"
-                                            f"🔗 <a href='{item['link']}'>ތަފްސީލް ކިޔާ</a>\n\n"
                                             f"📡 <b>ސަމޫގާ މީޑިއާ</b> | @samugacommunity"
                                         )
                                         card.seek(0)
