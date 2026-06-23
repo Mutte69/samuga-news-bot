@@ -1449,8 +1449,11 @@ def handle_updates():
                 if not msg: continue
                 text=msg.get("text","") or msg.get("caption","")
                 photo=msg.get("photo")  # list of photo sizes if message has photo
-                if not text and not photo: continue
+                video=msg.get("video") or msg.get("video_note")
+                if not text and not photo and not video: continue
                 if not text: text=""
+                # Skip videos for card creation — only photos supported
+                if video and not photo: photo = None
                 chat_id=msg["chat"]["id"]
                 msg_id=msg["message_id"]
                 thread_id=msg.get("message_thread_id")  # for forum/topic groups
@@ -1547,16 +1550,17 @@ def handle_updates():
                         elif tagged and (
                             "create card and post" in clean.lower() or
                             "create card and send to community" in clean.lower() or
-                            "create card and send to core team" in clean.lower()
+                            "create card and send to core team" in clean.lower() or
+                            "create card and post to core team" in clean.lower() or
+                            "create card and post to community" in clean.lower()
                         ):
-                            # Determine destination
                             cl = clean.lower()
-                            if "send to core team" in cl:
+                            if "to core team" in cl:
                                 destination = "coreteam"
-                            elif "send to community" in cl:
+                            elif "to community" in cl or "send to community" in cl:
                                 destination = "community"
                             else:
-                                destination = "all"  # create card and post = all platforms
+                                destination = "all"
 
                             # Extract the content text (everything before @SamugaNewsBot)
                             # The text comes from the photo caption or message, minus the command
@@ -1566,7 +1570,9 @@ def handle_updates():
                                 raw_text = raw_text.replace(f"@{BOT_USERNAME} {cmd}", "").replace(f"@{BOT_USERNAME.lower()} {cmd}", "")
                             raw_text = raw_text.replace(f"@{BOT_USERNAME}", "").strip()
 
-                            if not raw_text and not photo:
+                            if video and not photo:
+                                send_text(chat_id, "Videos are not supported for cards — please send a photo instead 📸", reply_to=msg_id, thread_id=thread_id)
+                            elif not raw_text and not photo:
                                 send_text(chat_id, "Send a photo with caption text, or just text, then add the command at the end.", reply_to=msg_id, thread_id=thread_id)
                             else:
                                 content_text = raw_text or "Samuga Media"
@@ -1600,9 +1606,9 @@ def handle_updates():
                                             posted.append("Core Team")
 
                                     if destination == "all":
-                                        card.seek(0)
-                                        buf_copy = io.BytesIO(card.getvalue())
-                                        threading.Thread(target=post_to_social, args=(buf_copy, full_caption), daemon=True).start()
+                                        card_bytes = card.getvalue()
+                                        buf_social = io.BytesIO(card_bytes)
+                                        threading.Thread(target=post_to_social, args=(buf_social, full_caption), daemon=True).start()
                                         posted.append("FB + IG + Twitter")
 
                                     if posted:
