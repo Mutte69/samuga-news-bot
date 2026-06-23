@@ -123,6 +123,18 @@ CORE_TEAM_PROACTIVE_TRIGGERS = [
     "haha", "lol", "😂", "anyone", "guys", "let's", "lets", "what if", "how about"
 ]
 
+# ── Rejection humor responses ────────────────────────────────────────────────
+REJECT_RESPONSES = [
+    "Okay okay, deleted. The article didn't make the cut. Just like my invite to your last outing. 💔",
+    "Gone. Rejected. Just like that one pitch Manchii had at 2am. We don't talk about it. 🗑️",
+    "Poof. Vanished. The article felt it too. 😭",
+    "Rejected faster than a loan application. Card deleted bro. 🚮",
+    "Understood. We move. The article does not. 👋",
+    "That article just got voted off the island. Maldivian style. 🏝️",
+    "Fine fine, I'll delete it. But between us — I thought it was good. Just saying. 🤷",
+    "Deleted! The article is now in a better place. (The bin.) 🗑️✨",
+]
+
 BREAKING_KEYWORDS = [
     "killed","dead","dies","murder","shot","stabbed","explosion","bomb","attack",
     "tsunami","earthquake","flood","disaster","sinking","collapsed","hostage",
@@ -1051,9 +1063,9 @@ def post_article(article, seen, social_only=False, allow_social=True):
                     "<b>Bot wrote:</b>\n"
                     f"{dv_text}\n\n"
                     f"<b>Key:</b> <code>{key}</code>\n\n"
-                    f"✅ Approve: <code>@SamugaNewsBot post {key}</code>\n"
-                    f"✏️ Correct: <code>@SamugaNewsBot post {key} ތިޔަ ތަން ރަނގަޅު ކޮށްފައި...</code>\n"
-                    f"❌ Reject: <code>@SamugaNewsBot reject {key}</code>"
+                    f"✅ Approve: <code>/approved {key}</code>\n"
+                    f"✏️ Edit & post: <code>/approved {key} [corrected dhivehi text]</code>\n"
+                    f"❌ Reject: <code>/reject {key}</code>"
                 )
                 send_text(CORE_TEAM_CHAT_ID, approval_msg, thread_id=CONTENT_LAB_THREAD_ID)
                 log.info(f"📨 Dhivehi approval sent to Content Lab: {key}")
@@ -1960,17 +1972,17 @@ def handle_updates():
                         sender_info = get_sender_info(display_name, first_name)
                         history = get_conversation(user_id)
 
-                        # @SamugaNewsBot post <key> [optional corrected dhivehi text]
-                        if tagged and clean.lower().startswith("post "):
-                            parts = clean[5:].strip().split(" ", 1)
+                        # /approved dv1 [optional corrected dhivehi text]
+                        if text.strip().lower().startswith("/approved "):
+                            parts = text.strip()[10:].strip().split(" ", 1)
                             key = parts[0].strip()
                             corrected = parts[1].strip() if len(parts) > 1 else None
                             if key in dhivehi_pending:
                                 pending = dhivehi_pending.pop(key)
                                 final_dv_text = corrected if corrected else pending["dv_text"]
-                                # NOW generate the card with approved Dhivehi text
+                                action = "edited" if corrected else "approved"
                                 try:
-                                    send_text(chat_id, f"⏳ Creating card for {key}...", thread_id=thread_id)
+                                    send_text(chat_id, f"Got it {first_name} 🙌 Your {action} card is being posted...", reply_to=msg_id, thread_id=thread_id)
                                     kw = pending.get("keyword", pending["cat"].lower())
                                     bg = fetch_background_image(kw)
                                     ts_now = (datetime.utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
@@ -1982,25 +1994,26 @@ def handle_updates():
                                         f"📡 <b>ސަމޫގާ މީޑިއާ</b> | @samugacommunity"
                                     )
                                     if send_to_telegram(card, full_caption):
-                                        send_text(chat_id, f"✅ Posted to community! ({key})", reply_to=msg_id, thread_id=thread_id)
-                                        log.info(f"✅ Dhivehi card {key} posted to community")
+                                        send_text(chat_id, f"✅ Posted to community!", reply_to=msg_id, thread_id=thread_id)
+                                        log.info(f"✅ Dhivehi card {key} posted by {first_name}")
                                     else:
                                         send_text(chat_id, f"❌ Telegram post failed.", reply_to=msg_id, thread_id=thread_id)
                                 except Exception as e:
                                     log.error(f"Dhivehi card post error: {e}")
-                                    send_text(chat_id, f"❌ Error creating card: {e}", reply_to=msg_id, thread_id=thread_id)
+                                    send_text(chat_id, f"❌ Error: {e}", reply_to=msg_id, thread_id=thread_id)
                             else:
-                                send_text(chat_id, f"Key {key} not found or already posted.", reply_to=msg_id, thread_id=thread_id)
+                                send_text(chat_id, f"Key `{key}` not found or already posted.", reply_to=msg_id, thread_id=thread_id)
 
-                        # @SamugaNewsBot reject <key>
-                        elif tagged and clean.lower().startswith("reject "):
-                            key = clean[7:].strip()
+                        # /reject dv1
+                        elif text.strip().lower().startswith("/reject "):
+                            key = text.strip()[8:].strip()
                             if key in dhivehi_pending:
-                                title = dhivehi_pending[key]["title"]
                                 del dhivehi_pending[key]
-                                send_text(chat_id, f"🗑️ Rejected: {key} ({title[:40]})", reply_to=msg_id, thread_id=thread_id)
+                                import random as _r
+                                send_text(chat_id, _r.choice(REJECT_RESPONSES), reply_to=msg_id, thread_id=thread_id)
+                                log.info(f"🗑️ {key} rejected by {first_name}")
                             else:
-                                send_text(chat_id, f"Key {key} not found.", reply_to=msg_id, thread_id=thread_id)
+                                send_text(chat_id, f"Key `{key}` not found — maybe already posted or rejected.", reply_to=msg_id, thread_id=thread_id)
 
                         # @SamugaNewsBot card [dhivehi text] — manual card creation
                         elif tagged and (
@@ -2123,8 +2136,8 @@ def handle_updates():
                             else:
                                 send_text(chat_id, "Send it like this: /read [paste your content here]", reply_to=msg_id, thread_id=thread_id)
 
-                        # Respond if tagged OR proactive trigger detected
-                        elif (not (tagged and (clean.lower().startswith("post ") or clean.lower().startswith("reject ")))) and (tagged or should_respond_proactively(text)):
+                        # Respond only when directly tagged — no more jumping in proactively
+                        elif tagged:
                             if not clean: clean = text.strip()
                             log.info(f"🧠 Core team {'[tagged]' if tagged else '[proactive]'} {display_name}: {clean[:50]}")
                             session_ctx = core_team_session_context.get(chat_id, "")
