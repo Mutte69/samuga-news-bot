@@ -420,13 +420,21 @@ def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
     headline = " ".join(hw)
     body = " ".join(bw)
 
+    import re as _re
+
+    def make_pango_markup(t, size, bold=False):
+        """Wrap numbers in LTR spans for proper RTL+number rendering"""
+        weight = ' weight="ultrabold"' if bold else ''
+        # Escape XML special chars
+        t = t.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+        # Wrap digit sequences in LTR span
+        t = _re.sub(r"(\d+)", r'<span dir="ltr">\1</span>', t)
+        return f'<span font="Noto Sans Thaana {size}"{weight}>{t}</span>'
+
     h_lo = PangoCairo.create_layout(ctx)
     h_lo.set_width(980 * Pango.SCALE)
     h_lo.set_alignment(Pango.Alignment.RIGHT)
-    h_fd = Pango.FontDescription("Noto Sans Thaana 50")
-    h_fd.set_weight(Pango.Weight.ULTRABOLD)
-    h_lo.set_font_description(h_fd)
-    h_lo.set_text(headline, -1)
+    h_lo.set_markup(make_pango_markup(headline, 50, bold=True), -1)
     ctx.set_source_rgb(1,1,1)
     ctx.move_to(50, tag_y+44); PangoCairo.show_layout(ctx, h_lo)
 
@@ -435,8 +443,7 @@ def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
         b_lo = PangoCairo.create_layout(ctx)
         b_lo.set_width(980 * Pango.SCALE)
         b_lo.set_alignment(Pango.Alignment.RIGHT)
-        b_lo.set_font_description(Pango.FontDescription("Noto Sans Thaana 26"))
-        b_lo.set_text(body, -1)
+        b_lo.set_markup(make_pango_markup(body, 26), -1)
         ctx.set_source_rgba(0.78, 0.86, 1, 0.85)
         ctx.move_to(50, tag_y+44+hh+8); PangoCairo.show_layout(ctx, b_lo)
 
