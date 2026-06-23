@@ -1999,7 +1999,7 @@ def handle_updates():
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("🚀 Samuga News Bot v3.2 starting...")
+    log.info("🚀 Samuga News Bot v4.0 starting...")
     # Install Noto fonts for Thaana/Dhivehi support
     if not os.path.exists("/usr/share/fonts/truetype/noto/NotoSansThaana-Bold.ttf") and not os.path.exists("/app/NotoSansThaana-Bold.ttf"):
         try:
@@ -2010,7 +2010,7 @@ if __name__ == "__main__":
             log.warning(f"Noto font install failed: {e}")
     else:
         log.info("✅ Thaana fonts available")
-    log.info("📅 7AM-6PM: every 30min | Night: social only")
+    log.info("📅 6AM-10PM: every 15min | Night: breaking only | v4 strategy")
     log.info("🌅 7AM Brief | 🌙 12AM Summary | 🌤️ 8AM/8PM Weather | 📊 Friday Digest")
     log.info("💬 Smart chat with history, Tavily search, Dhivehi support")
 
