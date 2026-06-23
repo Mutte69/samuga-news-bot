@@ -70,14 +70,47 @@ LIFESTYLE_FEEDS = [
 RSS_FEEDS = LOCAL_FEEDS + SPORTS_FEEDS + WORLD_FEEDS + LIFESTYLE_FEEDS
 
 CAT_CONFIG = {
-    "LOCAL":   {"label": "🇲🇻  LOCAL NEWS",   "color": (41,171,226)},
-    "SPORTS":  {"label": "🏅  SPORTS",         "color": (34,180,80)},
-    "WORLD":   {"label": "🌍  WORLD NEWS",     "color": (220,80,60)},
-    "DISASTER":{"label": "🚨  DISASTER ALERT", "color": (220,120,0)},
-    "WEATHER": {"label": "🌤️  WEATHER",        "color": (100,180,240)},
-    "TOURISM": {"label": "✈️  TOURISM",        "color": (160,80,220)},
-    "FOOTBALL":{"label": "🏅  SPORTS",         "color": (34,180,80)},  # alias for SPORTS
+    "BREAKING":  {"label": "🚨  BREAKING NEWS", "color": (220,50,50)},
+    "LOCAL":     {"label": "🇲🇻  LOCAL NEWS",    "color": (41,171,226)},
+    "POLITICAL": {"label": "🏛️  POLITICAL",      "color": (180,140,40)},
+    "LIFESTYLE": {"label": "🌴  LIFESTYLE",      "color": (160,80,220)},
+    "SPORTS":    {"label": "🏅  SPORTS",         "color": (34,180,80)},
+    # Legacy aliases — mapped so old code/feeds keep working
+    "DISASTER":  {"label": "🚨  BREAKING NEWS", "color": (220,50,50)},
+    "WORLD":     {"label": "🌍  WORLD NEWS",     "color": (220,80,60)},
+    "WEATHER":   {"label": "🌴  LIFESTYLE",      "color": (160,80,220)},
+    "TOURISM":   {"label": "🌴  LIFESTYLE",      "color": (160,80,220)},
+    "FOOTBALL":  {"label": "🏅  SPORTS",         "color": (34,180,80)},
 }
+
+# Maps any legacy/raw category to one of the 5 canonical display categories
+CATEGORY_MAP = {
+    "BREAKING":"BREAKING", "DISASTER":"BREAKING",
+    "LOCAL":"LOCAL",
+    "POLITICAL":"POLITICAL",
+    "LIFESTYLE":"LIFESTYLE", "TOURISM":"LIFESTYLE", "WEATHER":"LIFESTYLE",
+    "SPORTS":"SPORTS", "FOOTBALL":"SPORTS",
+    "WORLD":"LOCAL",  # world news folded into local (only Maldives-relevant posts anyway)
+}
+
+# Keywords that mark a story as POLITICAL (split out from general LOCAL)
+POLITICAL_KEYWORDS = [
+    "parliament","majlis","president","minister","ministry","government","cabinet",
+    "mp ","ruling party","opposition","mdp","pnc","ppm","election","vote","policy",
+    "bill","law","court","supreme court","judge","attorney general","ag office",
+    "council","mayor","governor","resign","appointed","reshuffle","summit","diplomatic",
+    "ambassador","foreign ministry","budget","parliamentary","constitution","impeach"
+]
+
+def canonical_category(cat, title="", summary=""):
+    """Resolve raw category + content into one of the 5 display categories."""
+    base = CATEGORY_MAP.get(cat, "LOCAL")
+    # If it's LOCAL, check whether it's actually political
+    if base == "LOCAL":
+        text = (title + " " + summary).lower()
+        if any(kw in text for kw in POLITICAL_KEYWORDS):
+            return "POLITICAL"
+    return base
 
 # ── Core Team Session Context (in-memory only, clears on restart) ────────────
 core_team_session_context = {}  # user_id -> stored context
@@ -212,6 +245,124 @@ BREAKING_BLACKLIST = [
     "civil war","squad","team","player","match","game","season","transfer",
     "economy","business","market","price","investment","opening","launch","event"
 ]
+
+# ── PostgreSQL Database Layer (v6) ────────────────────────────────────────────
+# Railway auto-injects DATABASE_URL when Postgres is in the project.
+# The bot uses Postgres for the article archive + intelligence, but ALWAYS falls
+# back to JSON files if the DB is unavailable, so it never breaks.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+_db_pool = None
+DB_ENABLED = False
+
+def init_database():
+    """Connect to Postgres and create tables. Sets DB_ENABLED on success."""
+    global _db_pool, DB_ENABLED
+    if not DATABASE_URL:
+        log.info("🗄️ No DATABASE_URL — running in JSON-only mode")
+        return
+    try:
+        import psycopg2
+        from psycopg2 import pool as _pgpool
+        # Railway sometimes gives postgres:// — psycopg2 wants postgresql://
+        url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        _db_pool = _pgpool.SimpleConnectionPool(1, 5, dsn=url)
+        # Create schema
+        conn = _db_pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS articles (
+                        id              TEXT PRIMARY KEY,
+                        title           TEXT NOT NULL,
+                        summary         TEXT,
+                        link            TEXT,
+                        source          TEXT,
+                        category        TEXT,
+                        lang            TEXT,
+                        score           INTEGER DEFAULT 0,
+                        reliability     INTEGER DEFAULT 0,
+                        is_breaking     BOOLEAN DEFAULT FALSE,
+                        cluster_id      TEXT,
+                        status          TEXT DEFAULT 'seen',   -- seen|queued|posted|rejected|duplicate
+                        found_at        TIMESTAMPTZ DEFAULT NOW(),
+                        posted_at       TIMESTAMPTZ,
+                        tg_message_id   BIGINT,
+                        tg_views        INTEGER DEFAULT 0
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_found_at ON articles(found_at);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_status   ON articles(status);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_cluster  ON articles(cluster_id);")
+                # Key-value store for bot state (replaces bot_state.json eventually)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bot_kv (
+                        key        TEXT PRIMARY KEY,
+                        value      JSONB,
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                """)
+            conn.commit()
+        finally:
+            _db_pool.putconn(conn)
+        DB_ENABLED = True
+        log.info("🗄️ ✅ PostgreSQL connected — article archive active")
+    except Exception as e:
+        log.error(f"🗄️ Database init failed (falling back to JSON): {e}")
+        DB_ENABLED = False
+
+def db_execute(query, params=None, fetch=None):
+    """
+    Run a query safely with pooled connection.
+    fetch: None (no result), 'one', or 'all'. Returns result or None on failure.
+    """
+    if not DB_ENABLED or not _db_pool:
+        return None
+    conn = None
+    try:
+        conn = _db_pool.getconn()
+        with conn.cursor() as cur:
+            cur.execute(query, params or ())
+            result = None
+            if fetch == "one":
+                result = cur.fetchone()
+            elif fetch == "all":
+                result = cur.fetchall()
+        conn.commit()
+        return result
+    except Exception as e:
+        log.error(f"🗄️ db_execute: {e}")
+        if conn:
+            try: conn.rollback()
+            except Exception: pass
+        return None
+    finally:
+        if conn and _db_pool:
+            _db_pool.putconn(conn)
+
+def db_record_article(article, score=0, reliability=0, status="seen", is_breaking=False):
+    """Insert or update an article in the archive. Safe no-op if DB disabled."""
+    if not DB_ENABLED:
+        return
+    db_execute("""
+        INSERT INTO articles (id, title, summary, link, source, category, lang, score, reliability, is_breaking, status)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (id) DO UPDATE SET
+            score=EXCLUDED.score, reliability=EXCLUDED.reliability, status=EXCLUDED.status
+    """, (
+        article.get("id"), article.get("title","")[:500], article.get("summary","")[:2000],
+        article.get("link",""), article.get("source",""), article.get("cat",""),
+        article.get("lang","en"), score, reliability, is_breaking, status
+    ))
+
+def db_mark_status(article_id, status, posted=False):
+    """Update an article's lifecycle status (queued/posted/rejected/duplicate)."""
+    if not DB_ENABLED:
+        return
+    if posted:
+        db_execute("UPDATE articles SET status=%s, posted_at=NOW() WHERE id=%s", (status, article_id))
+    else:
+        db_execute("UPDATE articles SET status=%s WHERE id=%s", (status, article_id))
 
 # ── Storage ───────────────────────────────────────────────────────────────────
 DATA_DIR  = "/data"
@@ -428,7 +579,7 @@ def remember_story_title(title):
 # Higher = more trusted. Used as a tie-breaker and a scoring boost so a direct
 # Mihaaru/MvCrisis story outranks a Google News scrape of the same topic.
 SOURCE_RELIABILITY = {
-    "mvcrisis":   100,  # #1 Maldives breaking source
+    "mvcrisis":    70,  # fast but mixes ads — lowered, filtered separately
     "mihaaru":     95,
     "sun":         92,
     "sunonline":   92,
@@ -504,7 +655,10 @@ def is_breaking(title, summary="", cat=""):
     text = (title + " " + summary).lower()
 
     # Never breaking for these categories
-    if cat in ["FOOTBALL", "TOURISM", "WEATHER", "SPORTS"]: return False
+    if cat in ["FOOTBALL", "TOURISM", "WEATHER", "SPORTS", "LIFESTYLE"]: return False
+
+    # Never breaking if it looks like an ad/promo (submarine hire, speedboat rental, etc.)
+    if _looks_like_ad(text): return False
 
     # Check blacklist first — if any blacklist term present, not breaking
     if any(bl in text for bl in BREAKING_BLACKLIST): return False
@@ -613,35 +767,58 @@ def gemini_translate(text):
     return text
 
 # ── Fetch News ────────────────────────────────────────────────────────────────
+# Words that signal an ad/promo/spam — never treat these as news
+MVCRISIS_AD_MARKERS = [
+    "hire","rent","for sale","available","booking","book now","contact","call now",
+    "whatsapp","viber","discount","offer","promo","cheap","price","mvr ","rufiyaa ",
+    "delivery","order now","dm ","inbox","trip","package","tour","charter","ferry service",
+    "submarine","speed boat hire","speedboat hire","private trips","advertise","sponsored",
+    "sale!","%","https://sauvees","buy ","sell ","service available","we offer"
+]
+
+def _looks_like_ad(text):
+    """Heuristic: is this MvCrisis post an ad/promo rather than news?"""
+    t = text.lower()
+    hits = sum(1 for m in MVCRISIS_AD_MARKERS if m in t)
+    # Multiple ad markers, or a phone number pattern, or a price = likely ad
+    import re as _re
+    has_phone = bool(_re.search(r"\b[79]\d{6}\b", t))  # Maldivian mobile pattern
+    has_price = bool(_re.search(r"\b\d+\s*(mvr|rf|rufiyaa|usd|\$)\b", t))
+    return hits >= 2 or (hits >= 1 and (has_phone or has_price))
+
 def fetch_mvcrisis():
-    """Scrape MvCrisis public Telegram channel for breaking news"""
+    """Scrape MvCrisis public Telegram channel — filters ads, only keeps real news."""
     try:
         resp = requests.get("https://t.me/s/mvcrisis", timeout=10,
                            headers={"User-Agent": "Mozilla/5.0"})
         if resp.status_code != 200: return []
         import re as _re, hashlib
-        # Extract message texts from Telegram web view
         texts = _re.findall(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', resp.text, _re.DOTALL)
         articles = []
+        skipped_ads = 0
         for raw in texts[:15]:
-            # Strip HTML tags
             text = _re.sub(r"<[^>]+>", "", raw).strip()
             text = text.replace("&amp;","&").replace("&#39;","'").replace("&quot;",'"')
-            if len(text) < 15: continue
+            if len(text) < 25: continue  # too short to be real news
+            # Skip ads/promos
+            if _looks_like_ad(text):
+                skipped_ads += 1
+                continue
             art_id = "mvc_" + hashlib.md5(text[:60].encode()).hexdigest()[:8]
-            # Detect language
             lang = "dv" if any("ހ" <= ch <= "޿" for ch in text) else "en"
+            # Don't force DISASTER — let is_breaking() + category logic decide.
+            # MvCrisis posts default to LOCAL; only become BREAKING if keywords match.
             articles.append({
                 "id": art_id,
                 "title": text[:150],
                 "summary": text,
                 "link": "https://t.me/mvcrisis",
                 "source": "MvCrisis",
-                "cat": "DISASTER",
+                "cat": "LOCAL",   # was DISASTER — fixed: not everything is an emergency
                 "lang": lang,
                 "published": datetime.utcnow()
             })
-        log.info(f"📡 MvCrisis: {len(articles)} posts fetched")
+        log.info(f"📡 MvCrisis: {len(articles)} news kept, {skipped_ads} ads skipped")
         return articles
     except Exception as e:
         log.error(f"MvCrisis fetch: {e}")
@@ -779,13 +956,17 @@ def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
 
     W, H = 1080, 1080
     DV_CAT = {
-        "LOCAL":   {"label": "ލޯކަލް ނިއުސް", "color": (0, 180, 255)},
-        "DISASTER":{"label": "ހާދިސާ",        "color": (220, 50, 50)},
-        "WORLD":   {"label": "ދުނިޔެ",         "color": (50, 180, 100)},
-        "FOOTBALL":{"label": "ކުޅިވަރު",       "color": (34, 180, 80)},
-        "TOURISM": {"label": "ފަތުރުވެރިކަން","color": (160, 80, 220)},
-        "WEATHER": {"label": "މޫސުން",         "color": (0, 200, 200)},
-        "SPORTS":  {"label": "ކުޅިވަރު",       "color": (0, 180, 100)},
+        "BREAKING": {"label": "ބްރޭކިން ނިއުސް", "color": (220, 50, 50)},
+        "LOCAL":    {"label": "ލޯކަލް ނިއުސް",   "color": (0, 180, 255)},
+        "POLITICAL":{"label": "ސިޔާސީ",          "color": (180, 140, 40)},
+        "LIFESTYLE":{"label": "ލައިފްސްޓައިލް",  "color": (160, 80, 220)},
+        "SPORTS":   {"label": "ކުޅިވަރު",        "color": (34, 180, 80)},
+        # Legacy aliases
+        "DISASTER": {"label": "ބްރޭކިން ނިއުސް", "color": (220, 50, 50)},
+        "WORLD":    {"label": "ދުނިޔެ",          "color": (50, 180, 100)},
+        "FOOTBALL": {"label": "ކުޅިވަރު",        "color": (34, 180, 80)},
+        "TOURISM":  {"label": "ލައިފްސްޓައިލް",  "color": (160, 80, 220)},
+        "WEATHER":  {"label": "ލައިފްސްޓައިލް",  "color": (160, 80, 220)},
     }
     cfg = DV_CAT.get(cat, DV_CAT["LOCAL"])
     accent = cfg["color"]
@@ -978,9 +1159,10 @@ def generate_card(text, source, timestamp, cat, bg_image=None, morning=False, _s
 
     draw.text((W-310,50),"t.me/samugacommunity",font=f_sm,fill=(200,230,255))
     # For Thaana cards use plain English label (no emoji, DejaVu renders it)
-    tag_label = {"LOCAL":"LOCAL NEWS","FOOTBALL":"FOOTBALL","WORLD":"WORLD NEWS",
-                 "DISASTER":"BREAKING NEWS","WEATHER":"WEATHER","TOURISM":"TOURISM",
-                 "SPORTS":"SPORTS"}.get(cat, cat) if has_thaana else label
+    tag_label = {"BREAKING":"BREAKING NEWS","LOCAL":"LOCAL NEWS","POLITICAL":"POLITICAL",
+                 "LIFESTYLE":"LIFESTYLE","SPORTS":"SPORTS",
+                 "DISASTER":"BREAKING NEWS","WORLD":"WORLD NEWS","WEATHER":"LIFESTYLE",
+                 "TOURISM":"LIFESTYLE","FOOTBALL":"SPORTS"}.get(cat, cat) if has_thaana else label
     f_tag_en = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
     tag_y=590; tw=draw.textbbox((0,0),tag_label,font=f_tag_en)[2]+26
     draw.rectangle([(50,tag_y),(50+tw,tag_y+34)],fill=accent)
@@ -1343,15 +1525,20 @@ def post_to_social(img_buf, caption):
 # ── Post Article ──────────────────────────────────────────────────────────────
 def _build_card_and_caption(article):
     """Build the card image + caption for an article. Returns (card_bytes, caption, rewritten, keyword)."""
-    cat = article["cat"]
-    breaking = is_breaking(article["title"], article["summary"], cat)
-    rewritten, keyword = rewrite_news(article["title"], article["summary"], cat)
+    raw_cat = article["cat"]
+    breaking = is_breaking(article["title"], article["summary"], raw_cat)
+    # Resolve to one of the 5 display categories. Breaking overrides everything.
+    if breaking:
+        display_cat = "BREAKING"
+    else:
+        display_cat = canonical_category(raw_cat, article["title"], article.get("summary",""))
+    rewritten, keyword = rewrite_news(article["title"], article["summary"], raw_cat)
     bg = fetch_background_image(keyword)
     ts = (datetime.utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
-    card = generate_card(rewritten, article["source"], ts, cat, bg)
+    card = generate_card(rewritten, article["source"], ts, display_cat, bg)
     card_bytes = card.getvalue()
 
-    cat_emoji = {"LOCAL":"🇲🇻","FOOTBALL":"⚽","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(cat,"📰")
+    cat_emoji = {"BREAKING":"🚨","LOCAL":"🇲🇻","POLITICAL":"🏛️","LIFESTYLE":"🌴","SPORTS":"🏅"}.get(display_cat,"📰")
     breaking_tag = "🚨 <b>BREAKING NEWS</b>\n\n" if breaking else ""
     caption = (f"{breaking_tag}{cat_emoji} <b>{article['title']}</b>\n\n"
                f"{rewritten}\n\n"
@@ -1446,9 +1633,15 @@ def post_article(article, seen, social_only=False, allow_social=True):
     # Mark seen now so the same article isn't re-processed on the next scan
     seen.add(article["id"]); save_seen(seen)
 
+    # Archive every article we process (DB no-op if Postgres unavailable)
+    db_record_article(article, score=score_article(article),
+                      reliability=source_reliability(article.get("source","")),
+                      status="seen", is_breaking=breaking)
+
     # ── Duplicate story check — skip if same event already posted/queued ──
     if is_duplicate_story(article["title"]):
         log.info(f"⏭️ Skipping duplicate: {article['title'][:55]}")
+        db_mark_status(article["id"], "duplicate")
         return False
     # Record this title so later similar stories are caught
     remember_story_title(article["title"])
@@ -1456,9 +1649,11 @@ def post_article(article, seen, social_only=False, allow_social=True):
     # ── English BREAKING: publish instantly, no approval ──
     if breaking and not is_dv:
         card_bytes, caption, rewritten, keyword = _build_card_and_caption(article)
-        return _publish_now(card_bytes, caption, cat, article["title"], article["link"],
+        result = _publish_now(card_bytes, caption, cat, article["title"], article["link"],
                             is_breaking_flag=True, allow_social=allow_social,
                             rewritten=rewritten, summary=article.get("summary",""))
+        db_mark_status(article["id"], "posted" if result else "seen", posted=result)
+        return result
 
     # ── Dhivehi cards: generate Dhivehi text, queue for approval (card built on approval) ──
     if is_dv:
@@ -1473,7 +1668,9 @@ def post_article(article, seen, social_only=False, allow_social=True):
                 dv_text=dv_text, keyword=keyword, source=article.get("source","LOCAL"),
                 is_breaking=breaking, allow_social=allow_social
             )
+            approval_queue[key]["article_id"] = article["id"]
             _send_approval_card(key, approval_queue[key])
+            db_mark_status(article["id"], "queued")
             return True
         except Exception as e:
             log.error(f"Dhivehi approval queue: {e}")
@@ -1490,7 +1687,9 @@ def post_article(article, seen, social_only=False, allow_social=True):
         # Stash rewritten + summary for poll generation on approval
         approval_queue[key]["rewritten"] = rewritten
         approval_queue[key]["summary"] = article.get("summary","")
+        approval_queue[key]["article_id"] = article["id"]
         _send_approval_card(key, approval_queue[key])
+        db_mark_status(article["id"], "queued")
         return True
     except Exception as e:
         log.error(f"English approval queue: {e}")
@@ -2399,6 +2598,8 @@ def handle_updates():
                                         )
 
                                     if ok:
+                                        if item.get("article_id"):
+                                            db_mark_status(item["article_id"], "posted", posted=True)
                                         send_text(chat_id, f"✅ <b>{key.upper()}</b> posted to community!\n📰 {item['title'][:90]}", reply_to=msg_id, thread_id=thread_id)
                                         log.info(f"✅ {key} ({item['lang']}) posted by {first_name}")
                                     else:
@@ -2414,6 +2615,8 @@ def handle_updates():
                             key = text.strip()[8:].strip()
                             if key in approval_queue:
                                 rej_title = approval_queue[key].get("title","")[:70]
+                                if approval_queue[key].get("article_id"):
+                                    db_mark_status(approval_queue[key]["article_id"], "rejected")
                                 del approval_queue[key]
                                 persist_state()
                                 import random as _r
@@ -2421,6 +2624,44 @@ def handle_updates():
                                 log.info(f"🗑️ {key} rejected by {first_name}")
                             else:
                                 send_text(chat_id, f"Key <code>{key}</code> not found — maybe already posted or rejected.", reply_to=msg_id, thread_id=thread_id)
+
+                        # /stats — newsroom archive overview (DB-powered)
+                        elif text.strip().lower() in ["/stats", "/archive"]:
+                            if not DB_ENABLED:
+                                send_text(chat_id, "🗄️ Database not connected — archive stats unavailable. Running in JSON mode.", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                try:
+                                    total = db_execute("SELECT COUNT(*) FROM articles", fetch="one")
+                                    today = db_execute("SELECT COUNT(*) FROM articles WHERE found_at > NOW() - INTERVAL '24 hours'", fetch="one")
+                                    posted = db_execute("SELECT COUNT(*) FROM articles WHERE status='posted' AND found_at > NOW() - INTERVAL '24 hours'", fetch="one")
+                                    dupes = db_execute("SELECT COUNT(*) FROM articles WHERE status='duplicate' AND found_at > NOW() - INTERVAL '24 hours'", fetch="one")
+                                    by_cat = db_execute("""
+                                        SELECT category, COUNT(*) FROM articles
+                                        WHERE found_at > NOW() - INTERVAL '24 hours'
+                                        GROUP BY category ORDER BY COUNT(*) DESC LIMIT 6
+                                    """, fetch="all")
+                                    top_src = db_execute("""
+                                        SELECT source, COUNT(*) FROM articles
+                                        WHERE found_at > NOW() - INTERVAL '24 hours' AND source IS NOT NULL
+                                        GROUP BY source ORDER BY COUNT(*) DESC LIMIT 5
+                                    """, fetch="all")
+                                    msg_lines = ["🗞️ <b>Samuga Newsroom — Last 24h</b>\n"]
+                                    msg_lines.append(f"📥 Scanned: <b>{today[0] if today else 0}</b>")
+                                    msg_lines.append(f"✅ Posted: <b>{posted[0] if posted else 0}</b>")
+                                    msg_lines.append(f"🔁 Duplicates blocked: <b>{dupes[0] if dupes else 0}</b>")
+                                    msg_lines.append(f"📚 Total archive: <b>{total[0] if total else 0}</b>\n")
+                                    if by_cat:
+                                        msg_lines.append("<b>By category:</b>")
+                                        for c, n in by_cat:
+                                            msg_lines.append(f"  • {c}: {n}")
+                                    if top_src:
+                                        msg_lines.append("\n<b>Top sources:</b>")
+                                        for s, n in top_src:
+                                            msg_lines.append(f"  • {s}: {n}")
+                                    send_text(chat_id, "\n".join(msg_lines), reply_to=msg_id, thread_id=thread_id)
+                                except Exception as e:
+                                    log.error(f"/stats: {e}")
+                                    send_text(chat_id, f"❌ Stats error: {e}", reply_to=msg_id, thread_id=thread_id)
 
                         # /pending — list all cards waiting for approval
                         elif text.strip().lower() in ["/pending", "/queue", "/list"]:
@@ -2604,7 +2845,7 @@ def handle_updates():
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("🚀 Samuga News Bot v4.0 starting...")
+    log.info("🚀 Samuga News Bot v6.0 starting (PostgreSQL archive)...")
     # Install Noto fonts for Thaana/Dhivehi support
     if not os.path.exists("/usr/share/fonts/truetype/noto/NotoSansThaana-Bold.ttf") and not os.path.exists("/app/NotoSansThaana-Bold.ttf"):
         try:
@@ -2619,6 +2860,7 @@ if __name__ == "__main__":
     log.info("🌅 7AM Brief | 🌙 12AM Summary | 🌤️ 8AM/8PM Weather | 📊 Friday Digest")
     log.info("💬 Smart chat with history, Tavily search, Dhivehi support")
 
+    init_database()  # connect to Postgres (falls back to JSON if unavailable)
     restore_state()  # bring back dedup memory, daily counters, pending cards, analytics
     seen_on_start=load_seen()
     log.info(f"📚 Loaded {len(seen_on_start)} seen articles")
