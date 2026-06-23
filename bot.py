@@ -144,7 +144,7 @@ def expire_old_approvals():
             )
             if ok:
                 send_text(CORE_TEAM_CHAT_ID,
-                          f"⏰ <b>Auto-posted</b> (no approval in 30min):\n{item['title'][:80]}",
+                          f"⏰ <b>{k.upper()} Auto-posted</b> (no approval in 30min):\n📰 {item['title'][:80]}",
                           thread_id=CONTENT_LAB_THREAD_ID)
         except Exception as e:
             log.error(f"Auto-post {k} failed: {e}")
@@ -1148,19 +1148,21 @@ def _send_approval_card(key, item):
     cat = item["cat"]
     lang_tag = "🇲🇻 Dhivehi" if item["lang"] == "dv" else "🇬🇧 English"
     brk = "🚨 BREAKING " if item["is_breaking"] else ""
+    cat_emoji = {"LOCAL":"🇲🇻","FOOTBALL":"⚽","SPORTS":"🏅","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(cat,"📰")
+    # KEY first and BIG so stacked cards are instantly identifiable
     header = (
+        f"🔑 <b>{key.upper()}</b>  •  {cat_emoji} {cat}\n"
         f"{brk}<b>{lang_tag} Card — Review Needed</b>\n\n"
-        f"<b>Article:</b> {item['title']}\n\n"
+        f"<b>📰 {item['title']}</b>\n\n"
     )
     if item["lang"] == "dv" and item.get("dv_text"):
         header += f"<b>Bot wrote:</b>\n{item['dv_text']}\n\n"
     footer = (
-        f"<b>Key:</b> <code>{key}</code>\n\n"
-        f"✅ Approve: <code>/approved {key}</code>\n"
+        f"✅ <code>/approved {key}</code>\n"
     )
     if item["lang"] == "dv":
-        footer += f"✏️ Edit & post: <code>/approved {key} [corrected dhivehi text]</code>\n"
-    footer += f"❌ Reject: <code>/reject {key}</code>\n\n"
+        footer += f"✏️ <code>/approved {key} [corrected dhivehi text]</code>\n"
+    footer += f"❌ <code>/reject {key}</code>\n\n"
     # Tell the team the auto-post / expiry behaviour
     if item["lang"] == "en":
         footer += "<i>⏰ Auto-posts in 30 min if not reviewed</i>"
@@ -2133,7 +2135,7 @@ def handle_updates():
                                         )
 
                                     if ok:
-                                        send_text(chat_id, "✅ Posted to community!", reply_to=msg_id, thread_id=thread_id)
+                                        send_text(chat_id, f"✅ <b>{key.upper()}</b> posted to community!\n📰 {item['title'][:90]}", reply_to=msg_id, thread_id=thread_id)
                                         log.info(f"✅ {key} ({item['lang']}) posted by {first_name}")
                                     else:
                                         send_text(chat_id, "❌ Telegram post failed.", reply_to=msg_id, thread_id=thread_id)
@@ -2147,12 +2149,32 @@ def handle_updates():
                         elif text.strip().lower().startswith("/reject "):
                             key = text.strip()[8:].strip()
                             if key in approval_queue:
+                                rej_title = approval_queue[key].get("title","")[:70]
                                 del approval_queue[key]
                                 import random as _r
-                                send_text(chat_id, _r.choice(REJECT_RESPONSES), reply_to=msg_id, thread_id=thread_id)
+                                send_text(chat_id, f"❌ <b>{key.upper()}</b> rejected — {rej_title}\n\n{_r.choice(REJECT_RESPONSES)}", reply_to=msg_id, thread_id=thread_id)
                                 log.info(f"🗑️ {key} rejected by {first_name}")
                             else:
                                 send_text(chat_id, f"Key <code>{key}</code> not found — maybe already posted or rejected.", reply_to=msg_id, thread_id=thread_id)
+
+                        # /pending — list all cards waiting for approval
+                        elif text.strip().lower() in ["/pending", "/queue", "/list"]:
+                            if not approval_queue:
+                                send_text(chat_id, "📭 No cards waiting for approval right now.", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                lines = ["📋 <b>Cards waiting for approval:</b>\n"]
+                                now_ = datetime.utcnow()
+                                for k, v in approval_queue.items():
+                                    age_min = int((now_ - v["created_at"]).total_seconds() / 60)
+                                    lang_flag = "🇲🇻" if v["lang"] == "dv" else "🇬🇧"
+                                    if v["lang"] == "en":
+                                        left = max(0, 30 - age_min)
+                                        timing = f"auto-posts in {left}m"
+                                    else:
+                                        left = max(0, 120 - age_min)
+                                        timing = f"expires in {left}m"
+                                    lines.append(f"🔑 <b>{k.upper()}</b> {lang_flag} — {v['title'][:55]} <i>({timing})</i>")
+                                send_text(chat_id, "\n".join(lines), reply_to=msg_id, thread_id=thread_id)
 
                         # @SamugaNewsBot card [dhivehi text] — manual card creation
                         elif tagged and (
