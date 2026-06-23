@@ -521,9 +521,14 @@ def generate_card(text, source, timestamp, cat, bg_image=None, morning=False, _s
         f_tag=f_title=f_body=f_sm=ImageFont.load_default()
 
     draw.text((W-310,50),"t.me/samugacommunity",font=f_sm,fill=(200,230,255))
-    tag_y=590; tw=draw.textbbox((0,0),label,font=f_tag)[2]+26
+    # For Thaana cards use plain English label (no emoji, DejaVu renders it)
+    tag_label = {"LOCAL":"LOCAL NEWS","FOOTBALL":"FOOTBALL","WORLD":"WORLD NEWS",
+                 "DISASTER":"BREAKING NEWS","WEATHER":"WEATHER","TOURISM":"TOURISM",
+                 "SPORTS":"SPORTS"}.get(cat, cat) if has_thaana else label
+    f_tag_en = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+    tag_y=590; tw=draw.textbbox((0,0),tag_label,font=f_tag_en)[2]+26
     draw.rectangle([(50,tag_y),(50+tw,tag_y+34)],fill=accent)
-    draw.text((63,tag_y+6),label,font=f_tag,fill=WHITE if not morning else (0,0,0))
+    draw.text((63,tag_y+6),tag_label,font=f_tag_en,fill=WHITE if not morning else (0,0,0))
 
     def wrap(t,f,mw):
         words=t.split(); lines,cur=[],""
