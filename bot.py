@@ -25,33 +25,52 @@ BUFFER_TW_ID        = os.environ.get("BUFFER_TWITTER_ID", "")
 ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ── RSS Feeds ─────────────────────────────────────────────────────────────────
-RSS_FEEDS = [
-    {"url": "https://news.google.com/rss/search?q=maldives&hl=en-MV&gl=MV&ceid=MV:en", "cat": "LOCAL", "lang": "en"},
-    {"url": "https://see.mv/feed", "cat": "LOCAL", "lang": "en"},
-    {"url": "https://english.sun.mv/feed", "cat": "LOCAL", "lang": "en"},
-    {"url": "https://edition.mv/feed", "cat": "LOCAL", "lang": "en"},
-    {"url": "https://maldivesindependent.com/feed", "cat": "LOCAL", "lang": "en"},
-    {"url": "https://oneonline.mv/en/feed", "cat": "LOCAL", "lang": "en"},
-    {"url": "https://psmnews.mv/en/feed", "cat": "LOCAL", "lang": "en"},
-    {"url": "https://mihaaru.com/rss", "cat": "LOCAL", "lang": "dv"},
-    {"url": "https://avas.mv/feed", "cat": "LOCAL", "lang": "dv"},
-    {"url": "https://news.google.com/rss/search?q=world+cup+2026+football&hl=en&gl=US&ceid=US:en", "cat": "FOOTBALL", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=champions+league+football&hl=en&gl=US&ceid=US:en", "cat": "FOOTBALL", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=war+conflict+breaking&hl=en&gl=US&ceid=US:en", "cat": "WORLD", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=earthquake+tsunami+volcanic+eruption&hl=en&gl=US&ceid=US:en", "cat": "DISASTER", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=maldives+accident+incident+breaking&hl=en&gl=MV&ceid=MV:en", "cat": "DISASTER", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=maldives+weather+storm&hl=en&gl=US&ceid=US:en", "cat": "WEATHER", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=maldives+tourism+travel&hl=en&gl=US&ceid=US:en", "cat": "TOURISM", "lang": "en"},
+# ── RSS Feeds (v4 Strategy) ───────────────────────────────────────────────────
+# LOCAL (70%) — Maldivian sources, priority order
+LOCAL_FEEDS = [
+    # Tier 1 — Breaking/Crisis
+    {"url": "https://news.google.com/rss/search?q=maldives+breaking+incident+accident+arrest&hl=en-MV&gl=MV&ceid=MV:en", "cat": "DISASTER", "lang": "en"},
+    # Tier 2 — Politics/Economy
+    {"url": "https://see.mv/feed",                  "cat": "LOCAL", "lang": "en"},
+    {"url": "https://english.sun.mv/feed",           "cat": "LOCAL", "lang": "en"},
+    {"url": "https://edition.mv/feed",               "cat": "LOCAL", "lang": "en"},
+    {"url": "https://maldivesindependent.com/feed",  "cat": "LOCAL", "lang": "en"},
+    {"url": "https://oneonline.mv/en/feed",          "cat": "LOCAL", "lang": "en"},
+    {"url": "https://psmnews.mv/en/feed",            "cat": "LOCAL", "lang": "en"},
+    {"url": "https://mihaaru.com/rss",               "cat": "LOCAL", "lang": "dv"},
+    {"url": "https://avas.mv/feed",                  "cat": "LOCAL", "lang": "dv"},
+    {"url": "https://news.google.com/rss/search?q=maldives+politics+parliament+government&hl=en-MV&gl=MV&ceid=MV:en", "cat": "LOCAL", "lang": "en"},
+    {"url": "https://news.google.com/rss/search?q=maldives+economy+finance+business&hl=en-MV&gl=MV&ceid=MV:en",       "cat": "LOCAL", "lang": "en"},
 ]
+
+# SPORTS (10%) — Maldives sports first, then major international
+SPORTS_FEEDS = [
+    {"url": "https://news.google.com/rss/search?q=maldives+football+sports&hl=en-MV&gl=MV&ceid=MV:en", "cat": "SPORTS", "lang": "en"},
+    {"url": "https://news.google.com/rss/search?q=world+cup+2026+results&hl=en&gl=US&ceid=US:en",       "cat": "SPORTS", "lang": "en"},
+]
+
+# WORLD (10%) — Only major international that affects Maldives or region
+WORLD_FEEDS = [
+    {"url": "https://news.google.com/rss/search?q=war+conflict+crisis+2026&hl=en&gl=US&ceid=US:en",     "cat": "WORLD", "lang": "en"},
+    {"url": "https://news.google.com/rss/search?q=earthquake+tsunami+disaster&hl=en&gl=US&ceid=US:en",  "cat": "DISASTER", "lang": "en"},
+]
+
+# LIFESTYLE (10%)
+LIFESTYLE_FEEDS = [
+    {"url": "https://news.google.com/rss/search?q=maldives+tourism+travel+resort&hl=en-MV&gl=MV&ceid=MV:en", "cat": "TOURISM", "lang": "en"},
+    {"url": "https://news.google.com/rss/search?q=maldives+weather+storm&hl=en-MV&gl=MV&ceid=MV:en",         "cat": "WEATHER", "lang": "en"},
+]
+
+RSS_FEEDS = LOCAL_FEEDS + SPORTS_FEEDS + WORLD_FEEDS + LIFESTYLE_FEEDS
 
 CAT_CONFIG = {
     "LOCAL":   {"label": "🇲🇻  LOCAL NEWS",   "color": (41,171,226)},
-    "FOOTBALL":{"label": "⚽  FOOTBALL",       "color": (34,180,80)},
+    "SPORTS":  {"label": "🏅  SPORTS",         "color": (34,180,80)},
     "WORLD":   {"label": "🌍  WORLD NEWS",     "color": (220,80,60)},
     "DISASTER":{"label": "🚨  DISASTER ALERT", "color": (220,120,0)},
     "WEATHER": {"label": "🌤️  WEATHER",        "color": (100,180,240)},
     "TOURISM": {"label": "✈️  TOURISM",        "color": (160,80,220)},
-    "SPORTS":  {"label": "🏅  SPORTS",          "color": (0,180,100)},
+    "FOOTBALL":{"label": "🏅  SPORTS",         "color": (34,180,80)},  # alias for SPORTS
 }
 
 # ── Core Team Session Context (in-memory only, clears on restart) ────────────
@@ -98,10 +117,17 @@ CORE_TEAM_PROACTIVE_TRIGGERS = [
 ]
 
 BREAKING_KEYWORDS = [
-    "breaking","urgent","alert","killed","dead","dies","explosion","crash","attack",
-    "arrested","emergency","disaster","flood","fire","missing","tsunami","earthquake",
-    "accident","murder","bomb","resign","crisis","leaked","scandal","raid","collapse",
-    "shot","war","strike","invasion","hostage","trapped","sinking"
+    "killed","dead","dies","murder","shot","stabbed","explosion","bomb","attack",
+    "tsunami","earthquake","flood","disaster","sinking","collapsed","hostage",
+    "emergency","missing person","arrested","raided","fire broke","crash landed"
+]
+
+# Keywords that should NEVER be breaking news
+BREAKING_BLACKLIST = [
+    "world cup","football","cricket","sports","fifa","champions league","premier league","tourism","resort","hotel","travel",
+    "award","ranking","luxury","boutique","hospitality","destination","lagoon",
+    "civil war","squad","team","player","match","game","season","transfer",
+    "economy","business","market","price","investment","opening","launch","event"
 ]
 
 # ── Storage ───────────────────────────────────────────────────────────────────
@@ -169,7 +195,24 @@ def is_fresh(entry, hours=24):
     return True
 
 def is_breaking(title, summary="", cat=""):
-    return any(kw in (title+" "+summary).lower() for kw in BREAKING_KEYWORDS) or cat=="DISASTER"
+    text = (title + " " + summary).lower()
+
+    # Never breaking for these categories
+    if cat in ["FOOTBALL", "TOURISM", "WEATHER", "SPORTS"]: return False
+
+    # Check blacklist first — if any blacklist term present, not breaking
+    if any(bl in text for bl in BREAKING_BLACKLIST): return False
+
+    # Must match a real breaking keyword
+    if not any(kw in text for kw in BREAKING_KEYWORDS): return False
+
+    # For LOCAL category — must be Maldives related
+    if cat == "LOCAL":
+        mv_terms = ["maldives","male","malé","dhivehi","maldivian","raajje","atoll",
+                    "police","court","majlis","minister","president","island"]
+        if not any(t in text for t in mv_terms): return False
+
+    return True
 
 last_regular_post_time = None
 def can_post_regular():
@@ -196,7 +239,7 @@ def can_post_social():
     today = mvt_now().date()
     if social_post_counts["date"] != today:
         social_post_counts = {"date": today, "count": 0}
-    limit = 30 if is_day_social() else 5
+    limit = 20 if is_day_social() else 3
     return social_post_counts["count"] < limit
 
 def increment_social_count():
@@ -205,7 +248,7 @@ def increment_social_count():
     if social_post_counts["date"] != today:
         social_post_counts = {"date": today, "count": 0}
     social_post_counts["count"] += 1
-    log.info(f"📊 Social posts today: {social_post_counts['count']} ({'day' if is_day_social() else 'night'} limit: {30 if is_day_social() else 5})")
+    log.info(f"📊 Social posts today: {social_post_counts['count']} ({'day' if is_day_social() else 'night'} limit: {20 if is_day_social() else 3})")
 
 # ── Gemini Translate ──────────────────────────────────────────────────────────
 def gemini_translate(text):
@@ -219,8 +262,47 @@ def gemini_translate(text):
     return text
 
 # ── Fetch News ────────────────────────────────────────────────────────────────
+def fetch_mvcrisis():
+    """Scrape MvCrisis public Telegram channel for breaking news"""
+    try:
+        resp = requests.get("https://t.me/s/mvcrisis", timeout=10,
+                           headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code != 200: return []
+        import re as _re, hashlib
+        # Extract message texts from Telegram web view
+        texts = _re.findall(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', resp.text, _re.DOTALL)
+        articles = []
+        for raw in texts[:15]:
+            # Strip HTML tags
+            text = _re.sub(r"<[^>]+>", "", raw).strip()
+            text = text.replace("&amp;","&").replace("&#39;","'").replace("&quot;",'"')
+            if len(text) < 15: continue
+            art_id = "mvc_" + hashlib.md5(text[:60].encode()).hexdigest()[:8]
+            # Detect language
+            lang = "dv" if any("ހ" <= ch <= "޿" for ch in text) else "en"
+            articles.append({
+                "id": art_id,
+                "title": text[:150],
+                "summary": text,
+                "link": "https://t.me/mvcrisis",
+                "source": "MvCrisis",
+                "cat": "DISASTER",
+                "lang": lang,
+                "published": datetime.utcnow()
+            })
+        log.info(f"📡 MvCrisis: {len(articles)} posts fetched")
+        return articles
+    except Exception as e:
+        log.error(f"MvCrisis fetch: {e}")
+        return []
+
 def fetch_news():
     articles, seen_titles = [], set()
+    # MvCrisis first — #1 Maldives breaking news source
+    for a in fetch_mvcrisis():
+        if a["title"] not in seen_titles:
+            seen_titles.add(a["title"])
+            articles.append(a)
     for fc in RSS_FEEDS:
         try:
             feed = feedparser.parse(fc["url"])
@@ -326,7 +408,7 @@ def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
         "LOCAL":   {"label": "ލޯކަލް ނިއުސް", "color": (0, 180, 255)},
         "DISASTER":{"label": "ހާދިސާ",        "color": (220, 50, 50)},
         "WORLD":   {"label": "ދުނިޔެ",         "color": (50, 180, 100)},
-        "FOOTBALL":{"label": "ފުޓްބޯޅަ",      "color": (255, 140, 0)},
+        "FOOTBALL":{"label": "ކުޅިވަރު",       "color": (34, 180, 80)},
         "TOURISM": {"label": "ފަތުރުވެރިކަން","color": (160, 80, 220)},
         "WEATHER": {"label": "މޫސުން",         "color": (0, 200, 200)},
         "SPORTS":  {"label": "ކުޅިވަރު",       "color": (0, 180, 100)},
@@ -753,7 +835,8 @@ def resolve_url(url):
 def post_to_buffer(image_url, caption, channel_id, metadata=None):
     """Post to a single Buffer channel. Returns True on success."""
     if not BUFFER_TOKEN or not channel_id: return False
-    clean = re.sub(r'<[^>]+>', '', caption).replace('&amp;', '&').strip()
+    clean = re.sub(r'<[^>]+>', '', caption)
+    clean = clean.replace('&amp;', '&').replace('&#039;', "'").replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>').strip()
 
     query = """
 mutation CreatePost($input: CreatePostInput!) {
@@ -805,7 +888,7 @@ def post_to_social(img_buf, caption):
         log.warning("Social: no BUFFER_TOKEN, skipping")
         return
     if not can_post_social():
-        limit = 30 if is_day_social() else 5
+        limit = 20 if is_day_social() else 3
         log.info(f"📵 Social limit reached ({30 if is_day_social() else 5} posts {'day' if is_day_social() else 'night'}) — skipping")
         return
     try:
@@ -816,7 +899,8 @@ def post_to_social(img_buf, caption):
             return
 
         # Strip HTML for all social platforms
-        clean = re.sub(r'<[^>]+>', '', caption).replace('&amp;', '&').strip()
+        clean = re.sub(r'<[^>]+>', '', caption)
+        clean = clean.replace('&amp;', '&').replace('&#039;', "'").replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>').strip()
 
         # Extract and resolve article URL (fixes Google News redirects)
         link_match = re.search(r"href='([^']+)'", caption)
@@ -956,23 +1040,33 @@ def score_article(a):
     title_lower = a["title"].lower()
     summary_lower = a.get("summary","").lower()
     cat = a["cat"]
-    # Category priority
-    if cat == "LOCAL": score += 50
-    elif cat == "DISASTER": score += 40
+    # Category priority — LOCAL is king
+    if cat == "LOCAL": score += 80
+    elif cat == "DISASTER": score += 70
     elif cat == "WEATHER": score += 30
     elif cat == "TOURISM": score += 20
     elif cat == "WORLD": score += 10
-    elif cat == "FOOTBALL": score += 5
+    elif cat in ["FOOTBALL", "SPORTS"]: score += 2  # Very low priority
     # Maldives keywords boost
-    mv_kws = ["maldives","male","dhivehi","raajje","mvr","atoll","island","resort","gaa",
-              "parliament","majlis","president","minister","police","court","malé"]
+    mv_kws = ["maldives","male","dhivehi","raajje","mvr","atoll","island","gaa",
+              "parliament","majlis","president","minister","police","court","malé",
+              "hulhumale","addu","fuvahmulah","laamu","economy","rufiyaa"]
     for kw in mv_kws:
-        if kw in title_lower or kw in summary_lower: score += 15
+        if kw in title_lower or kw in summary_lower: score += 20
+    # Sports penalty — only post if really relevant
+    if cat in ["FOOTBALL", "SPORTS"]:
+        maldives_sports = ["maldives","dhivehi","raajje","team maldives","national team"]
+        if not any(kw in title_lower + summary_lower for kw in maldives_sports):
+            score -= 30  # Heavy penalty for non-Maldives sports
+    # World news — only if Maldives related
+    if cat == "WORLD":
+        if not any(kw in title_lower + summary_lower for kw in ["maldives","indian ocean","south asia","economy"]):
+            score -= 20
     # Breaking boost
-    if is_breaking(a["title"], a.get("summary",""), cat): score += 60
+    if is_breaking(a["title"], a.get("summary",""), cat): score += 80
     return score
 
-def run_job(social_only=False):
+def run_job(social_only=False, breaking_only=False):
     h=get_mvt_hour()
     log.info(f"🕐 MVT {h:02d}:xx | {'SOCIAL ONLY' if social_only else 'DAY' if is_day_mode() else 'NIGHT'}")
     seen=load_seen(); articles=fetch_news()
@@ -986,7 +1080,11 @@ def run_job(social_only=False):
     fresh.sort(key=score_article, reverse=True)
 
     breaking_articles = [a for a in fresh if is_breaking(a["title"], a.get("summary",""), a["cat"])]
-    regular_articles  = [a for a in fresh if not is_breaking(a["title"], a.get("summary",""), a["cat"])]
+    regular_articles  = [] if breaking_only else [a for a in fresh if not is_breaking(a["title"], a.get("summary",""), a["cat"])]
+
+    if breaking_only and not breaking_articles:
+        log.info("🌙 Night mode: no breaking news found")
+        return
 
     log.info(f"🔴 {len(breaking_articles)} breaking | 🟡 {len(regular_articles)} regular")
 
@@ -1003,14 +1101,20 @@ def run_job(social_only=False):
         time.sleep(10)
 
     # Then best regular articles (dedupe by category — one per cat)
+    # Sports max 1 per day, World only if Maldives relevant
     seen_cats = set()
+    sports_posted_today = 0
     for a in regular_articles:
-        if a["cat"] in seen_cats: continue
-        seen_cats.add(a["cat"])
+        cat = a["cat"]
+        if cat in seen_cats: continue
+        # Max 1 sports post per run
+        if cat in ["SPORTS", "FOOTBALL"] and sports_posted_today >= 1: continue
+        seen_cats.add(cat)
         can_social = social_posted < MAX_SOCIAL_PER_RUN
         if post_article(a, seen, social_only, allow_social=can_social):
             posted += 1
             social_posted += 1
+            if cat in ["SPORTS", "FOOTBALL"]: sports_posted_today += 1
         if posted > 1: time.sleep(300)
 
     log.info(f"✅ Posted {posted} articles ({social_posted} to socials).")
@@ -1034,9 +1138,9 @@ def breaking_news_check():
 
 def scheduled_check():
     h=get_mvt_hour()
-    if not is_day_mode() and h not in [18,21,0,3,6]:
-        log.info(f"💤 Night (MVT {h:02d}:xx) — social only")
-        run_job(social_only=True); return
+    if not is_day_mode():
+        log.info(f"🌙 Night mode (MVT {h:02d}:xx) — breaking news only")
+        run_job(breaking_only=True); return
     run_job()
 
 # ── Morning Brief (7AM MVT) ───────────────────────────────────────────────────
@@ -1916,7 +2020,7 @@ if __name__ == "__main__":
     threading.Thread(target=handle_updates, daemon=True).start()
 
     scheduler=BlockingScheduler(timezone="UTC")
-    scheduler.add_job(scheduled_check, "interval", minutes=30)
+    scheduler.add_job(scheduled_check, "interval", minutes=15)
     # Breaking news fast check every 5 min (LOCAL/DISASTER only)
     scheduler.add_job(breaking_news_check, "interval", minutes=5)
     # Morning brief 7AM MVT = 2AM UTC
