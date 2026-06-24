@@ -4230,6 +4230,7 @@ def handle_updates():
                             # The text comes from the photo caption or message, minus the command
                             raw_text = text  # original full text including caption
                             # Remove the bot mention and ALL command variants
+                            # Do this BEFORE any other processing
                             cmd_variants = [
                                 "create card and post to coreteam",
                                 "create card and post to core team",
@@ -4246,7 +4247,7 @@ def handle_updates():
                                     raw_text = raw_text[:idx].strip()
                                     raw_lower = raw_text.lower()
                                     break
-                            # Remove bot mention
+                            # Remove bot mention (anywhere in text)
                             raw_text = re.sub(r"@\w+", "", raw_text).strip()
                             raw_text = raw_text.strip()
 
@@ -4332,21 +4333,23 @@ def handle_updates():
                                     )
 
                                     posted = []
+                                    _social_fired = False
 
-                                    if destination in ["community", "all"]:
+                                    if destination == "community":
                                         card.seek(0)
                                         if send_to_telegram(card, full_caption):
                                             posted.append("Community ✅")
 
-                                    if destination == "coreteam":
+                                    elif destination == "coreteam":
                                         card.seek(0)
                                         if send_photo(CORE_TEAM_CHAT_ID, card, full_caption, thread_id=CONTENT_LAB_THREAD_ID):
                                             posted.append("Content Lab ✅")
 
-                                    if destination == "all":
-                                        # ── Confirmation gate before firing to socials ──
-                                        # Card already posted to Telegram above.
-                                        # Store card + caption and ask for /confirm.
+                                    elif destination == "all":
+                                        # ── PREVIEW + CONFIRM gate ────────────────────────
+                                        # Do NOT post anywhere public yet.
+                                        # Send the card as a PREVIEW to the core team only,
+                                        # then wait for /confirm (posts everywhere) or /cancel.
                                         card_bytes_stored = card.getvalue()
                                         _pending_manual_post.clear()
                                         _pending_manual_post.update({
@@ -4357,19 +4360,26 @@ def handle_updates():
                                             "first_name":   first_name,
                                             "created_at":   utcnow(),
                                         })
-                                        posted.append("Community ✅")
-                                        send_text(chat_id,
-                                            f"✅ Posted to <b>Community</b>.\n\n"
-                                            f"📲 Ready to post to <b>Facebook + Instagram + Twitter</b>.\n"
-                                            f"Type <code>/confirm</code> to fire to all socials, or ignore to skip.",
-                                            reply_to=msg_id, thread_id=thread_id)
-                                        log.info(f"🃏 Manual card pending social confirm by {first_name}")
+                                        # Send preview card to core team
+                                        preview = io.BytesIO(card_bytes_stored)
+                                        preview_caption = (
+                                            f"👀 <b>PREVIEW — not posted yet</b>\n\n"
+                                            f"{full_caption}\n\n"
+                                            f"━━━━━━━━━━━━━━\n"
+                                            f"📲 This will post to <b>Telegram Community + Facebook + Instagram + X</b>.\n"
+                                            f"✅ <code>/confirm</code> to post everywhere\n"
+                                            f"❌ <code>/cancel</code> to discard"
+                                        )
+                                        send_photo(chat_id, preview, preview_caption, thread_id=thread_id)
+                                        log.info(f"🃏 Manual card PREVIEW sent to core team by {first_name} — awaiting /confirm")
+                                        _social_fired = True  # block fallthrough
 
-                                    if posted and destination != "all":
-                                        send_text(chat_id, "✅ Posted to: " + ", ".join(posted), reply_to=msg_id, thread_id=thread_id)
-                                        log.info(f"✅ Manual card posted to: {posted}")
-                                    elif not posted and destination != "all":
-                                        send_text(chat_id, "❌ Failed to post.", reply_to=msg_id, thread_id=thread_id)
+                                    if not _social_fired:
+                                        if posted:
+                                            send_text(chat_id, "✅ Posted to: " + ", ".join(posted), reply_to=msg_id, thread_id=thread_id)
+                                            log.info(f"✅ Manual card posted to: {posted}")
+                                        else:
+                                            send_text(chat_id, "❌ Failed to post.", reply_to=msg_id, thread_id=thread_id)
 
                                 except Exception as e:
                                     log.error(f"Manual card: {e}")
@@ -4385,43 +4395,65 @@ def handle_updates():
                             else:
                                 send_text(chat_id, "Send it like this: /read [paste your content here]", reply_to=msg_id, thread_id=thread_id)
 
-                        # /confirm — fire pending manual card to Facebook + Instagram + Twitter
+                        # /confirm — post pending preview card EVERYWHERE (Telegram + FB + IG + X)
                         elif text.strip().lower() in ["/confirm"]:
                             if not _pending_manual_post:
                                 send_text(chat_id,
-                                    "No card waiting for confirmation. "
+                                    "Nothing waiting to confirm. "
                                     "Use <code>create card and post</code> first.",
                                     reply_to=msg_id, thread_id=thread_id)
                             else:
-                                # Check it hasn't gone stale (10 min window)
                                 age = (utcnow() - _pending_manual_post["created_at"]).total_seconds()
                                 if age > 600:
                                     _pending_manual_post.clear()
                                     send_text(chat_id,
-                                        "⏰ That card expired (10 min window). "
+                                        "⏰ That preview expired (10 min window). "
                                         "Create a new one with <code>create card and post</code>.",
                                         reply_to=msg_id, thread_id=thread_id)
                                 else:
                                     try:
-                                        buf_social = io.BytesIO(_pending_manual_post["card_bytes"])
-                                        send_text(chat_id, f"🚀 Firing to FB + IG + Twitter... ⏳",
+                                        cap = _pending_manual_post["full_caption"]
+                                        cbytes = _pending_manual_post["card_bytes"]
+                                        send_text(chat_id, "🚀 Posting to all platforms... ⏳",
                                                   reply_to=msg_id, thread_id=thread_id)
+
+                                        done = []
+                                        # 1) Telegram community
+                                        tg_buf = io.BytesIO(cbytes)
+                                        if send_to_telegram(tg_buf, cap):
+                                            done.append("Telegram ✅")
+
+                                        # 2) Socials (FB + IG + Twitter) in background
+                                        social_buf = io.BytesIO(cbytes)
                                         threading.Thread(
                                             target=post_to_social,
-                                            args=(buf_social, _pending_manual_post["full_caption"]),
+                                            args=(social_buf, cap),
                                             daemon=True
                                         ).start()
-                                        who = _pending_manual_post.get("first_name", "Someone")
+                                        done.append("FB + IG + X ✅")
+
                                         _pending_manual_post.clear()
                                         send_text(chat_id,
-                                            f"✅ <b>Confirmed by {first_name}</b> — posted to FB + IG + Twitter.\n"
-                                            f"📡 All platforms done.",
+                                            f"✅ <b>Confirmed by {first_name}</b>\n"
+                                            f"📡 Posted to: {', '.join(done)}",
                                             reply_to=msg_id, thread_id=thread_id)
-                                        log.info(f"✅ Manual card confirmed by {first_name} — fired to socials")
+                                        log.info(f"✅ Manual card confirmed by {first_name} — posted everywhere")
                                     except Exception as e:
                                         log.error(f"/confirm: {e}")
-                                        send_text(chat_id, f"❌ Error firing to socials: {e}",
+                                        send_text(chat_id, f"❌ Error posting: {e}",
                                                   reply_to=msg_id, thread_id=thread_id)
+
+                        # /cancel — discard the pending preview card
+                        elif text.strip().lower() in ["/cancel"]:
+                            if not _pending_manual_post:
+                                send_text(chat_id, "Nothing to cancel.",
+                                          reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                _pending_manual_post.clear()
+                                send_text(chat_id,
+                                    f"❌ <b>Cancelled by {first_name}</b> — card discarded, nothing posted.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                                log.info(f"❌ Manual card cancelled by {first_name}")
 
                         # Respond only when directly tagged — no more jumping in proactively
                         elif tagged:
