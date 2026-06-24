@@ -27,6 +27,12 @@ BUFFER_TOKEN        = os.environ.get("BUFFER_ACCESS_TOKEN", "")
 BUFFER_FB_ID        = os.environ.get("BUFFER_FACEBOOK_ID", "")
 BUFFER_IG_ID        = os.environ.get("BUFFER_INSTAGRAM_ID", "")
 BUFFER_TW_ID        = os.environ.get("BUFFER_TWITTER_ID", "")
+# Meta Graph API (Phase 2.5) — reads FB + IG engagement off your own page
+META_PAGE_TOKEN     = os.environ.get("META_PAGE_TOKEN", "")
+META_PAGE_ID        = os.environ.get("META_PAGE_ID", "")
+META_APP_SECRET     = os.environ.get("META_APP_SECRET", "")
+META_IG_ID          = os.environ.get("META_IG_ID", "")  # optional; auto-resolved if blank
+META_API_VER        = os.environ.get("META_API_VER", "v21.0")
 
 ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -293,7 +299,9 @@ def init_database():
                         found_at        TIMESTAMPTZ DEFAULT NOW(),
                         posted_at       TIMESTAMPTZ,
                         tg_message_id   BIGINT,
-                        tg_views        INTEGER DEFAULT 0
+                        tg_views        INTEGER DEFAULT 0,
+                        meta_engagement INTEGER DEFAULT 0,   -- FB+IG reactions/comments/shares/likes
+                        match_key       TEXT                 -- normalized headline for caption matching
                     );
                 """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_found_at ON articles(found_at);")
@@ -308,6 +316,31 @@ def init_database():
                         updated_at TIMESTAMPTZ DEFAULT NOW()
                     );
                 """)
+                # Phase 2: learning table — records every team action so the bot
+                # can learn from approvals/rejections over time.
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS learning (
+                        id              SERIAL PRIMARY KEY,
+                        article_id      TEXT,
+                        action          TEXT,          -- approved | rejected | edited | auto_posted
+                        member          TEXT,          -- who did it (first_name)
+                        category        TEXT,
+                        source          TEXT,
+                        score           INTEGER,
+                        theme           TEXT,          -- trend theme if any
+                        original_caption TEXT,
+                        final_caption    TEXT,
+                        lang            TEXT,
+                        created_at      TIMESTAMPTZ DEFAULT NOW()
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_learning_action ON learning(action);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_learning_theme  ON learning(theme);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_msgid  ON articles(tg_message_id);")
+                # Phase 2.5: add Meta columns to an already-existing articles table (no-op if present)
+                cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS meta_engagement INTEGER DEFAULT 0;")
+                cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS match_key TEXT;")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_matchkey ON articles(match_key);")
             conn.commit()
         finally:
             _db_pool.putconn(conn)
@@ -369,6 +402,84 @@ def db_mark_status(article_id, status, posted=False):
         db_execute("UPDATE articles SET status=%s, posted_at=NOW() WHERE id=%s", (status, article_id))
     else:
         db_execute("UPDATE articles SET status=%s WHERE id=%s", (status, article_id))
+
+# ── Phase 2: bot_kv helpers + learning logger ────────────────────────────────
+def kv_get(key, default=None):
+    """Read a JSON value from bot_kv. Returns default if missing or DB off."""
+    if not DB_ENABLED:
+        return default
+    row = db_execute("SELECT value FROM bot_kv WHERE key=%s", (key,), fetch="one")
+    if row and row[0] is not None:
+        return row[0]   # psycopg2 returns JSONB already parsed to dict/list
+    return default
+
+def kv_set(key, value):
+    """Write a JSON value to bot_kv (upsert). No-op if DB off."""
+    if not DB_ENABLED:
+        return
+    db_execute("""
+        INSERT INTO bot_kv (key, value, updated_at)
+        VALUES (%s, %s::jsonb, NOW())
+        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+    """, (key, json.dumps(value)))
+
+def db_log_learning(article_id, action, member="", category="", source="",
+                    score=0, theme="", original_caption="", final_caption="", lang="en"):
+    """Record a team action so the bot can learn from approvals/rejections."""
+    if not DB_ENABLED:
+        return
+    db_execute("""
+        INSERT INTO learning (article_id, action, member, category, source, score,
+                              theme, original_caption, final_caption, lang)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        article_id, action, (member or "")[:60], (category or "")[:40],
+        (source or "")[:80], score, (theme or "")[:40],
+        (original_caption or "")[:1000], (final_caption or "")[:1000], lang
+    ))
+
+def db_set_article_message(article_id, message_id):
+    """Store the Telegram message_id for an article so we can fetch its views later."""
+    if not DB_ENABLED or not article_id or not message_id:
+        return
+    db_execute("UPDATE articles SET tg_message_id=%s WHERE id=%s", (message_id, article_id))
+
+def _caption_match_key(text):
+    """
+    Normalize a headline/caption to a stable key for matching the same story
+    across Telegram, Facebook and Instagram. Lowercase, strip punctuation/emoji,
+    collapse whitespace, take the first ~60 chars of meaningful words.
+    """
+    if not text:
+        return ""
+    import re as _re, unicodedata as _ud
+    t = text.lower()
+    # Drop the boilerplate Samuga tagline so it doesn't dominate the key
+    for junk in ["samuga media", "samuga creative", "@samugacommunity",
+                 "ސަމޫގާ މީޑިއާ", "📡", "🇲🇻"]:
+        t = t.replace(junk.lower(), " ")
+    # Fold accents to plain ASCII per-character so "Malé"->"male", but keep
+    # thaana characters exactly in place (NFKD on thaana would corrupt them).
+    out = []
+    for ch in t:
+        if "\u0780" <= ch <= "\u07bf":
+            out.append(ch)                       # thaana — keep as-is
+        else:
+            folded = _ud.normalize("NFKD", ch).encode("ascii", "ignore").decode("ascii")
+            out.append(folded)
+    t = "".join(out)
+    # Keep latin letters, digits, thaana; drop everything else
+    t = _re.sub(r"[^a-z0-9\u0780-\u07bf ]", " ", t)
+    t = _re.sub(r"\s+", " ", t).strip()
+    return t[:60]
+
+def db_set_article_matchkey(article_id, title):
+    """Store the normalized match key for an article (for FB/IG caption matching)."""
+    if not DB_ENABLED or not article_id:
+        return
+    mk = _caption_match_key(title)
+    if mk:
+        db_execute("UPDATE articles SET match_key=%s WHERE id=%s", (mk, article_id))
 
 # ── TREND DETECTOR (v6 Intelligence) ─────────────────────────────────────────
 # Reads the Postgres archive, extracts topics from article titles, counts how
@@ -1411,12 +1522,19 @@ def generate_card(text, source, timestamp, cat, bg_image=None, morning=False, _s
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def send_to_telegram(buf, caption):
+    """Post a photo to the community channel. Returns message_id (int) or False."""
     try:
-        resp=requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-            data={"chat_id":TELEGRAM_CHANNEL_ID,"caption":caption,"parse_mode":"HTML"},
-            files={"photo":("card.png",buf,"image/png")},timeout=30)
-        resp.raise_for_status(); log.info("✅ Posted to Telegram"); return True
-    except Exception as e: log.error(f"Telegram: {e}"); return False
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+            data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"},
+            files={"photo": ("card.png", buf, "image/png")}, timeout=30)
+        resp.raise_for_status()
+        mid = resp.json().get("result", {}).get("message_id")
+        log.info(f"✅ Posted to Telegram (msg {mid})")
+        return mid or True
+    except Exception as e:
+        log.error(f"Telegram: {e}")
+        return False
 
 def download_telegram_photo(photo_list):
     """Download the highest quality photo from a Telegram photo array"""
@@ -1741,10 +1859,11 @@ def _build_card_and_caption(article):
 
 
 def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_social,
-                 rewritten="", summary="", report_to=None):
+                 rewritten="", summary="", report_to=None, article_id=None):
     """
     Post a card to Telegram + socials. Returns (tg_ok, social_results).
     report_to: optional (chat_id, thread_id) to send a per-platform status report.
+    article_id: if given, the Telegram message_id is stored for later view tracking.
     """
     global last_regular_post_time
     buf = io.BytesIO(card_bytes)
@@ -1757,6 +1876,10 @@ def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_
 
     if tg_ok:
         remember_post(title, cat, ts)
+        if isinstance(tg_ok, int) and article_id:        # Phase 2: store msg id
+            db_set_article_message(article_id, tg_ok)
+        if article_id:                                    # Phase 2.5: store match key for FB/IG
+            db_set_article_matchkey(article_id, title)
         if not is_breaking_flag:
             last_regular_post_time = utcnow()
             persist_state()
@@ -1880,11 +2003,12 @@ def post_article(article, seen, social_only=False, allow_social=True):
     # ── English BREAKING: publish instantly, no approval ──
     if breaking and not is_dv:
         card_bytes, caption, rewritten, keyword = _build_card_and_caption(article)
-        result = _publish_now(card_bytes, caption, cat, article["title"], article["link"],
+        tg_ok, _social = _publish_now(card_bytes, caption, cat, article["title"], article["link"],
                             is_breaking_flag=True, allow_social=allow_social,
-                            rewritten=rewritten, summary=article.get("summary",""))
-        db_mark_status(article["id"], "posted" if result else "seen", posted=result)
-        return result
+                            rewritten=rewritten, summary=article.get("summary",""),
+                            article_id=article["id"])
+        db_mark_status(article["id"], "posted" if tg_ok else "seen", posted=bool(tg_ok))
+        return bool(tg_ok)
 
     # ── Dhivehi cards: generate Dhivehi text, queue for approval (card built on approval) ──
     if is_dv:
@@ -1900,6 +2024,9 @@ def post_article(article, seen, social_only=False, allow_social=True):
                 is_breaking=breaking, allow_social=allow_social
             )
             approval_queue[key]["article_id"] = article["id"]
+            approval_queue[key]["_cluster_size"] = article.get("_cluster_size", 1)
+            approval_queue[key]["_trend_theme"] = article.get("_trend_theme", "")
+            approval_queue[key]["summary"] = article.get("summary", "")
             _send_approval_card(key, approval_queue[key])
             db_mark_status(article["id"], "queued")
             return True
@@ -1919,6 +2046,8 @@ def post_article(article, seen, social_only=False, allow_social=True):
         approval_queue[key]["rewritten"] = rewritten
         approval_queue[key]["summary"] = article.get("summary","")
         approval_queue[key]["article_id"] = article["id"]
+        approval_queue[key]["_cluster_size"] = article.get("_cluster_size", 1)
+        approval_queue[key]["_trend_theme"] = article.get("_trend_theme", "")
         _send_approval_card(key, approval_queue[key])
         db_mark_status(article["id"], "queued")
         return True
@@ -1975,7 +2104,109 @@ def score_article(a):
     cluster_size = a.get("_cluster_size", 1)
     if cluster_size >= 2:
         score += min((cluster_size - 1) * 12, 36)
+    # ── Engagement nudge (Phase 2) — ±LEARN_CAP, INERT until /learning on ──
+    try:
+        eng_pts, eng_theme = topic_weight_for(a["title"], a.get("summary",""))
+        if eng_pts:
+            score += eng_pts
+            a["_engagement_pts"] = eng_pts
+            a["_engagement_theme"] = eng_theme
+    except Exception as e:
+        log.debug(f"engagement nudge: {e}")
     return score
+
+def score_breakdown(a):
+    """
+    Return (total, [(label, points), ...]) explaining how an article scored.
+    Mirrors score_article() so the team can see exactly why a story ranked.
+    """
+    items = []
+    title_lower = a["title"].lower()
+    summary_lower = a.get("summary", "").lower()
+    text = title_lower + " " + summary_lower
+    cat = a["cat"]
+
+    cat_base = {"LOCAL": 80, "DISASTER": 70, "WEATHER": 30, "TOURISM": 20,
+                "WORLD": 10, "FOOTBALL": 2, "SPORTS": 2}.get(cat, 0)
+    if cat_base:
+        items.append((f"Category ({cat})", cat_base))
+
+    mv_kws = ["maldives","male","dhivehi","raajje","mvr","atoll","island","gaa",
+              "parliament","majlis","president","minister","police","court","malé",
+              "hulhumale","addu","fuvahmulah","laamu","economy","rufiyaa"]
+    mv_hits = sum(1 for kw in mv_kws if kw in title_lower or kw in summary_lower)
+    if mv_hits:
+        items.append((f"Maldives keywords (x{mv_hits})", mv_hits * 20))
+
+    if cat in ["FOOTBALL", "SPORTS"]:
+        maldives_sports = ["maldives","dhivehi","raajje","team maldives","national team"]
+        if not any(kw in text for kw in maldives_sports):
+            items.append(("Non-Maldives sports penalty", -30))
+
+    if cat == "WORLD":
+        if not any(kw in text for kw in ["maldives","indian ocean","south asia","economy"]):
+            items.append(("Non-relevant world penalty", -20))
+
+    try:
+        if is_breaking(a["title"], a.get("summary",""), cat):
+            items.append(("Breaking news", 80))
+    except Exception:
+        pass
+
+    rel = source_reliability(a.get("source", ""))
+    rel_pts = int((rel - 50) / 2)
+    if rel_pts:
+        items.append((f"Source trust ({a.get('source','?')}, {rel}/100)", rel_pts))
+
+    try:
+        trending, theme, count = is_trending_topic(a["title"], a.get("summary",""))
+        if trending:
+            items.append((f"Trending topic ({theme}, {count} stories)", 30))
+    except Exception:
+        pass
+
+    cluster_size = a.get("_cluster_size", 1)
+    if cluster_size >= 2:
+        corr = min((cluster_size - 1) * 12, 36)
+        items.append((f"Corroborated ({cluster_size} sources)", corr))
+
+    try:
+        eng_pts, eng_theme = topic_weight_for(a["title"], a.get("summary",""))
+        if eng_pts:
+            items.append((f"Audience nudge ({eng_theme})", eng_pts))
+    except Exception:
+        pass
+
+    total = sum(p for _, p in items)
+    return total, items
+
+def format_score_breakdown(a):
+    """Pretty HTML block for Telegram showing the itemized score."""
+    total, items = score_breakdown(a)
+    lines = [f"🧮 <b>Why this scored {total}</b>", f"<i>{a['title'][:90]}</i>", ""]
+    for label, pts in items:
+        sign = "➕" if pts > 0 else "➖"
+        lines.append(f"  {sign} {label}: <b>{pts:+d}</b>")
+    if not items:
+        lines.append("  <i>(no scoring signals matched)</i>")
+    lines.append("")
+    try:
+        if is_breaking(a["title"], a.get("summary",""), a["cat"]):
+            lines.append("📌 <b>Breaking</b> → posts immediately, no approval.")
+        elif a.get("lang") == "dv":
+            lines.append("📌 <b>Dhivehi</b> → always queued for Content Lab review.")
+        else:
+            lines.append("📌 <b>Regular English</b> → queued; auto-posts in 15 min if not reviewed.")
+    except Exception:
+        pass
+    try:
+        if learning_is_active():
+            lines.append(f"🧠 Learning <b>ON</b> — audience data may shift score ±{LEARN_CAP}.")
+        else:
+            lines.append("🧠 Learning <b>off</b> — audience data not affecting scores yet.")
+    except Exception:
+        pass
+    return "\n".join(lines)
 
 def run_job(social_only=False, breaking_only=False):
     """
@@ -2529,6 +2760,406 @@ Keep it tight, smart, and in English. Max 280 words. Write like a real editor ta
     except Exception as e:
         log.error(f"Samuga AI brief: {e}")
 
+# ── Phase 2: ENGAGEMENT LEARNING ENGINE (observe-only until /learning on) ─────
+LEARN_MIN_POSTS        = 200   # total posted articles before activation allowed
+LEARN_MIN_WEEKS        = 4     # weeks of history before activation allowed
+LEARN_MIN_VALID_VIEWS  = 50    # posts that actually have view counts (real data)
+LEARN_CAP              = 15    # max ± points engagement may move a score (hard cap)
+
+_scraper_health = {"ok": 0, "fail": 0, "warned": False}
+
+def fetch_message_views(message_id):
+    """
+    Scrape view count for a public-channel post. Returns int or None.
+    Tracks success/failure so we can warn the team if it stops working.
+    NOTE: Telegram's Bot API can't read post views — this scrapes the public
+    t.me page. Works while the channel is public. Swap to a Telethon MTProto
+    client later for guaranteed counts (single-function change).
+    """
+    if not message_id:
+        return None
+    try:
+        chan = TELEGRAM_CHANNEL_ID.lstrip("@")
+        url = f"https://t.me/{chan}/{message_id}?embed=1&mode=tme"
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code != 200:
+            _scraper_health["fail"] += 1
+            return None
+        import re as _re
+        m = _re.search(r'tgme_widget_message_views[^>]*>([\d.,KMkm]+)<', resp.text)
+        if not m:
+            _scraper_health["fail"] += 1
+            return None
+        raw = m.group(1).strip().upper().replace(",", "")
+        if raw.endswith("K"):
+            val = int(float(raw[:-1]) * 1000)
+        elif raw.endswith("M"):
+            val = int(float(raw[:-1]) * 1_000_000)
+        else:
+            val = int(float(raw))
+        _scraper_health["ok"] += 1
+        return val
+    except Exception as e:
+        log.debug(f"fetch_message_views({message_id}): {e}")
+        _scraper_health["fail"] += 1
+        return None
+
+def check_scraper_health(min_attempts=20):
+    """Warn Content Lab once if view-scraping is mostly failing. Resets counters."""
+    ok, fail = _scraper_health["ok"], _scraper_health["fail"]
+    total = ok + fail
+    if total >= min_attempts and fail / total > 0.7 and not _scraper_health["warned"]:
+        send_text(CORE_TEAM_CHAT_ID,
+            "⚠️ <b>View tracking looks broken.</b>\n\n"
+            f"View scraping failed {fail}/{total} times this run. Telegram may have "
+            "changed their page format, or the channel went private.\n\n"
+            "Learning will keep using old numbers until this is fixed. Engagement "
+            "data won't update.\n\n"
+            "<i>Nothing else is affected — posting works normally.</i>",
+            thread_id=CONTENT_LAB_THREAD_ID)
+        _scraper_health["warned"] = True
+        log.warning(f"⚠️ Scraper health poor: {fail}/{total} failed")
+    _scraper_health["ok"] = 0
+    _scraper_health["fail"] = 0
+
+# ── Phase 2.5: META GRAPH API — Facebook + Instagram engagement ──────────────
+# Reads engagement off your OWN page (no scraping). FB lost reach/impressions in
+# Meta's June 2026 change, so FB = reactions+comments+shares. IG = likes+comments
+# (+impressions where available). Matched to articles by caption (match_key).
+_meta_health = {"ok": 0, "fail": 0, "warned": False}
+
+def _meta_get(path, params=None):
+    """GET the Graph API. Returns parsed JSON dict or None."""
+    if not META_PAGE_TOKEN:
+        return None
+    try:
+        p = dict(params or {})
+        p["access_token"] = META_PAGE_TOKEN
+        url = f"https://graph.facebook.com/{META_API_VER}/{path}"
+        resp = requests.get(url, params=p, timeout=15)
+        if resp.status_code == 200:
+            _meta_health["ok"] += 1
+            return resp.json()
+        # Surface the Graph error message to logs (token expiry, perms, etc.)
+        try:
+            err = resp.json().get("error", {}).get("message", resp.text[:200])
+        except Exception:
+            err = resp.text[:200]
+        log.error(f"Meta GET {path} → {resp.status_code}: {err}")
+        _meta_health["fail"] += 1
+        return None
+    except Exception as e:
+        log.error(f"Meta GET {path}: {e}")
+        _meta_health["fail"] += 1
+        return None
+
+def _resolve_ig_id():
+    """Find the Instagram Business account linked to the FB page. Cached in bot_kv."""
+    if META_IG_ID:
+        return META_IG_ID
+    cached = kv_get("meta_ig_id", {})
+    if isinstance(cached, dict) and cached.get("id"):
+        return cached["id"]
+    if not META_PAGE_ID:
+        return None
+    data = _meta_get(META_PAGE_ID, {"fields": "instagram_business_account"})
+    ig = (data or {}).get("instagram_business_account", {}).get("id") if data else None
+    if ig:
+        kv_set("meta_ig_id", {"id": ig})
+        log.info(f"📷 Resolved IG business account: {ig}")
+    return ig
+
+def _fetch_fb_post_engagement(limit=50):
+    """
+    Return list of (caption_text, engagement_int) for recent FB page posts.
+    Engagement = reactions + comments + shares (reach/impressions deprecated by Meta).
+    """
+    if not META_PAGE_ID:
+        return []
+    data = _meta_get(f"{META_PAGE_ID}/posts", {
+        "fields": "message,created_time,"
+                  "reactions.summary(total_count).limit(0),"
+                  "comments.summary(total_count).limit(0),"
+                  "shares",
+        "limit": limit,
+    })
+    out = []
+    for post in (data or {}).get("data", []):
+        msg = post.get("message", "")
+        if not msg:
+            continue
+        reacts = post.get("reactions", {}).get("summary", {}).get("total_count", 0)
+        comments = post.get("comments", {}).get("summary", {}).get("total_count", 0)
+        shares = post.get("shares", {}).get("count", 0)
+        eng = (reacts or 0) + (comments or 0) + (shares or 0)
+        out.append((msg, eng))
+    log.info(f"📘 FB: {len(out)} posts with engagement")
+    return out
+
+def _fetch_ig_post_engagement(limit=50):
+    """
+    Return list of (caption_text, engagement_int) for recent IG media.
+    Engagement = like_count + comments_count.
+    """
+    ig_id = _resolve_ig_id()
+    if not ig_id:
+        return []
+    data = _meta_get(f"{ig_id}/media", {
+        "fields": "caption,like_count,comments_count,timestamp",
+        "limit": limit,
+    })
+    out = []
+    for media in (data or {}).get("data", []):
+        cap = media.get("caption", "")
+        if not cap:
+            continue
+        eng = (media.get("like_count") or 0) + (media.get("comments_count") or 0)
+        out.append((cap, eng))
+    log.info(f"📷 IG: {len(out)} media with engagement")
+    return out
+
+def fetch_meta_insights(days=28):
+    """
+    Pull FB + IG engagement, match each post to an article by caption (match_key),
+    and write the combined number to articles.meta_engagement. Runs weekly.
+    Returns number of articles updated.
+    """
+    if not DB_ENABLED or not META_PAGE_TOKEN:
+        return 0
+    # Get candidate articles (posted recently, with a match key)
+    rows = db_execute("""
+        SELECT id, match_key FROM articles
+        WHERE status='posted' AND match_key IS NOT NULL AND match_key <> ''
+          AND posted_at > NOW() - INTERVAL %s
+    """, (f"{days} days",), fetch="all")
+    if not rows:
+        return 0
+    articles = [(aid, mk) for aid, mk in rows]
+
+    # Gather all platform posts (caption, engagement)
+    platform_posts = _fetch_fb_post_engagement() + _fetch_ig_post_engagement()
+    if not platform_posts:
+        check_meta_health()
+        return 0
+
+    # Pre-normalize platform captions to match keys
+    norm_posts = [(_caption_match_key(cap), eng) for cap, eng in platform_posts]
+
+    updated = 0
+    for aid, mk in articles:
+        if not mk:
+            continue
+        total_eng = 0
+        matched = False
+        for pmk, eng in norm_posts:
+            if not pmk:
+                continue
+            # Match if either key contains the other's leading chunk (captions get
+            # truncated differently per platform). Require a decent overlap.
+            short = min(len(mk), len(pmk))
+            if short >= 18 and (mk[:short] == pmk[:short] or mk in pmk or pmk in mk):
+                total_eng += eng
+                matched = True
+        if matched:
+            db_execute("UPDATE articles SET meta_engagement=%s WHERE id=%s", (total_eng, aid))
+            updated += 1
+    log.info(f"📊 Meta insights matched {updated}/{len(articles)} articles")
+    check_meta_health()
+    return updated
+
+def check_meta_health(min_attempts=4):
+    """Warn Content Lab once if Meta API calls are mostly failing (token expired etc.)."""
+    ok, fail = _meta_health["ok"], _meta_health["fail"]
+    total = ok + fail
+    if total >= min_attempts and fail / total > 0.7 and not _meta_health["warned"]:
+        send_text(CORE_TEAM_CHAT_ID,
+            "⚠️ <b>Facebook/Instagram data tracking failed.</b>\n\n"
+            f"Meta API calls failed {fail}/{total} times. The Page token may have "
+            "expired or lost permissions.\n\n"
+            "Regenerate it (Graph API Explorer → me/accounts) and update "
+            "<code>META_PAGE_TOKEN</code> in Railway.\n\n"
+            "<i>Posting still works — only FB/IG learning data is affected.</i>",
+            thread_id=CONTENT_LAB_THREAD_ID)
+        _meta_health["warned"] = True
+        log.warning(f"⚠️ Meta health poor: {fail}/{total} failed")
+    _meta_health["ok"] = 0
+    _meta_health["fail"] = 0
+
+
+def backfill_tg_views(hours=240, limit=120):
+    """Update tg_views for posted articles with a message_id. Runs weekly."""
+    if not DB_ENABLED:
+        return 0
+    rows = db_execute("""
+        SELECT id, tg_message_id FROM articles
+        WHERE status='posted' AND tg_message_id IS NOT NULL
+          AND posted_at > NOW() - INTERVAL %s
+        ORDER BY posted_at DESC LIMIT %s
+    """, (f"{hours} hours", limit), fetch="all")
+    if not rows:
+        return 0
+    updated = 0
+    for art_id, mid in rows:
+        views = fetch_message_views(mid)
+        if views is not None and views > 0:
+            db_execute("UPDATE articles SET tg_views=%s WHERE id=%s", (views, art_id))
+            updated += 1
+        time.sleep(0.4)
+    log.info(f"📈 Backfilled views for {updated}/{len(rows)} posts")
+    check_scraper_health()
+    return updated
+
+def _median(nums):
+    """Median of a list of numbers. 0 if empty."""
+    s = sorted(n for n in nums if n is not None)
+    if not s:
+        return 0
+    mid = len(s) // 2
+    return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
+
+def compute_topic_weights(days=28):
+    """
+    Rank trend themes by MEDIAN engagement (average = secondary). Combines
+    Telegram views + Facebook/Instagram engagement, each normalized to its OWN
+    platform baseline first (different scales), then blended. Writes to
+    bot_kv['topic_weights']. Does NOT change scoring. Returns the weights dict.
+    """
+    if not DB_ENABLED:
+        return {}
+    rows = db_execute("""
+        SELECT title, summary, tg_views, meta_engagement FROM articles
+        WHERE status='posted'
+          AND (tg_views > 0 OR meta_engagement > 0)
+          AND posted_at > NOW() - INTERVAL %s
+    """, (f"{days} days",), fetch="all")
+    if not rows:
+        return {}
+
+    # Platform baselines (median of non-zero values) so we can normalize scales
+    tg_vals   = [r[2] for r in rows if r[2] and r[2] > 0]
+    meta_vals = [r[3] for r in rows if r[3] and r[3] > 0]
+    tg_base   = _median(tg_vals) or 1
+    meta_base = _median(meta_vals) or 1
+
+    def _combined_signal(tg, meta):
+        """Each platform normalized to ~1.0 = its own median, then averaged."""
+        parts = []
+        if tg and tg > 0:
+            parts.append(tg / tg_base)
+        if meta and meta > 0:
+            parts.append(meta / meta_base)
+        return sum(parts) / len(parts) if parts else 0.0
+
+    theme_signals = {}
+    for title, summary, tg, meta in rows:
+        sig = _combined_signal(tg, meta)
+        if sig <= 0:
+            continue
+        for theme in _detect_themes(f"{title or ''} {summary or ''}"):
+            theme_signals.setdefault(theme, []).append(sig)
+    if not theme_signals:
+        return {}
+
+    all_sig = [s for ss in theme_signals.values() for s in ss]
+    baseline = _median(all_sig) or 1.0
+
+    import math
+    weights = {}
+    for theme, ss in theme_signals.items():
+        if len(ss) < 3:
+            continue
+        med = _median(ss)
+        avg = sum(ss) / len(ss)
+        ratio = med / baseline if baseline else 1.0
+        raw = math.log2(ratio) * LEARN_CAP if ratio > 0 else 0
+        weight = max(-LEARN_CAP, min(LEARN_CAP, round(raw)))
+        # 'median' shown as a relative index (1.0 = typical post) for readability
+        weights[theme] = {"weight": weight, "median": round(med, 2),
+                          "avg": round(avg, 2), "n": len(ss)}
+
+    kv_set("topic_weights", weights)
+    kv_set("topic_weights_baseline", {"median": round(baseline, 2)})
+    log.info(f"📊 Computed topic weights for {len(weights)} themes (baseline median {round(baseline)})")
+    return weights
+
+def learning_stats():
+    """Return (posted_total, weeks_elapsed, valid_view_count)."""
+    if not DB_ENABLED:
+        return (0, 0, 0)
+    posted = db_execute("SELECT COUNT(*) FROM articles WHERE status='posted'", fetch="one")
+    posted = posted[0] if posted else 0
+    first = db_execute("SELECT MIN(found_at) FROM articles", fetch="one")
+    weeks = 0
+    if first and first[0]:
+        try:
+            weeks = (utcnow() - first[0].replace(tzinfo=None)).days / 7.0
+        except Exception:
+            weeks = 0
+    valid = db_execute("SELECT COUNT(*) FROM articles WHERE status='posted' AND (tg_views > 0 OR meta_engagement > 0)", fetch="one")
+    valid = valid[0] if valid else 0
+    return (posted, round(weeks, 1), valid)
+
+def learning_is_active():
+    """True only if a human flipped the switch."""
+    flag = kv_get("learning_active", {"on": False})
+    return bool(flag.get("on")) if isinstance(flag, dict) else bool(flag)
+
+def topic_weight_for(title, summary=""):
+    """Engagement nudge ±LEARN_CAP, ONLY if learning active. (points, theme) or (0,None)."""
+    if not learning_is_active():
+        return (0, None)
+    weights = kv_get("topic_weights", {})
+    if not weights:
+        return (0, None)
+    themes = _detect_themes(f"{title} {summary}")
+    best_pts, best_theme = 0, None
+    for th in themes:
+        w = weights.get(th, {}).get("weight", 0)
+        if abs(w) > abs(best_pts):
+            best_pts, best_theme = w, th
+    return (best_pts, best_theme)
+
+def _top_gainers_losers(weights, n=4):
+    """Format top +n gainers and -n losers as two text blocks."""
+    if not weights:
+        return ("", "")
+    items = [(th, d["weight"], d["median"], d["n"]) for th, d in weights.items()]
+    gain = sorted([i for i in items if i[1] > 0], key=lambda x: -x[1])[:n]
+    lose = sorted([i for i in items if i[1] < 0], key=lambda x:  x[1])[:n]
+    g = "\n".join([f"  • {th} +{w} <i>({med}× typical, {nn} posts)</i>" for th, w, med, nn in gain])
+    l = "\n".join([f"  • {th} {w} <i>({med}× typical, {nn} posts)</i>" for th, w, med, nn in lose])
+    return (g, l)
+
+def check_learning_readiness():
+    """Weekly: if gate met and not yet asked, send the ONE-TIME readiness prompt."""
+    if not DB_ENABLED:
+        return
+    posted, weeks, valid = learning_stats()
+    already = kv_get("learning_prompt_sent", {"sent": False})
+    if learning_is_active() or (isinstance(already, dict) and already.get("sent")):
+        return
+    if posted < LEARN_MIN_POSTS or weeks < LEARN_MIN_WEEKS or valid < LEARN_MIN_VALID_VIEWS:
+        log.info(f"🧪 Learning not ready: posts={posted}/{LEARN_MIN_POSTS} "
+                 f"weeks={weeks}/{LEARN_MIN_WEEKS} valid_views={valid}/{LEARN_MIN_VALID_VIEWS}")
+        return
+    weights = compute_topic_weights()
+    gainers, losers = _top_gainers_losers(weights)
+    msg = (
+        "🧠 <b>Learning mode ready</b>\n\n"
+        f"I've banked <b>{posted}</b> posts over <b>{weeks}</b> weeks, "
+        f"<b>{valid}</b> with real view counts.\n\n"
+        "<b>Top performers:</b>\n" + (gainers or "  (not enough data)") + "\n\n"
+        "<b>Underperformers:</b>\n" + (losers or "  (not enough data)") + "\n\n"
+        "If you approve, I'll let audience data <i>nudge</i> my posting decisions — "
+        f"capped at ±{LEARN_CAP} pts. It informs, it never overrides a serious story.\n\n"
+        "✅ <code>/learning on</code> to activate\n"
+        "📊 <code>/learning status</code> to see the numbers\n"
+        "<i>Ignore to stay observe-only. I won't ask again.</i>"
+    )
+    send_text(CORE_TEAM_CHAT_ID, msg, thread_id=CONTENT_LAB_THREAD_ID)
+    kv_set("learning_prompt_sent", {"sent": True, "at": utcnow().isoformat()})
+    log.info("🧠 Readiness prompt sent to Content Lab (one-time).")
+
 # ── Weekly Analytics Report to Core Team ─────────────────────────────────────
 def send_weekly_analytics():
     log.info("📊 Weekly analytics report...")
@@ -2558,7 +3189,27 @@ def send_weekly_analytics():
             + "<b>Bot:</b> Samuga News Bot v3.2" + chr(10)
             + "Samuga Media | @samugacommunity"
         )
+        # ── Phase 2: weekly engagement crunch + readiness ──
+        learn_block = ""
+        try:
+            backfill_tg_views()                      # refresh view counts (matured)
+            fetch_meta_insights()                    # refresh FB + IG engagement
+            weights = compute_topic_weights()        # recompute (stored, not yet acting)
+            posted, weeks, valid = learning_stats()
+            gainers, losers = _top_gainers_losers(weights)
+            mode = "ACTIVE ✅" if learning_is_active() else "observing 👀"
+            learn_block = (
+                chr(10) + "<b>📈 What we learned this week</b>" + chr(10)
+                + f"Mode: {mode}  ({posted} posts, {valid} with views)" + chr(10) + chr(10)
+                + "<b>Top gainers:</b>" + chr(10) + (gainers or "  (gathering data)") + chr(10) + chr(10)
+                + "<b>Top losers:</b>"  + chr(10) + (losers  or "  (gathering data)") + chr(10)
+            )
+        except Exception as e:
+            log.error(f"weekly learning block: {e}")
+        report = report + learn_block
+
         send_text(CORE_TEAM_CHAT_ID, report)
+        check_learning_readiness()                  # one-time prompt if gate met
         log.info("✅ Analytics report sent to core team")
     except Exception as e:
         log.error(f"Analytics report: {e}")
@@ -2935,6 +3586,9 @@ def handle_updates():
                                         )
                                         card.seek(0)
                                         ok = send_to_telegram(card, full_caption)
+                                        if isinstance(ok, int) and item.get("article_id"):
+                                            db_set_article_message(item["article_id"], ok)
+                                            db_set_article_matchkey(item["article_id"], item["title"])
                                         if ok:
                                             remember_post(item["title"], item["cat"], ts_now)
                                             if item.get("allow_social"):
@@ -2949,13 +3603,24 @@ def handle_updates():
                                             allow_social=item.get("allow_social", True),
                                             rewritten=item.get("rewritten",""),
                                             summary=item.get("summary",""),
-                                            report_to=(chat_id, thread_id)
+                                            report_to=(chat_id, thread_id),
+                                            article_id=item.get("article_id")
                                         )
                                         ok = tg_ok
 
                                     if ok:
                                         if item.get("article_id"):
                                             db_mark_status(item["article_id"], "posted", posted=True)
+                                        db_log_learning(
+                                            article_id=item.get("article_id"),
+                                            action=("edited" if corrected else "approved"),
+                                            member=first_name,
+                                            category=item.get("cat",""),
+                                            source=item.get("source",""),
+                                            theme=item.get("_trend_theme",""),
+                                            original_caption=item.get("dv_text") or item.get("caption",""),
+                                            final_caption=(corrected or item.get("dv_text") or item.get("caption","")),
+                                            lang=item.get("lang","en"))
                                         log.info(f"✅ {key} ({item['lang']}) posted by {first_name}")
                                     else:
                                         # Telegram failed — put card back so team can retry
@@ -2989,9 +3654,19 @@ def handle_updates():
                         elif text.strip().lower().startswith("/reject "):
                             key = text.strip()[8:].strip()
                             if key in approval_queue:
-                                rej_title = approval_queue[key].get("title","")[:70]
-                                if approval_queue[key].get("article_id"):
-                                    db_mark_status(approval_queue[key]["article_id"], "rejected")
+                                rej_item  = approval_queue[key]
+                                rej_title = rej_item.get("title","")[:70]
+                                if rej_item.get("article_id"):
+                                    db_mark_status(rej_item["article_id"], "rejected")
+                                db_log_learning(
+                                    article_id=rej_item.get("article_id"),
+                                    action="rejected",
+                                    member=first_name,
+                                    category=rej_item.get("cat",""),
+                                    source=rej_item.get("source",""),
+                                    theme=rej_item.get("_trend_theme",""),
+                                    original_caption=rej_item.get("dv_text") or rej_item.get("caption",""),
+                                    lang=rej_item.get("lang","en"))
                                 del approval_queue[key]
                                 persist_state()
                                 import random as _r
@@ -3057,6 +3732,126 @@ def handle_updates():
                                 except Exception as e:
                                     log.error(f"/trends: {e}")
                                     send_text(chat_id, f"❌ Trends error: {e}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /learning on | off | status — engagement learning switch
+                        elif text.strip().lower().startswith("/learning"):
+                            arg = text.strip().lower().replace("/learning", "").strip()
+                            if not DB_ENABLED:
+                                send_text(chat_id, "🗄️ Database not connected — learning unavailable.", reply_to=msg_id, thread_id=thread_id)
+                            elif arg == "on":
+                                posted, weeks, valid = learning_stats()
+                                if posted < LEARN_MIN_POSTS or weeks < LEARN_MIN_WEEKS or valid < LEARN_MIN_VALID_VIEWS:
+                                    send_text(chat_id,
+                                        f"⏳ Not ready yet:\n"
+                                        f"  • Posts: {posted}/{LEARN_MIN_POSTS}\n"
+                                        f"  • Weeks: {weeks}/{LEARN_MIN_WEEKS}\n"
+                                        f"  • Posts with views: {valid}/{LEARN_MIN_VALID_VIEWS}\n\n"
+                                        f"I'll keep collecting and tell you when the gate is met.",
+                                        reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    kv_set("learning_active", {"on": True, "by": first_name, "at": utcnow().isoformat()})
+                                    weights = compute_topic_weights()
+                                    gainers, losers = _top_gainers_losers(weights)
+                                    send_text(chat_id,
+                                        f"✅ <b>Learning mode ON</b> (by {first_name})\n\n"
+                                        f"Audience data now nudges scoring, capped at ±{LEARN_CAP} pts.\n\n"
+                                        f"<b>Getting a boost:</b>\n{gainers or '  (none yet)'}\n\n"
+                                        f"<b>Getting demoted:</b>\n{losers or '  (none yet)'}\n\n"
+                                        f"<i>Serious news always wins — this only breaks ties.</i>\n"
+                                        f"Turn off anytime: <code>/learning off</code>",
+                                        reply_to=msg_id, thread_id=thread_id)
+                                    log.info(f"🧠 Learning ACTIVATED by {first_name}")
+                            elif arg == "off":
+                                kv_set("learning_active", {"on": False, "by": first_name, "at": utcnow().isoformat()})
+                                send_text(chat_id,
+                                    f"🛑 <b>Learning mode OFF</b> (by {first_name})\n"
+                                    f"Back to observe-only. Scoring ignores audience data again.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                                log.info(f"🧠 Learning DEACTIVATED by {first_name}")
+                            else:  # status
+                                posted, weeks, valid = learning_stats()
+                                active = learning_is_active()
+                                weights = kv_get("topic_weights", {})
+                                gainers, losers = _top_gainers_losers(weights)
+                                ready = (posted >= LEARN_MIN_POSTS and weeks >= LEARN_MIN_WEEKS and valid >= LEARN_MIN_VALID_VIEWS)
+                                send_text(chat_id,
+                                    f"🧠 <b>Learning status</b>\n\n"
+                                    f"Mode: {'ACTIVE ✅' if active else 'observing 👀'}\n"
+                                    f"Gate: {'met ✅' if ready else 'not met'}\n"
+                                    f"  • Posts: {posted}/{LEARN_MIN_POSTS}\n"
+                                    f"  • Weeks: {weeks}/{LEARN_MIN_WEEKS}\n"
+                                    f"  • Posts with views: {valid}/{LEARN_MIN_VALID_VIEWS}\n\n"
+                                    f"<b>Top gainers:</b>\n{gainers or '  (gathering data)'}\n\n"
+                                    f"<b>Top losers:</b>\n{losers or '  (gathering data)'}\n\n"
+                                    + (f"Cap: ±{LEARN_CAP} pts. " if active else "")
+                                    + ("<code>/learning on</code> to activate." if (ready and not active) else ""),
+                                    reply_to=msg_id, thread_id=thread_id)
+
+                        # /meta — test the Facebook/Instagram connection live
+                        elif text.strip().lower() in ["/meta", "/facebook", "/insights"]:
+                            if not META_PAGE_TOKEN:
+                                send_text(chat_id,
+                                    "📵 No <code>META_PAGE_TOKEN</code> set in Railway. "
+                                    "FB/IG learning is off.", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                send_text(chat_id, "🔌 Testing Facebook + Instagram connection... ⏳",
+                                          reply_to=msg_id, thread_id=thread_id)
+                                try:
+                                    fb = _fetch_fb_post_engagement(limit=10)
+                                    ig_id = _resolve_ig_id()
+                                    ig = _fetch_ig_post_engagement(limit=10) if ig_id else []
+                                    lines = ["🔌 <b>Meta connection test</b>\n"]
+                                    if fb:
+                                        top_fb = max(e for _, e in fb)
+                                        lines.append(f"📘 Facebook: ✅ {len(fb)} posts read (top engagement: {top_fb})")
+                                    else:
+                                        lines.append("📘 Facebook: ⚠️ no posts returned (new page, or check token perms)")
+                                    if ig_id and ig:
+                                        top_ig = max(e for _, e in ig)
+                                        lines.append(f"📷 Instagram: ✅ {len(ig)} posts read (top engagement: {top_ig})")
+                                    elif ig_id:
+                                        lines.append("📷 Instagram: linked ✅ but no posts returned yet")
+                                    else:
+                                        lines.append("📷 Instagram: ⚠️ not linked — switch IG to Professional & link to the FB page")
+                                    matched = fetch_meta_insights()
+                                    lines.append(f"\n🔗 Matched to <b>{matched}</b> articles in the archive.")
+                                    lines.append("<i>Runs automatically every Friday + Tuesday. Data feeds learning (still observe-only).</i>")
+                                    send_text(chat_id, "\n".join(lines), reply_to=msg_id, thread_id=thread_id)
+                                except Exception as e:
+                                    log.error(f"/meta: {e}")
+                                    send_text(chat_id, f"❌ Meta test error: {e}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /why <key> — explain how a queued card scored
+                        elif text.strip().lower().startswith("/why"):
+                            key = text.strip()[4:].strip()
+                            if not key:
+                                send_text(chat_id,
+                                    "Usage: <code>/why en12</code> — explains how a card in the "
+                                    "queue scored. Run <code>/pending</code> to see keys.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                            elif key not in approval_queue:
+                                send_text(chat_id,
+                                    f"Key <code>{key}</code> not in the queue. "
+                                    f"<code>/pending</code> shows what's waiting.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                item = approval_queue[key]
+                                art = {
+                                    "title": item.get("title",""),
+                                    "summary": item.get("summary",""),
+                                    "cat": item.get("cat","LOCAL"),
+                                    "source": item.get("source",""),
+                                    "lang": item.get("lang","en"),
+                                    "_cluster_size": item.get("_cluster_size", 1),
+                                    "_trend_theme": item.get("_trend_theme",""),
+                                }
+                                try:
+                                    send_text(chat_id, format_score_breakdown(art),
+                                              reply_to=msg_id, thread_id=thread_id)
+                                except Exception as e:
+                                    log.error(f"/why: {e}")
+                                    send_text(chat_id, f"❌ Couldn't explain {key}: {e}",
+                                              reply_to=msg_id, thread_id=thread_id)
 
                         # /brief — generate the AI nightly editorial brief on demand
                         elif text.strip().lower() in ["/brief", "/journalist", "/editor"]:
@@ -3242,7 +4037,7 @@ def handle_updates():
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("🚀 Samuga News Bot v6.0 starting (PostgreSQL archive)...")
+    log.info("🚀 Samuga News Bot v6.2 starting (archive + learning + FB/IG insights)...")
     # Install Noto fonts for Thaana/Dhivehi support
     if not os.path.exists("/usr/share/fonts/truetype/noto/NotoSansThaana-Bold.ttf") and not os.path.exists("/app/NotoSansThaana-Bold.ttf"):
         try:
@@ -3280,6 +4075,10 @@ if __name__ == "__main__":
     scheduler.add_job(send_weekly_digest, "cron", day_of_week="fri", hour=13, minute=0)
     # Weekly analytics report Friday 6:30PM MVT = 1:30PM UTC Friday
     scheduler.add_job(send_weekly_analytics, "cron", day_of_week="fri", hour=13, minute=30)
+    # Phase 2: mid-week view backfill — Tue 10PM UTC = 3AM Wed MVT (quiet hours)
+    scheduler.add_job(backfill_tg_views, "cron", day_of_week="tue", hour=22, minute=0)
+    # Phase 2.5: mid-week Meta (FB+IG) engagement refresh — Tue 10PM UTC too
+    scheduler.add_job(fetch_meta_insights, "cron", day_of_week="tue", hour=22, minute=15)
     # Weather update 8AM MVT = 3AM UTC
     scheduler.add_job(lambda: send_weather_update("morning"), "cron", hour=3, minute=0)
     # Weather update 8PM MVT = 3PM UTC
