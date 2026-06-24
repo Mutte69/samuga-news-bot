@@ -2474,7 +2474,145 @@ def _tomorrow_code_to_wmo(code):
     }
     return mapping.get(code, 3)
 
-def get_weather_data():
+# ── Island Watch — 5 Maldivian population centres ────────────────────────────
+ISLAND_LOCATIONS = [
+    {"name": "Malé",           "lat": 4.1755,   "lon": 73.5093},
+    {"name": "Addu",           "lat": 0.6167,   "lon": 73.1000},
+    {"name": "Kulhudhuffushi", "lat": 6.6226,   "lon": 73.0700},
+    {"name": "Fuvahmulah",     "lat": -0.2985,  "lon": 73.4236},
+    {"name": "Dhidhdhoo",      "lat": 6.8833,   "lon": 73.1167},
+]
+
+def generate_outlook(hourly_slots, mvt_now):
+    """
+    Convert next 12 hours of Tomorrow.io hourly slots into a one-line outlook.
+    e.g. "Heavy showers after 4 PM", "Sunny all day", "Thunderstorms tonight"
+    Uses Tomorrow.io native weatherCode (not WMO).
+    """
+    from datetime import datetime, timezone, timedelta as _td
+
+    SEVERITY = {
+        8000:5, 8001:5, 8002:5,           # thunderstorm
+        4201:4, 6201:4,                    # heavy rain
+        4001:3, 6001:3, 4200:3,            # rain
+        4000:2, 6000:2, 5000:2, 7000:2,   # drizzle/snow/ice
+        2000:1, 2100:1,                    # fog
+        1001:0, 1102:0,                    # cloudy
+        1101:0, 1100:0,                    # partly cloudy
+        1000:0,                            # clear
+    }
+
+    def sev(code): return SEVERITY.get(code, 0)
+
+    def label(code):
+        if code in [8000,8001,8002]: return "thunderstorms"
+        if code in [4201,6201]:      return "heavy showers"
+        if code in [4001,6001,4200]: return "rain showers"
+        if code in [4000,6000]:      return "light rain"
+        if code in [2000,2100]:      return "foggy conditions"
+        if code in [1001,1102]:      return "cloudy skies"
+        if code in [1100,1101]:      return "partly cloudy"
+        return "sunny"
+
+    # Parse all slots into (mvt_hour, raw_code, precip)
+    entries = []
+    for slot in hourly_slots[:12]:
+        try:
+            t_str = slot.get("time","")
+            dt_utc = datetime.fromisoformat(t_str.replace("Z","+00:00"))
+            dt_mvt = dt_utc + _td(hours=5)
+            v = slot.get("values",{})
+            raw_code = v.get("weatherCode", 1000)
+            precip   = v.get("precipitationProbability", 0)
+            entries.append((dt_mvt.hour, raw_code, precip))
+        except:
+            continue
+
+    if not entries:
+        return "Weather data unavailable"
+
+    now_h = mvt_now.hour
+
+    # Find the single worst event across all upcoming hours
+    worst = max(entries, key=lambda e: (sev(e[1]), e[2]))
+    worst_h, worst_code, worst_precip = worst
+
+    # If nothing severe at all — classify overall
+    if sev(worst_code) == 0:
+        all_codes = [e[1] for e in entries]
+        if all(c == 1000 for c in all_codes):
+            return "Sunny all day"
+        if all(c in [1000,1100] for c in all_codes):
+            return "Sunny with some clouds"
+        if all(c in [1000,1100,1101,1001,1102] for c in all_codes):
+            return "Mostly cloudy"
+        return "Partly cloudy"
+
+    # There IS a significant event — say when it happens
+    desc = label(worst_code)
+
+    if worst_h < 6:    time_hint = "overnight"
+    elif worst_h < 9:  time_hint = "early morning"
+    elif worst_h < 12: time_hint = "this morning"
+    elif worst_h == 12: time_hint = "at noon"
+    elif worst_h < 15: time_hint = "this afternoon"
+    elif worst_h < 18: time_hint = f"after {worst_h - 12} PM"
+    elif worst_h < 21: time_hint = "this evening"
+    else:              time_hint = "tonight"
+
+    # If already happening now, say "right now"
+    if abs(worst_h - now_h) <= 1:
+        return f"{desc.capitalize()} right now"
+
+    return f"{desc.capitalize()} {time_hint}"
+
+def get_island_forecasts():
+    """
+    Fetch 12-hour hourly forecast for all 5 islands via Tomorrow.io.
+    Returns list of {name, temp, code, outlook} dicts, or [] on failure.
+    """
+    TOMORROW_API_KEY = os.environ.get("TOMORROW_API_KEY", "")
+    if not TOMORROW_API_KEY:
+        return []
+
+    from datetime import datetime, timezone, timedelta as _td
+    mvt_now = datetime.now(timezone.utc) + _td(hours=5)
+    results = []
+
+    for island in ISLAND_LOCATIONS:
+        try:
+            params = (f"?location={island['lat']},{island['lon']}"
+                      f"&apikey={TOMORROW_API_KEY}&units=metric")
+            base = "https://api.tomorrow.io/v4/weather"
+
+            rt = requests.get(f"{base}/realtime{params}", timeout=12)
+            fc = requests.get(f"{base}/forecast{params}", timeout=12)
+
+            if rt.status_code != 200 or fc.status_code != 200:
+                log.warning(f"Island forecast {island['name']}: HTTP {rt.status_code}/{fc.status_code}")
+                results.append({"name": island["name"], "temp": 29,
+                                 "code": 1000, "outlook": "Data unavailable"})
+                continue
+
+            rv = rt.json()["data"]["values"]
+            fd = fc.json()
+            temp = round(rv.get("temperature", 29))
+            code = _tomorrow_code_to_wmo(rv.get("weatherCode", 1000))
+            hourly_slots = fd.get("timelines", {}).get("hourly", [])[:12]
+            outlook = generate_outlook(hourly_slots, mvt_now)
+
+            results.append({"name": island["name"], "temp": temp,
+                             "code": code, "outlook": outlook})
+            log.info(f"🏝️ {island['name']}: {temp}°C — {outlook}")
+
+        except Exception as e:
+            log.error(f"Island forecast {island['name']}: {e}")
+            results.append({"name": island["name"], "temp": 29,
+                             "code": 1000, "outlook": "Data unavailable"})
+
+    return results
+
+
     """
     Fetch real-time weather for Malé, Maldives.
     Primary: Tomorrow.io (richer data — UV, gusts, visibility, dew point).
@@ -2636,12 +2774,15 @@ def draw_weather_icon(draw, code, x, y, size=40):
     else:  # Default cloud
         draw.ellipse([cx-s//2, cy-s//6, cx+s//2, cy+s//2], fill=(180,190,220,240))
 
-def generate_weather_card(weather_data, alert_mode=False, alert_text=""):
-    """Samuga branded weather card with logo, UV, gusts, dew point, pressure, data source."""
+def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_data=None):
+    """Samuga branded weather card with logo, UV, gusts, dew point, pressure, data source.
+    island_data = list of {name, temp, code, outlook} from get_island_forecasts().
+    Card is 1080×1350 when island_data present, 1080×1080 otherwise.
+    """
     from PIL import Image, ImageDraw, ImageFont
     import math
 
-    W, H = 1080, 1080
+    W, H = 1080, (1350 if island_data else 1080)
     img = Image.new("RGB", (W, H), (0,0,0))
     draw = ImageDraw.Draw(img, "RGBA")
 
@@ -2832,6 +2973,34 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text=""):
             draw.text((hx-hpw//2, y_base+100), hp_str, font=font_xs, fill=(120,200,255,210))
         displayed += 1
 
+    # ── ISLAND WATCH STRIP ────────────────────────────────────────────────────
+    if island_data:
+        iw_y = y_base + 128
+        draw.line([(40,iw_y),(W-40,iw_y)], fill=(255,255,255,40), width=1)
+        iw_y += 14
+        hdr = "WEATHER WATCH — MALDIVES"
+        hdw = draw.textlength(hdr, font=font_small)
+        draw.text(((W-hdw)//2, iw_y), hdr, font=font_small, fill=(255,220,100,230))
+        iw_y += 38
+
+        for isl in island_data:
+            iname = isl["name"]
+            iout  = isl["outlook"]
+            itemp = isl.get("temp", 29)
+            icode = isl.get("code", 1000)
+
+            # Island name — left
+            draw.text((48, iw_y), iname, font=F(18, True), fill=(255,255,255,230))
+            # Temperature — right
+            ts2 = f"{itemp}\u00b0C"
+            tw3 = int(draw.textlength(ts2, font=F(18, True)))
+            draw.text((W-48-tw3, iw_y), ts2, font=F(18, True), fill=(160,215,255,210))
+            # Outlook — below name, dimmer
+            draw.text((48, iw_y+24), iout, font=font_xs, fill=(200,225,255,170))
+            iw_y += 58
+
+        draw.line([(40,iw_y),(W-40,iw_y)], fill=(255,255,255,30), width=1)
+
     # Bottom bar
     bar_y = H - 78
     draw.line([(60,bar_y),(W-60,bar_y)], fill=(255,255,255,40), width=1)
@@ -2955,14 +3124,22 @@ def send_weather_alert(weather_data, alert_type, alert_text):
         log.error(f"Weather alert send: {e}")
 
 def send_weather_update(time_of_day="morning"):
-    """Send weather card to Telegram + check for alerts"""
+    """Send weather card to Telegram + island watch + check for alerts"""
     log.info(f"🌤️ Weather update ({time_of_day})...")
     try:
         data = get_weather_data()
         if not data:
             log.error("Weather: no data"); return
 
-        card = generate_weather_card(data)
+        # Fetch island forecasts (5 islands — ~10 API calls, well within 500/day limit)
+        log.info("🏝️ Fetching island forecasts...")
+        islands = get_island_forecasts()
+        if islands:
+            log.info(f"🏝️ Got {len(islands)} island forecasts")
+        else:
+            log.warning("🏝️ No island forecast data — card will show Malé only")
+
+        card = generate_weather_card(data, island_data=islands if islands else None)
         current = data.get("current", {})
         temp     = round(current.get("temperature_2m", 29))
         code     = current.get("weathercode", 0)
@@ -2973,11 +3150,20 @@ def send_weather_update(time_of_day="morning"):
         emoji, condition = weather_code_to_info(code)
         greeting = "\U0001f305 Good Morning Maldives!" if time_of_day == "morning" else "\U0001f319 Good Evening Maldives!"
         src_tag = f"\n<i>Data: {source}</i>" if source else ""
+
+        # Build island summary for caption
+        island_lines = ""
+        if islands:
+            island_lines = "\n\n🏝 <b>Weather Watch</b>\n"
+            for isl in islands:
+                island_lines += f"📍 <b>{isl['name']}</b> — {isl['outlook']}\n"
+
         caption = (
             f"{greeting}\n\n"
             f"{emoji} <b>Current Weather \u2014 Mal\u00e9</b>\n"
             f"\U0001f321\ufe0f <b>{temp}\u00b0C</b> \u2014 {condition}\n"
-            f"\U0001f4a8 Wind {wind} km/h  \u00b7  \u2614 Rain {precip_p}%  \u00b7  \u2600\ufe0f UV {uv}\n\n"
+            f"\U0001f4a8 Wind {wind} km/h  \u00b7  \u2614 Rain {precip_p}%  \u00b7  \u2600\ufe0f UV {uv}"
+            f"{island_lines}\n\n"
             f"\U0001f4e1 <b>Samuga Media</b> | @samugacommunity"
             f"{src_tag}"
         )
@@ -2987,7 +3173,7 @@ def send_weather_update(time_of_day="morning"):
         # Alert check after every regular card
         should_alert, alert_type, alert_text = detect_weather_alert(data)
         if should_alert:
-            log.info(f"\u26a0\ufe0f Alert detected: {alert_type} — {alert_text[:60]}")
+            log.info(f"\u26a0\ufe0f Alert detected: {alert_type}")
             send_weather_alert(data, alert_type, alert_text)
         else:
             log.info("\u2705 No alert conditions detected")
