@@ -1708,7 +1708,7 @@ def post_to_social(img_buf, caption):
             track_analytics("SOCIAL", social_ok=True)
         if fail:
             log.error(f"❌ Social failed for: {', '.join(fail)}")
-            track_analytics("SOCIAL", social_ok=False)
+        return results  # Return per-platform results so callers can report back
     except Exception as e:
         log.error(f"Social: {e}")
 
@@ -1740,15 +1740,22 @@ def _build_card_and_caption(article):
     return card_bytes, caption, rewritten, keyword
 
 
-def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_social, rewritten="", summary=""):
-    """Actually post a finished card to Telegram + (optionally) social. Returns True on Telegram success."""
+def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_social,
+                 rewritten="", summary="", report_to=None):
+    """
+    Post a card to Telegram + socials. Returns (tg_ok, social_results).
+    report_to: optional (chat_id, thread_id) to send a per-platform status report.
+    """
     global last_regular_post_time
     buf = io.BytesIO(card_bytes)
     ts = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+    social_results = {}
 
     log.info(f"📰 [{'🔴BREAKING' if is_breaking_flag else '🟡REGULAR'}][{cat}] {title[:60]}...")
     buf.seek(0)
-    if send_to_telegram(buf, caption):
+    tg_ok = send_to_telegram(buf, caption)
+
+    if tg_ok:
         remember_post(title, cat, ts)
         if not is_breaking_flag:
             last_regular_post_time = utcnow()
@@ -1756,24 +1763,49 @@ def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_
             log.info("🕐 Regular timer reset — next Telegram post in 90min")
         else:
             log.info("🔴 Breaking posted!")
-        # Social
-        if allow_social:
-            social_buf = io.BytesIO(card_bytes)
-            threading.Thread(target=post_to_social, args=(social_buf, caption), daemon=True).start()
-        # Poll for political news
-        if should_create_poll(title, summary, cat):
-            log.info("🗳️ Generating poll...")
-            question, options = generate_poll_question(title, rewritten or title)
-            if question and options:
-                time.sleep(3)
-                send_poll(question, options)
-                increment_poll_count()
-        return True
-    log.warning(f"Telegram failed for [{cat}]")
+
+    # Social — run synchronously when report_to is set so we can report results
     if allow_social:
         social_buf = io.BytesIO(card_bytes)
-        threading.Thread(target=post_to_social, args=(social_buf, caption), daemon=True).start()
-    return False
+        if report_to:
+            # Synchronous — so we can tell the team what happened per platform
+            social_results = post_to_social(social_buf, caption) or {}
+        else:
+            # Background thread for automated posts (don't block)
+            threading.Thread(target=post_to_social, args=(social_buf, caption), daemon=True).start()
+
+    # Poll
+    if tg_ok and should_create_poll(title, summary, cat):
+        log.info("🗳️ Generating poll...")
+        question, options = generate_poll_question(title, rewritten or title)
+        if question and options:
+            time.sleep(3)
+            send_poll(question, options)
+            increment_poll_count()
+
+    # Report per-platform status back to Content Lab
+    if report_to:
+        rchat, rthread = report_to
+        tg_icon  = "✅" if tg_ok else "❌"
+        fb_icon  = "✅" if social_results.get("Facebook")  else ("❌" if "Facebook"  in social_results else "⏭️")
+        ig_icon  = "✅" if social_results.get("Instagram") else ("❌" if "Instagram" in social_results else "⏭️")
+        tw_icon  = "✅" if social_results.get("Twitter")   else ("❌" if "Twitter"   in social_results else "⏭️")
+        status = (
+            f"{tg_icon} Telegram  {fb_icon} Facebook  {ig_icon} Instagram  {tw_icon} Twitter"
+        )
+        if tg_ok:
+            msg = f"✅ <b>{title[:70]}</b>\n\n📡 {status}"
+        else:
+            msg = (f"⚠️ <b>Post had issues</b>\n\n"
+                   f"📡 {status}\n\n"
+                   f"Telegram failed — card not posted to community.")
+        # Show retry tip if anything failed
+        has_failure = not tg_ok or any(v is False for v in social_results.values())
+        if has_failure:
+            msg += f"\n\n💡 <i>Telegram failed? The article may have expired. Create a manual card instead.</i>"
+        send_text(rchat, msg, thread_id=rthread)
+
+    return tg_ok, social_results
 
 
 def _send_approval_card(key, item):
@@ -2877,15 +2909,18 @@ def handle_updates():
                         # /approved <key> [optional corrected dhivehi text]
                         if text.strip().lower().startswith("/approved "):
                             parts = text.strip()[10:].strip().split(" ", 1)
-                            key = parts[0].strip()
+                            key = parts[0].strip().lower()
                             corrected = parts[1].strip() if len(parts) > 1 else None
+
+                            # Always acknowledge immediately — team should NEVER get silence
+                            send_text(chat_id, f"⏳ Got it {first_name}! Processing <b>{key.upper()}</b>...", reply_to=msg_id, thread_id=thread_id)
+
                             if key in approval_queue:
                                 item = approval_queue.pop(key)
                                 persist_state()
                                 action = "edited" if corrected else "approved"
                                 try:
-                                    send_text(chat_id, f"Got it {first_name} 🙌 Your {action} card is being posted... ⏳", reply_to=msg_id, thread_id=thread_id)
-
+                                    ok = False
                                     if item["lang"] == "dv":
                                         # Build Dhivehi card now (with optional correction)
                                         final_dv = corrected if corrected else item["dv_text"]
@@ -2906,28 +2941,49 @@ def handle_updates():
                                                 card.seek(0)
                                                 threading.Thread(target=post_to_social, args=(io.BytesIO(card.getvalue()), full_caption), daemon=True).start()
                                     else:
-                                        # English card already built — just publish
-                                        ok = _publish_now(
+                                        # English — publish + report per platform back to Content Lab
+                                        tg_ok, social_res = _publish_now(
                                             item["card_bytes"], item["caption"], item["cat"],
                                             item["title"], item["link"],
                                             is_breaking_flag=item.get("is_breaking", False),
                                             allow_social=item.get("allow_social", True),
                                             rewritten=item.get("rewritten",""),
-                                            summary=item.get("summary","")
+                                            summary=item.get("summary",""),
+                                            report_to=(chat_id, thread_id)
                                         )
+                                        ok = tg_ok
 
                                     if ok:
                                         if item.get("article_id"):
                                             db_mark_status(item["article_id"], "posted", posted=True)
-                                        send_text(chat_id, f"✅ <b>{key.upper()}</b> posted to community!\n📰 {item['title'][:90]}", reply_to=msg_id, thread_id=thread_id)
                                         log.info(f"✅ {key} ({item['lang']}) posted by {first_name}")
                                     else:
-                                        send_text(chat_id, "❌ Telegram post failed.", reply_to=msg_id, thread_id=thread_id)
+                                        # Telegram failed — put card back so team can retry
+                                        approval_queue[key] = item
+                                        persist_state()
+                                        send_text(chat_id,
+                                            f"❌ <b>{key.upper()} — Telegram failed</b>\n\n"
+                                            f"Card is still in queue. Try again:\n"
+                                            f"<code>/approved {key}</code>\n"
+                                            f"Or reject: <code>/reject {key}</code>",
+                                            reply_to=msg_id, thread_id=thread_id)
+                                        log.error(f"❌ {key} post failed for {first_name}")
                                 except Exception as e:
                                     log.error(f"Approval post error: {e}")
-                                    send_text(chat_id, f"❌ Error: {e}", reply_to=msg_id, thread_id=thread_id)
+                                    # Put card back so team can retry
+                                    approval_queue[key] = item
+                                    persist_state()
+                                    send_text(chat_id,
+                                        f"❌ <b>Error posting {key.upper()}</b>: {str(e)[:100]}\n\n"
+                                        f"Card saved — try again: <code>/approved {key}</code>",
+                                        reply_to=msg_id, thread_id=thread_id)
                             else:
-                                send_text(chat_id, f"Key <code>{key}</code> not found — maybe expired (2h), already posted, or rejected.", reply_to=msg_id, thread_id=thread_id)
+                                # Key not found — give helpful context
+                                send_text(chat_id,
+                                    f"⚠️ <b>{key.upper()}</b> not found in queue\n\n"
+                                    f"It may have already posted, been rejected, or expired.\n"
+                                    f"Run <code>/pending</code> to see what's still waiting.",
+                                    reply_to=msg_id, thread_id=thread_id)
 
                         # /reject <key>
                         elif text.strip().lower().startswith("/reject "):
