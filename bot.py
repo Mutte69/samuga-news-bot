@@ -492,6 +492,8 @@ def _save_state(state):
     except Exception as e:
         log.error(f"save_state: {e}")
 
+_poll_offset = [0]  # Telegram update offset — persisted so bot never misses messages on restart
+
 def persist_state():
     """Snapshot all volatile state to disk. Called after any meaningful change."""
     try:
@@ -507,6 +509,7 @@ def persist_state():
             "last_regular_post_time": last_regular_post_time.isoformat() if last_regular_post_time else None,
             "approval_counter": _approval_counter[0],
             "approval_queue": _serialize_approval_queue(),
+            "poll_offset": _poll_offset[0],
         }
         _save_state(state)
     except Exception as e:
@@ -570,6 +573,7 @@ def restore_state():
             except Exception: pass
 
         _approval_counter[0] = state.get("approval_counter", 0)
+        _poll_offset[0] = state.get("poll_offset", 0)
 
         # Restore approval queue (with card images)
         for k, item in state.get("approval_queue", {}).items():
@@ -1777,7 +1781,7 @@ def _send_approval_card(key, item):
     cat = item["cat"]
     lang_tag = "🇲🇻 Dhivehi" if item["lang"] == "dv" else "🇬🇧 English"
     brk = "🚨 BREAKING " if item["is_breaking"] else ""
-    cat_emoji = {"LOCAL":"🇲🇻","FOOTBALL":"⚽","SPORTS":"🏅","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(cat,"📰")
+    cat_emoji = {"BREAKING":"🚨","LOCAL":"🇲🇻","POLITICAL":"🏛️","LIFESTYLE":"🌴","SPORTS":"🏅","FOOTBALL":"⚽","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(cat,"📰")
     # KEY first and BIG so stacked cards are instantly identifiable
     header = (
         f"🔑 <b>{key.upper()}</b>  •  {cat_emoji} {cat}\n"
@@ -2796,8 +2800,10 @@ def chat_with_coreteam(message, sender_name, sender_info=None, conversation_hist
 
 # ── Chat Handler ──────────────────────────────────────────────────────────────
 def handle_updates():
-    offset=0; bot_mention=f"@{BOT_USERNAME}".lower()
-    log.info(f"💬 Chat listening for @{BOT_USERNAME}...")
+    # Use persisted offset so we never miss messages across restarts
+    offset = _poll_offset[0]
+    bot_mention=f"@{BOT_USERNAME}".lower()
+    log.info(f"💬 Chat listening for @{BOT_USERNAME}... (offset={offset})")
     while True:
         try:
             resp=requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
@@ -2805,6 +2811,10 @@ def handle_updates():
             if resp.status_code!=200: time.sleep(5); continue
             for update in resp.json().get("result",[]):
                 offset=update["update_id"]+1
+                _poll_offset[0] = offset
+                # Save offset every 10 updates — cheap insurance against missing messages on restart
+                if offset % 10 == 0:
+                    persist_state()
                 msg=update.get("message",{})
                 if not msg: continue
                 text=msg.get("text","") or msg.get("caption","")
