@@ -4362,6 +4362,41 @@ def handle_updates():
                                     send_text(chat_id, f"❌ Couldn't explain {key}: {e}",
                                               reply_to=msg_id, thread_id=thread_id)
 
+                        # /weather — force send a weather card preview to core team
+                        elif text.strip().lower() in ["/weather", "/wx"]:
+                            send_text(chat_id, "🌤️ Fetching weather + island data... ⏳",
+                                      reply_to=msg_id, thread_id=thread_id)
+                            def _send_weather_preview():
+                                try:
+                                    data = get_weather_data()
+                                    if not data:
+                                        send_text(chat_id, "❌ Weather data unavailable right now.", thread_id=thread_id)
+                                        return
+                                    islands = get_island_forecasts()
+                                    card = generate_weather_card(data, island_data=islands if islands else None)
+                                    current = data.get("current", {})
+                                    temp  = round(current.get("temperature_2m", 29))
+                                    code  = current.get("weathercode", 0)
+                                    emoji, condition = weather_code_to_info(code)
+                                    source = data.get("_source", "")
+                                    island_lines = ""
+                                    if islands:
+                                        island_lines = "\n\n🏝 <b>Weather Watch</b>\n"
+                                        for isl in islands:
+                                            island_lines += f"📍 <b>{isl['name']}</b> — {isl['outlook']}\n"
+                                    caption = (
+                                        f"🌤️ <b>Weather Preview — Malé, Maldives</b>\n"
+                                        f"{emoji} {temp}°C — {condition}"
+                                        f"{island_lines}\n"
+                                        f"<i>Data: {source} · Preview only, not posted to community</i>"
+                                    )
+                                    send_photo(chat_id, card, caption, thread_id=thread_id)
+                                    log.info(f"🌤️ Weather preview sent to core team by {first_name}")
+                                except Exception as e:
+                                    log.error(f"/weather preview: {e}")
+                                    send_text(chat_id, f"❌ Error: {e}", thread_id=thread_id)
+                            threading.Thread(target=_send_weather_preview, daemon=True).start()
+
                         # /brief — generate the AI nightly editorial brief on demand
                         elif text.strip().lower() in ["/brief", "/journalist", "/editor"]:
                             send_text(chat_id, "🧠 Generating editorial brief from today's news... give me a moment ⏳", reply_to=msg_id, thread_id=thread_id)
