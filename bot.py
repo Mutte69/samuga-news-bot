@@ -3937,7 +3937,37 @@ def handle_updates():
                             elif not raw_text and not photo:
                                 send_text(chat_id, "Send a photo with caption text, or just text, then add the command at the end.", reply_to=msg_id, thread_id=thread_id)
                             else:
-                                content_text = raw_text or "Samuga Media"
+                                # ── Parse headline / subheading split ──────────────────
+                                # Blank line (\n\n) = intentional headline/subhead separator.
+                                # Language-aware limit: Thaana glyphs are wider so less fits.
+                                #   Dhivehi: 80 chars max on card
+                                #   English: 150 chars max on card
+                                # If subhead exceeds limit → headline only on card, subhead to caption.
+                                has_thaana_input = any('\u0780'<=c<='\u07bf' for c in raw_text)
+                                SUBHEAD_CARD_LIMIT = 80 if has_thaana_input else 150
+                                parts = [p.strip() for p in raw_text.split("\n\n") if p.strip()]
+                                if len(parts) >= 2:
+                                    card_headline = parts[0]
+                                    card_subhead  = " ".join(parts[1:])  # everything after first blank line
+                                    if len(card_subhead) <= SUBHEAD_CARD_LIMIT:
+                                        # Fits on card — pass as one block with newline so
+                                        # generate_card renders it as headline + smaller body.
+                                        # We use ". " trick for English, space for Dhivehi path.
+                                        if has_thaana_input:
+                                            content_text = card_headline + " " + card_subhead
+                                        else:
+                                            content_text = card_headline.rstrip(".") + ". " + card_subhead
+                                        caption_subhead = ""   # already on card, not needed in caption
+                                    else:
+                                        # Too long — card gets headline only, subhead goes to caption
+                                        content_text  = card_headline
+                                        caption_subhead = card_subhead
+                                else:
+                                    # No blank line = just headline, no subhead
+                                    content_text    = raw_text
+                                    caption_subhead = ""
+
+                                content_text = content_text or "Samuga Media"
                                 try:
                                     send_text(chat_id, "⏳ Creating card...", thread_id=thread_id)
 
@@ -3952,8 +3982,12 @@ def handle_updates():
                                     card = generate_card(content_text, "Samuga Media", ts_now, manual_cat, bg)
                                     cat_emoji = {"BREAKING":"🚨","LOCAL":"🇲🇻","POLITICAL":"🏛️","LIFESTYLE":"🌴","SPORTS":"🏅","FOOTBALL":"⚽","DISASTER":"🚨","WORLD":"🌍","WEATHER":"🌤️","TOURISM":"✈️"}.get(manual_cat,"📰")
                                     breaking_prefix = "🚨 <b>BREAKING NEWS</b>\n\n" if manual_cat in ["BREAKING", "DISASTER"] else ""
+                                    # Caption: headline (always) + subhead if it didn't fit on card
+                                    caption_body = card_headline if len(parts) >= 2 else content_text
+                                    if caption_subhead:
+                                        caption_body = caption_body + "\n\n" + caption_subhead
                                     full_caption = (
-                                        breaking_prefix + cat_emoji + " " + content_text + "\n\n"
+                                        breaking_prefix + cat_emoji + " " + caption_body + "\n\n"
                                         "📡 <b>Samuga Media</b> | @samugacommunity"
                                     )
 
