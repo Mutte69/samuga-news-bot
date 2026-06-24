@@ -2435,8 +2435,130 @@ def send_tip_cta():
     log.info("📣 Tip CTA sent")
 
 # ── Weather Card ──────────────────────────────────────────────────────────────
+def _tomorrow_code_to_wmo(code):
+    """
+    Map Tomorrow.io weatherCode to the nearest WMO code so weather_code_to_info()
+    works unchanged. Tomorrow.io codes: 1000=clear, 1100=mostly clear,
+    1101=partly cloudy, 1102=mostly cloudy, 1001=cloudy, 2000=fog,
+    4000=drizzle, 4001=rain, 4200=light rain, 4201=heavy rain,
+    8000=thunderstorm, 5000=snow (won't happen in Maldives but handled).
+    """
+    mapping = {
+        1000: 0,    # clear sky
+        1100: 1,    # mostly clear
+        1101: 2,    # partly cloudy
+        1102: 3,    # mostly cloudy
+        1001: 3,    # cloudy/overcast
+        2000: 45,   # fog
+        2100: 48,   # light fog
+        4000: 51,   # drizzle
+        4001: 61,   # rain
+        4200: 61,   # light rain
+        4201: 65,   # heavy rain
+        6000: 51,   # freezing drizzle
+        6001: 61,   # freezing rain
+        6200: 51,   # light freezing rain
+        6201: 65,   # heavy freezing rain
+        7000: 71,   # ice pellets
+        7101: 77,   # heavy ice pellets
+        7102: 71,   # light ice pellets
+        5000: 71,   # snow
+        5001: 73,   # flurries
+        5100: 71,   # light snow
+        5101: 75,   # heavy snow
+        8000: 95,   # thunderstorm
+    }
+    return mapping.get(code, 3)
+
 def get_weather_data():
-    """Fetch real-time weather for Male, Maldives via Open-Meteo (free, no key needed)"""
+    """
+    Fetch real-time weather for Malé, Maldives.
+    Primary: Tomorrow.io (richer data — UV, gusts, visibility, dew point).
+    Fallback: Open-Meteo (free, no key, always available).
+    Returns a normalised dict the card renderer understands.
+    """
+    TOMORROW_API_KEY = os.environ.get("TOMORROW_API_KEY", "")
+
+    # ── Primary: Tomorrow.io ─────────────────────────────────────────────────
+    if TOMORROW_API_KEY:
+        try:
+            # Two calls: realtime (current) + forecast (hourly + daily)
+            base = "https://api.tomorrow.io/v4/weather"
+            params = f"?location=4.1755,73.5093&apikey={TOMORROW_API_KEY}&units=metric"
+
+            rt = requests.get(f"{base}/realtime{params}", timeout=15)
+            fc = requests.get(f"{base}/forecast{params}", timeout=15)
+
+            if rt.status_code == 200 and fc.status_code == 200:
+                rv = rt.json()["data"]["values"]
+                fd = fc.json()
+
+                # Current conditions
+                wmo = _tomorrow_code_to_wmo(rv.get("weatherCode", 1000))
+                current = {
+                    "temperature_2m":        rv.get("temperature", 29),
+                    "apparent_temperature":   rv.get("temperatureApparent", 29),
+                    "relativehumidity_2m":    rv.get("humidity", 80),
+                    "windspeed_10m":          rv.get("windSpeed", 10),
+                    "windgust_10m":           rv.get("windGust", 0),
+                    "weathercode":            wmo,
+                    "uv_index":               rv.get("uvIndex", 0),
+                    "visibility":             rv.get("visibility", 10),
+                    "dewpoint_2m":            rv.get("dewPoint", 25),
+                    "pressure_msl":           rv.get("pressureSurfaceLevel", 1010),
+                    "precipitation_prob":     rv.get("precipitationProbability", 0),
+                    "_source":                "Tomorrow.io",
+                }
+
+                # Hourly forecast (next 8 hours)
+                hourly_t, hourly_wmo, hourly_precip = [], [], []
+                hourly_times = []
+                for slot in fd.get("timelines", {}).get("hourly", [])[:12]:
+                    v = slot.get("values", {})
+                    hourly_times.append(slot.get("time", ""))
+                    hourly_t.append(v.get("temperature", 29))
+                    hourly_wmo.append(_tomorrow_code_to_wmo(v.get("weatherCode", 1000)))
+                    hourly_precip.append(v.get("precipitationProbability", 0))
+
+                hourly = {
+                    "time":                     hourly_times,
+                    "temperature_2m":           hourly_t,
+                    "weathercode":              hourly_wmo,
+                    "precipitation_probability":hourly_precip,
+                }
+
+                # Daily H/L + sunrise/sunset
+                daily_max, daily_min, daily_wmo = [], [], []
+                sunrise_str, sunset_str = "06:00", "18:00"
+                for i, day in enumerate(fd.get("timelines", {}).get("daily", [])[:1]):
+                    v = day.get("values", {})
+                    daily_max.append(v.get("temperatureMax", 32))
+                    daily_min.append(v.get("temperatureMin", 26))
+                    daily_wmo.append(_tomorrow_code_to_wmo(v.get("weatherCodeMax", 1000)))
+                    sr = v.get("sunriseTime", "")
+                    ss = v.get("sunsetTime", "")
+                    if sr: sunrise_str = sr[11:16]
+                    if ss: sunset_str  = ss[11:16]
+
+                daily = {
+                    "temperature_2m_max": daily_max or [32],
+                    "temperature_2m_min": daily_min or [26],
+                    "weathercode":        daily_wmo or [wmo],
+                    "sunrise":            [f"2026-01-01T{sunrise_str}"],
+                    "sunset":             [f"2026-01-01T{sunset_str}"],
+                }
+
+                log.info(f"🌤️ Tomorrow.io: {current['temperature_2m']:.1f}°C, "
+                         f"UV={current['uv_index']}, wind={current['windspeed_10m']}km/h")
+                return {"current": current, "hourly": hourly, "daily": daily,
+                        "_source": "Tomorrow.io"}
+
+            else:
+                log.warning(f"Tomorrow.io HTTP rt={rt.status_code} fc={fc.status_code} — falling back")
+        except Exception as e:
+            log.error(f"Tomorrow.io weather: {e} — falling back to Open-Meteo")
+
+    # ── Fallback: Open-Meteo (no key needed, always free) ────────────────────
     try:
         url = ("https://api.open-meteo.com/v1/forecast"
                "?latitude=4.1755&longitude=73.5093"
@@ -2444,11 +2566,23 @@ def get_weather_data():
                "&hourly=temperature_2m,weathercode,precipitation_probability"
                "&daily=temperature_2m_max,temperature_2m_min,sunrise,sunset,weathercode"
                "&timezone=Indian%2FMaldives&forecast_days=1")
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=15)
         if resp.status_code == 200:
-            return resp.json()
+            data = resp.json()
+            data["_source"] = "Open-Meteo"
+            # Normalise Open-Meteo current to match Tomorrow.io shape
+            c = data.get("current", {})
+            c["uv_index"]        = 0
+            c["visibility"]      = 10
+            c["windgust_10m"]    = 0
+            c["dewpoint_2m"]     = 25
+            c["pressure_msl"]    = 1010
+            c["precipitation_prob"] = 0
+            c["_source"]         = "Open-Meteo"
+            log.info(f"🌤️ Open-Meteo fallback: {c.get('temperature_2m',29):.1f}°C")
+            return data
     except Exception as e:
-        log.error(f"Weather fetch: {e}")
+        log.error(f"Open-Meteo fallback: {e}")
     return None
 
 def weather_code_to_info(code):
@@ -2498,8 +2632,8 @@ def draw_weather_icon(draw, code, x, y, size=40):
     else:  # Default cloud
         draw.ellipse([cx-s//2, cy-s//6, cx+s//2, cy+s//2], fill=(180,190,220,240))
 
-def generate_weather_card(weather_data):
-    """Generate iPhone-style weather card with drawn icons"""
+def generate_weather_card(weather_data, alert_mode=False, alert_text=""):
+    """Samuga branded weather card with logo, UV, gusts, dew point, pressure, data source."""
     from PIL import Image, ImageDraw, ImageFont
     import math
 
@@ -2510,165 +2644,350 @@ def generate_weather_card(weather_data):
     current = weather_data.get("current", {})
     hourly  = weather_data.get("hourly", {})
     daily   = weather_data.get("daily", {})
+    source  = weather_data.get("_source", "")
 
     temp     = round(current.get("temperature_2m", 29))
     feels    = round(current.get("apparent_temperature", 29))
     humidity = current.get("relativehumidity_2m", 80)
     wind     = round(current.get("windspeed_10m", 10))
+    gusts    = round(current.get("windgust_10m", 0))
+    uv       = current.get("uv_index", 0)
+    vis      = round(current.get("visibility", 10))
+    dew      = round(current.get("dewpoint_2m", 25))
+    pressure = round(current.get("pressure_msl", 1010))
+    precip_p = current.get("precipitation_prob", 0)
     code     = current.get("weathercode", 0)
     _, condition = weather_code_to_info(code)
 
-    # Daily H/L
     temp_max = round(daily.get("temperature_2m_max", [temp])[0])
     temp_min = round(daily.get("temperature_2m_min", [temp])[0])
 
-    # Sunrise/sunset
     sunrise_raw = daily.get("sunrise", [""])[0]
-    sunset_raw  = daily.get("sunset", [""])[0]
+    sunset_raw  = daily.get("sunset",  [""])[0]
     sunrise_str = sunrise_raw.split("T")[1][:5] if "T" in sunrise_raw else "06:00"
-    sunset_str  = sunset_raw.split("T")[1][:5] if "T" in sunset_raw else "18:00"
+    sunset_str  = sunset_raw.split("T")[1][:5]  if "T" in sunset_raw  else "18:19"
 
-    # Hourly
     hours  = hourly.get("time", [])
     temps  = hourly.get("temperature_2m", [])
     codes  = hourly.get("weathercode", [])
     precip = hourly.get("precipitation_probability", [])
 
-    # Background gradient
-    for y in range(H):
-        t = y / H
-        if code in [95,96,99]:
-            r,g,b = int(15+t*25), int(8+t*15), int(35+t*50)
-        elif code in [61,63,65,80,81,82,51,53,55]:
-            r,g,b = int(30+t*25), int(50+t*35), int(90+t*55)
-        elif code == 0:
-            r,g,b = int(15+t*8), int(70+t*35), int(170+t*35)
-        else:
-            r,g,b = int(50+t*25), int(70+t*35), int(110+t*55)
-        draw.line([(0,y),(W,y)], fill=(r,g,b,255))
+    # Background gradient — weather-aware
+    if alert_mode:
+        for y in range(H):
+            t=y/H; draw.line([(0,y),(W,y)], fill=(int(40+t*20),int(5+t*8),int(5+t*10),255))
+    elif code in [95,96,99]:
+        for y in range(H):
+            t=y/H; draw.line([(0,y),(W,y)], fill=(int(15+t*25),int(8+t*15),int(35+t*50),255))
+    elif code in [61,63,65,80,81,82,51,53,55]:
+        for y in range(H):
+            t=y/H; draw.line([(0,y),(W,y)], fill=(int(20+t*20),int(40+t*30),int(80+t*50),255))
+    elif code == 0:
+        for y in range(H):
+            t=y/H; draw.line([(0,y),(W,y)], fill=(int(10+t*8),int(60+t*35),int(155+t*35),255))
+    else:
+        for y in range(H):
+            t=y/H; draw.line([(0,y),(W,y)], fill=(int(40+t*20),int(60+t*30),int(100+t*50),255))
 
-    try:
-        font_huge  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 180)
-        font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 52)
-        font_med   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 36)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
-        font_tiny  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 22)
-        font_xs    = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
-    except Exception as e:
-        log.debug(f"weather font fallback: {e}")
-        font_huge = font_large = font_med = font_small = font_tiny = font_xs = ImageFont.load_default()
+    # Dark vignette at top so logo is readable
+    for y in range(110):
+        draw.line([(0,y),(W,y)], fill=(0,0,0,int(130*(1-y/110))))
+
+    def F(sz, bold=False):
+        try:
+            return ImageFont.truetype(
+                f"/usr/share/fonts/truetype/dejavu/DejaVuSans{chr(45)+'Bold' if bold else ''}.ttf", sz)
+        except:
+            return ImageFont.load_default()
+
+    font_huge  = F(160, True)
+    font_large = F(48,  True)
+    font_med   = F(34)
+    font_small = F(26,  True)
+    font_tiny  = F(21)
+    font_xs    = F(17)
+    font_xxs   = F(14)
 
     from datetime import timezone
     mvt = datetime.now(timezone.utc) + timedelta(hours=5)
 
-    # Location
-    loc = "Malé, Maldives"
-    lw = draw.textlength(loc, font=font_large)
-    draw.text(((W-lw)//2, 55), loc, font=font_large, fill=(255,255,255,230))
+    # Samuga logo — top left
+    try:
+        logo = Image.open("logo.png").convert("RGBA")
+        lh = 62; lw2 = int(logo.width * lh / logo.height)
+        logo = logo.resize((lw2, lh), Image.LANCZOS)
+        ir = img.convert("RGBA"); ir.paste(logo, (36, 24), logo)
+        img = ir.convert("RGB"); draw = ImageDraw.Draw(img, "RGBA")
+    except Exception as e:
+        log.debug(f"weather logo: {e}")
 
-    # Big weather icon (drawn)
-    draw_weather_icon(draw, code, W//2, 210, size=100)
+    # Alert accent bars
+    if alert_mode:
+        draw.rectangle([(0,0),(W,6)], fill=(220,50,50,255))
+        draw.rectangle([(0,0),(5,H)], fill=(220,50,50,255))
+        btext = "WEATHER ALERT"
+        btw = draw.textlength(btext, font=font_small)
+        draw.text(((W-btw)//2, 36), btext, font=font_small, fill=(255,80,80,255))
+
+    # Channel tag top right
+    tag = "t.me/samugacommunity"
+    ttw = draw.textlength(tag, font=font_xxs)
+    draw.text((W-ttw-36, 40), tag, font=font_xxs, fill=(255,255,255,140))
+
+    # Location
+    loc = "Male, Maldives"
+    top_y = 100 if not alert_mode else 68
+    lcw = draw.textlength(loc, font=font_large)
+    draw.text(((W-lcw)//2, top_y), loc, font=font_large, fill=(255,255,255,230))
+
+    # Big icon
+    draw_weather_icon(draw, code, W//2, top_y+80, size=90)
 
     # Temperature
-    temp_str = f"{temp}°"
-    tw = draw.textlength(temp_str, font=font_huge)
-    draw.text(((W-tw)//2, 320), temp_str, font=font_huge, fill=(255,255,255,255))
+    temp_str = f"{temp}\u00b0"
+    ttw2 = draw.textlength(temp_str, font=font_huge)
+    draw.text(((W-ttw2)//2, top_y+180), temp_str, font=font_huge, fill=(255,255,255,255))
 
     # Condition
-    cw = draw.textlength(condition, font=font_large)
-    draw.text(((W-cw)//2, 520), condition, font=font_large, fill=(255,255,255,200))
+    ccw = draw.textlength(condition, font=font_large)
+    draw.text(((W-ccw)//2, top_y+356), condition, font=font_large, fill=(255,255,255,200))
 
-    # H / L
-    hl_str = f"H:{temp_max}°  L:{temp_min}°"
+    # Alert text
+    if alert_mode and alert_text:
+        atw = draw.textlength(alert_text, font=font_small)
+        if atw > W-80:
+            words2=alert_text.split(); alines=[]; cur2=""
+            for aw in words2:
+                if draw.textlength(cur2+" "+aw,font=font_small)<W-80: cur2=(cur2+" "+aw).strip()
+                else: alines.append(cur2); cur2=aw
+            if cur2: alines.append(cur2)
+            for ai,al in enumerate(alines[:2]):
+                alw=draw.textlength(al,font=font_small)
+                draw.text(((W-alw)//2, top_y+414+ai*34), al, font=font_small, fill=(255,120,120,255))
+        else:
+            draw.text(((W-atw)//2, top_y+414), alert_text, font=font_small, fill=(255,120,120,255))
+
+    # H/L
+    hl_y = top_y + 414 if not alert_mode else top_y + 480
+    hl_str = f"H:{temp_max}\u00b0  L:{temp_min}\u00b0"
     hlw = draw.textlength(hl_str, font=font_med)
-    draw.text(((W-hlw)//2, 585), hl_str, font=font_med, fill=(255,255,255,190))
+    draw.text(((W-hlw)//2, hl_y), hl_str, font=font_med, fill=(255,255,255,190))
 
-    # Details row: feels, humidity, wind
-    details = f"Feels {feels}°   Humidity {humidity}%   Wind {wind} km/h"
-    dw = draw.textlength(details, font=font_tiny)
-    draw.text(((W-dw)//2, 635), details, font=font_tiny, fill=(255,255,255,170))
+    dy = hl_y + 46
+    # Row 1: feels, humidity, wind
+    row1 = f"Feels {feels}\u00b0   Humidity {humidity}%   Wind {wind} km/h"
+    if gusts and gusts > wind: row1 += f" (gusts {gusts})"
+    r1w = draw.textlength(row1, font=font_tiny)
+    draw.text(((W-r1w)//2, dy), row1, font=font_tiny, fill=(255,255,255,175))
+    dy += 30
 
-    # Sunrise / Sunset row
+    # Row 2: UV, visibility, dew point, pressure
+    r2parts = []
+    if uv: r2parts.append(f"UV {uv}")
+    if vis: r2parts.append(f"Vis {vis} km")
+    if dew: r2parts.append(f"Dew {dew}\u00b0")
+    if pressure: r2parts.append(f"{pressure} hPa")
+    if r2parts:
+        row2 = "   ".join(r2parts)
+        r2w = draw.textlength(row2, font=font_tiny)
+        draw.text(((W-r2w)//2, dy), row2, font=font_tiny, fill=(255,255,255,150))
+        dy += 30
+
+    # Row 3: sunrise/sunset + precip prob
     sun_str = f"Sunrise {sunrise_str}   Sunset {sunset_str}"
-    sw = draw.textlength(sun_str, font=font_tiny)
-    draw.text(((W-sw)//2, 665), sun_str, font=font_tiny, fill=(255,220,100,200))
+    if precip_p: sun_str += f"   Rain {precip_p}%"
+    ssw = draw.textlength(sun_str, font=font_tiny)
+    draw.text(((W-ssw)//2, dy), sun_str, font=font_tiny, fill=(255,220,100,200))
+    dy += 30
 
     # Divider
-    draw.line([(60, 705), (W-60, 705)], fill=(255,255,255,50), width=1)
+    div_y = dy + 8
+    draw.line([(60,div_y),(W-60,div_y)], fill=(255,255,255,50), width=1)
 
-    # Hourly forecast — next 8 hours with drawn icons
+    # Hourly strip
     now_hour = mvt.hour
-    slot_w = (W - 120) // 8
+    slot_w2 = (W-120)//8
     displayed = 0
+    y_base = div_y + 20
 
-    for i, (h_str, t, c, p) in enumerate(zip(hours, temps, codes, precip)):
-        try:
-            h_hour = int(h_str.split("T")[1][:2])
-        except Exception: continue
+    for i2,(h_str,ht,hc,hp) in enumerate(zip(hours,temps,codes,precip)):
+        try: h_hour = int(h_str.split("T")[1][:2])
+        except: continue
         if h_hour < now_hour: continue
         if displayed >= 8: break
-
-        x = 60 + displayed * slot_w + slot_w // 2
-        y_base = 725
-
-        # Hour label
-        h_label = "Now" if displayed == 0 else f"{h_hour:02d}:00"
-        hw = draw.textlength(h_label, font=font_xs)
-        draw.text((x - hw//2, y_base), h_label, font=font_xs, fill=(255,255,255,170))
-
-        # Drawn weather icon
-        draw_weather_icon(draw, c, x, y_base + 45, size=28)
-
-        # Temp
-        t_str = f"{round(t)}°"
-        tw2 = draw.textlength(t_str, font=font_small)
-        draw.text((x - tw2//2, y_base + 75), t_str, font=font_small, fill=(255,255,255,255))
-
-        # Rain %
-        if p and p > 0:
-            p_str = f"{p}%"
-            pw = draw.textlength(p_str, font=font_xs)
-            draw.text((x - pw//2, y_base + 108), p_str, font=font_xs, fill=(120,200,255,210))
-
+        hx = 60 + displayed*slot_w2 + slot_w2//2
+        h_label = "Now" if displayed==0 else f"{h_hour:02d}:00"
+        hlw2 = draw.textlength(h_label, font=font_xs)
+        draw.text((hx-hlw2//2, y_base), h_label, font=font_xs, fill=(255,255,255,170))
+        draw_weather_icon(draw, hc, hx, y_base+40, size=26)
+        ht_str = f"{round(ht)}\u00b0"
+        htw = draw.textlength(ht_str, font=font_small)
+        draw.text((hx-htw//2, y_base+68), ht_str, font=font_small, fill=(255,255,255,255))
+        if hp and hp>0:
+            hp_str=f"{hp}%"; hpw=draw.textlength(hp_str,font=font_xs)
+            draw.text((hx-hpw//2, y_base+100), hp_str, font=font_xs, fill=(120,200,255,210))
         displayed += 1
 
-    # Bottom divider
-    draw.line([(60, 895), (W-60, 895)], fill=(255,255,255,50), width=1)
-
-    # Date + time
-    time_str = mvt.strftime("%A, %d %B %Y  •  %H:%M MVT")
-    fw = draw.textlength(time_str, font=font_xs)
-    draw.text(((W-fw)//2, 910), time_str, font=font_xs, fill=(255,255,255,130))
-
-    # Brand
+    # Bottom bar
+    bar_y = H - 78
+    draw.line([(60,bar_y),(W-60,bar_y)], fill=(255,255,255,40), width=1)
+    time_str = mvt.strftime("%A, %d %B %Y  \u2022  %H:%M MVT")
+    tfw = draw.textlength(time_str, font=font_xs)
+    draw.text(((W-tfw)//2, bar_y+10), time_str, font=font_xs, fill=(255,255,255,120))
     brand = "Samuga Media  |  @samugacommunity"
-    bw = draw.textlength(brand, font=font_small)
-    draw.text(((W-bw)//2, 940), brand, font=font_small, fill=(255,255,255,200))
+    bw3 = draw.textlength(brand, font=font_small)
+    draw.text(((W-bw3)//2, bar_y+34), brand, font=font_small, fill=(255,255,255,200))
+    if source:
+        src_txt = f"Data: {source}"
+        stw2 = draw.textlength(src_txt, font=font_xxs)
+        draw.text((W-stw2-36, bar_y+58), src_txt, font=font_xxs, fill=(255,255,255,80))
 
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG")
     buf.seek(0)
     return buf
 
+# ── Weather Alert System ──────────────────────────────────────────────────────
+# Checks every weather fetch for dangerous conditions.
+# Max 2 alerts per day (MVT). Never spams.
+weather_alerts_today = {"date": None, "count": 0}
+
+ALERT_THRESHOLDS = {
+    "heavy_rain":    {"precip_prob": 85, "rain_codes": [65,82,95,96,99]},
+    "strong_wind":   {"wind_kmh": 40, "gust_kmh": 55},
+    "thunderstorm":  {"codes": [95,96,99]},
+}
+
+def can_send_weather_alert():
+    global weather_alerts_today
+    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+    if weather_alerts_today["date"] != today:
+        weather_alerts_today = {"date": today, "count": 0}
+    return weather_alerts_today["count"] < 2
+
+def increment_alert_count():
+    global weather_alerts_today
+    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+    if weather_alerts_today["date"] != today:
+        weather_alerts_today = {"date": today, "count": 0}
+    weather_alerts_today["count"] += 1
+    log.info(f"⚠️ Weather alerts today: {weather_alerts_today['count']}/2")
+
+def detect_weather_alert(weather_data):
+    """
+    Check if current conditions warrant an alert.
+    Returns (should_alert, alert_type, alert_text) or (False, None, None).
+    """
+    current = weather_data.get("current", {})
+    code    = current.get("weathercode", 0)
+    wind    = current.get("windspeed_10m", 0)
+    gusts   = current.get("windgust_10m", 0)
+    precip  = current.get("precipitation_prob", 0)
+
+    # Thunderstorm — highest priority
+    if code in ALERT_THRESHOLDS["thunderstorm"]["codes"]:
+        return (True, "thunderstorm",
+                f"Thunderstorm conditions over Malé — stay safe and stay indoors.")
+
+    # Heavy rain
+    if (code in ALERT_THRESHOLDS["heavy_rain"]["rain_codes"] and
+            precip >= ALERT_THRESHOLDS["heavy_rain"]["precip_prob"]):
+        return (True, "heavy_rain",
+                f"Heavy rain expected — {int(precip)}% precipitation probability. "
+                "Expect poor visibility and flooding risk.")
+
+    # Rough sea / strong wind
+    if (wind >= ALERT_THRESHOLDS["strong_wind"]["wind_kmh"] or
+            gusts >= ALERT_THRESHOLDS["strong_wind"]["gust_kmh"]):
+        w_str = f"Wind {int(wind)} km/h" + (f", gusts {int(gusts)} km/h" if gusts > wind else "")
+        return (True, "strong_wind",
+                f"Rough sea conditions — {w_str}. "
+                "Caution advised for sea travel and water activities.")
+
+    return (False, None, None)
+
+def send_weather_alert(weather_data, alert_type, alert_text):
+    """Send a weather alert card to community + core team. Max 2/day."""
+    if not can_send_weather_alert():
+        log.info("⚠️ Weather alert limit (2/day) reached — skipping")
+        return
+    try:
+        card = generate_weather_card(weather_data, alert_mode=True, alert_text=alert_text)
+        current = weather_data.get("current", {})
+        code = current.get("weathercode", 0)
+        emoji, condition = weather_code_to_info(code)
+
+        alert_icons = {
+            "thunderstorm": "⛈️",
+            "heavy_rain":   "🌧️",
+            "strong_wind":  "💨",
+        }
+        icon = alert_icons.get(alert_type, "⚠️")
+
+        caption = (
+            f"⚠️ <b>WEATHER ALERT — Malé, Maldives</b>\n\n"
+            f"{icon} {alert_text}\n\n"
+            f"🌡️ Current: {round(current.get('temperature_2m',29))}°C — {condition}\n\n"
+            f"📡 <b>Samuga Media</b> | @samugacommunity"
+        )
+
+        # Community channel
+        card.seek(0)
+        send_photo(TELEGRAM_CHANNEL_ID, card, caption)
+
+        # Core team notification
+        card.seek(0)
+        team_note = (
+            f"⚠️ <b>Weather alert sent to community</b>\n"
+            f"Type: {alert_type}\n"
+            f"{alert_text}\n"
+            f"Alerts today: {weather_alerts_today['count']+1}/2"
+        )
+        send_text(CORE_TEAM_CHAT_ID, team_note)
+
+        increment_alert_count()
+        log.info(f"⚠️ Weather alert sent: {alert_type}")
+    except Exception as e:
+        log.error(f"Weather alert send: {e}")
+
 def send_weather_update(time_of_day="morning"):
-    """Send weather card to Telegram"""
+    """Send weather card to Telegram + check for alerts"""
     log.info(f"🌤️ Weather update ({time_of_day})...")
     try:
         data = get_weather_data()
         if not data:
             log.error("Weather: no data"); return
+
         card = generate_weather_card(data)
         current = data.get("current", {})
-        temp = round(current.get("temperature_2m", 29))
-        code = current.get("weathercode", 0)
+        temp     = round(current.get("temperature_2m", 29))
+        code     = current.get("weathercode", 0)
+        uv       = current.get("uv_index", 0)
+        wind     = round(current.get("windspeed_10m", 10))
+        precip_p = current.get("precipitation_prob", 0)
+        source   = data.get("_source", "")
         emoji, condition = weather_code_to_info(code)
-        greeting = "🌅 Good Morning Maldives!" if time_of_day == "morning" else "🌙 Good Evening Maldives!"
-        caption = (f"{greeting}\n\n"
-                   f"{emoji} <b>Current Weather \u2014 Mal\u00e9</b>\n"
-                   f"\U0001f321\ufe0f <b>{temp}\u00b0C</b> \u2014 {condition}\n\n"
-                   f"\U0001f4e1 <b>Samuga Media</b> | @samugacommunity")
+        greeting = "\U0001f305 Good Morning Maldives!" if time_of_day == "morning" else "\U0001f319 Good Evening Maldives!"
+        src_tag = f"\n<i>Data: {source}</i>" if source else ""
+        caption = (
+            f"{greeting}\n\n"
+            f"{emoji} <b>Current Weather \u2014 Mal\u00e9</b>\n"
+            f"\U0001f321\ufe0f <b>{temp}\u00b0C</b> \u2014 {condition}\n"
+            f"\U0001f4a8 Wind {wind} km/h  \u00b7  \u2614 Rain {precip_p}%  \u00b7  \u2600\ufe0f UV {uv}\n\n"
+            f"\U0001f4e1 <b>Samuga Media</b> | @samugacommunity"
+            f"{src_tag}"
+        )
         send_photo(TELEGRAM_CHANNEL_ID, card, caption)
-        log.info(f"✅ Weather card sent ({time_of_day})")
+        log.info(f"\u2705 Weather card sent ({time_of_day}) via {source}")
+
+        # Alert check after every regular card
+        should_alert, alert_type, alert_text = detect_weather_alert(data)
+        if should_alert:
+            log.info(f"\u26a0\ufe0f Alert detected: {alert_type} — {alert_text[:60]}")
+            send_weather_alert(data, alert_type, alert_text)
+        else:
+            log.info("\u2705 No alert conditions detected")
+
     except Exception as e:
         log.error(f"Weather update: {e}")
 
