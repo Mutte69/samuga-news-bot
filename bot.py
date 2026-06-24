@@ -127,6 +127,10 @@ def canonical_category(cat, title="", summary=""):
 # ── Core Team Session Context (in-memory only, clears on restart) ────────────
 core_team_session_context = {}  # user_id -> stored context
 
+# Pending manual card waiting for /confirm before firing to all platforms
+# Only one at a time — new "create card and post" replaces the previous pending one.
+_pending_manual_post = {}  # {card_bytes, full_caption, chat_id, thread_id, first_name}
+
 # ── Universal Approval Queue (in-memory) ─────────────────────────────────────
 # Every card (English + Dhivehi) waits here for Content Lab approval before posting.
 # Cards expire after 2 hours if not approved.
@@ -4332,23 +4336,39 @@ def handle_updates():
                                     if destination in ["community", "all"]:
                                         card.seek(0)
                                         if send_to_telegram(card, full_caption):
-                                            posted.append("Community")
+                                            posted.append("Community ✅")
 
                                     if destination == "coreteam":
                                         card.seek(0)
                                         if send_photo(CORE_TEAM_CHAT_ID, card, full_caption, thread_id=CONTENT_LAB_THREAD_ID):
-                                            posted.append("Content Lab")
+                                            posted.append("Content Lab ✅")
 
                                     if destination == "all":
-                                        card_bytes = card.getvalue()
-                                        buf_social = io.BytesIO(card_bytes)
-                                        threading.Thread(target=post_to_social, args=(buf_social, full_caption), daemon=True).start()
-                                        posted.append("FB + IG + Twitter")
+                                        # ── Confirmation gate before firing to socials ──
+                                        # Card already posted to Telegram above.
+                                        # Store card + caption and ask for /confirm.
+                                        card_bytes_stored = card.getvalue()
+                                        _pending_manual_post.clear()
+                                        _pending_manual_post.update({
+                                            "card_bytes":   card_bytes_stored,
+                                            "full_caption": full_caption,
+                                            "chat_id":      chat_id,
+                                            "thread_id":    thread_id,
+                                            "first_name":   first_name,
+                                            "created_at":   utcnow(),
+                                        })
+                                        posted.append("Community ✅")
+                                        send_text(chat_id,
+                                            f"✅ Posted to <b>Community</b>.\n\n"
+                                            f"📲 Ready to post to <b>Facebook + Instagram + Twitter</b>.\n"
+                                            f"Type <code>/confirm</code> to fire to all socials, or ignore to skip.",
+                                            reply_to=msg_id, thread_id=thread_id)
+                                        log.info(f"🃏 Manual card pending social confirm by {first_name}")
 
-                                    if posted:
+                                    if posted and destination != "all":
                                         send_text(chat_id, "✅ Posted to: " + ", ".join(posted), reply_to=msg_id, thread_id=thread_id)
                                         log.info(f"✅ Manual card posted to: {posted}")
-                                    else:
+                                    elif not posted and destination != "all":
                                         send_text(chat_id, "❌ Failed to post.", reply_to=msg_id, thread_id=thread_id)
 
                                 except Exception as e:
@@ -4364,6 +4384,44 @@ def handle_updates():
                                 log.info(f"📖 Session context stored: {context_text[:60]}...")
                             else:
                                 send_text(chat_id, "Send it like this: /read [paste your content here]", reply_to=msg_id, thread_id=thread_id)
+
+                        # /confirm — fire pending manual card to Facebook + Instagram + Twitter
+                        elif text.strip().lower() in ["/confirm"]:
+                            if not _pending_manual_post:
+                                send_text(chat_id,
+                                    "No card waiting for confirmation. "
+                                    "Use <code>create card and post</code> first.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                # Check it hasn't gone stale (10 min window)
+                                age = (utcnow() - _pending_manual_post["created_at"]).total_seconds()
+                                if age > 600:
+                                    _pending_manual_post.clear()
+                                    send_text(chat_id,
+                                        "⏰ That card expired (10 min window). "
+                                        "Create a new one with <code>create card and post</code>.",
+                                        reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    try:
+                                        buf_social = io.BytesIO(_pending_manual_post["card_bytes"])
+                                        send_text(chat_id, f"🚀 Firing to FB + IG + Twitter... ⏳",
+                                                  reply_to=msg_id, thread_id=thread_id)
+                                        threading.Thread(
+                                            target=post_to_social,
+                                            args=(buf_social, _pending_manual_post["full_caption"]),
+                                            daemon=True
+                                        ).start()
+                                        who = _pending_manual_post.get("first_name", "Someone")
+                                        _pending_manual_post.clear()
+                                        send_text(chat_id,
+                                            f"✅ <b>Confirmed by {first_name}</b> — posted to FB + IG + Twitter.\n"
+                                            f"📡 All platforms done.",
+                                            reply_to=msg_id, thread_id=thread_id)
+                                        log.info(f"✅ Manual card confirmed by {first_name} — fired to socials")
+                                    except Exception as e:
+                                        log.error(f"/confirm: {e}")
+                                        send_text(chat_id, f"❌ Error firing to socials: {e}",
+                                                  reply_to=msg_id, thread_id=thread_id)
 
                         # Respond only when directly tagged — no more jumping in proactively
                         elif tagged:
