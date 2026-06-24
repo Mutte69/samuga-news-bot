@@ -3925,11 +3925,6 @@ def handle_updates():
                                     break
                             # Remove bot mention
                             raw_text = re.sub(r"@\w+", "", raw_text).strip()
-                            # Only strip English category keywords if not Thaana text
-                            # (regex \b breaks on Unicode/Thaana characters)
-                            if not any('\u0780' <= ch <= '\u07BF' for ch in raw_text):
-                                for kw in ["breaking", "sports", "football", "world", "tourism", "weather", "local", "political"]:
-                                    raw_text = re.sub(rf"\b{kw}\b", "", raw_text, flags=re.IGNORECASE).strip()
                             raw_text = raw_text.strip()
 
                             if video and not photo:
@@ -3938,14 +3933,36 @@ def handle_updates():
                                 send_text(chat_id, "Send a photo with caption text, or just text, then add the command at the end.", reply_to=msg_id, thread_id=thread_id)
                             else:
                                 # ── Parse headline / subheading split ──────────────────
-                                # Blank line (\n\n) = intentional headline/subhead separator.
-                                # Language-aware limit: Thaana glyphs are wider so less fits.
-                                #   Dhivehi: 80 chars max on card
-                                #   English: 150 chars max on card
-                                # If subhead exceeds limit → headline only on card, subhead to caption.
+                                # Split on blank lines first, then strip category keywords
+                                # from each part individually (handles Dhivehi text with
+                                # English category word at the bottom correctly).
+                                CAT_KWS = ["breaking news","breaking","political","politics",
+                                           "sports","sport","football","soccer","lifestyle",
+                                           "world","international","global","tourism","weather",
+                                           "local","culture","health","travel","resort","storm"]
+                                def strip_cat_kws(t):
+                                    """
+                                    Return empty string if this paragraph IS a category keyword
+                                    (possibly with punctuation/spaces). Otherwise return unchanged.
+                                    We only discard a whole paragraph that is purely a category
+                                    label — never strip keywords from inside real sentences.
+                                    """
+                                    cleaned = t.strip().rstrip("!.,;:").strip().lower()
+                                    if cleaned in CAT_KWS:
+                                        return ""
+                                    return t
+
+                                raw_parts = [p.strip() for p in raw_text.split("\n\n") if p.strip()]
+                                # A part that is ONLY a category keyword (after stripping) = discard
+                                parts = []
+                                for p in raw_parts:
+                                    cleaned = strip_cat_kws(p)
+                                    if cleaned:          # still has real content → keep
+                                        parts.append(cleaned)
+                                    # else: it was just "Breaking" or "Sports" → discard silently
+
                                 has_thaana_input = any('\u0780'<=c<='\u07bf' for c in raw_text)
                                 SUBHEAD_CARD_LIMIT = 80 if has_thaana_input else 150
-                                parts = [p.strip() for p in raw_text.split("\n\n") if p.strip()]
                                 if len(parts) >= 2:
                                     card_headline = parts[0]
                                     card_subhead  = " ".join(parts[1:])  # everything after first blank line
