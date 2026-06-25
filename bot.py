@@ -2581,10 +2581,53 @@ SPECIAL_DAY_DETAILS = {
     "Isra and Mi'raj":  "The night journey of the Prophet ﷺ and his ascension to the heavens.",
 }
 
+# ── Daily Islamic reminders (rotated when no special day) ────────────────────
+# Short reminders from Quran and authentic Sunnah. One shows per card, rotating
+# by day so each card is different.
+ISLAMIC_REMINDERS = [
+    ("\"Indeed, Allah is with the patient.\"", "Quran 2:153"),
+    ("\"So remember Me; I will remember you.\"", "Quran 2:152"),
+    ("\"Verily, with hardship comes ease.\"", "Quran 94:6"),
+    ("\"And He is with you wherever you are.\"", "Quran 57:4"),
+    ("\"Allah does not burden a soul beyond what it can bear.\"", "Quran 2:286"),
+    ("\"And whoever relies upon Allah — He is sufficient for him.\"", "Quran 65:3"),
+    ("\"Do not despair of the mercy of Allah.\"", "Quran 39:53"),
+    ("\"The best among you are those who learn the Quran and teach it.\"", "Bukhari"),
+    ("\"None of you truly believes until he loves for his brother what he loves for himself.\"", "Bukhari & Muslim"),
+    ("\"The strong believer is better and more beloved to Allah than the weak believer.\"", "Muslim"),
+    ("\"Whoever believes in Allah and the Last Day should speak good or remain silent.\"", "Bukhari & Muslim"),
+    ("\"Allah is beautiful and He loves beauty.\"", "Muslim"),
+    ("\"A kind word is charity.\"", "Bukhari & Muslim"),
+    ("\"The most beloved deeds to Allah are those done consistently, even if small.\"", "Bukhari & Muslim"),
+    ("\"He who does not thank people has not thanked Allah.\"", "Abu Dawud, Tirmidhi"),
+    ("\"Smiling at your brother is charity.\"", "Tirmidhi"),
+    ("\"Make things easy, do not make things difficult.\"", "Bukhari & Muslim"),
+    ("\"Whoever treads a path seeking knowledge, Allah eases his way to Paradise.\"", "Muslim"),
+    ("\"The believer is not one who eats his fill while his neighbour is hungry.\"", "Al-Adab Al-Mufrad"),
+    ("\"Fear Allah wherever you are, and follow a bad deed with a good one.\"", "Tirmidhi"),
+    ("\"And speak to people good words.\"", "Quran 2:83"),
+    ("\"Indeed, the patient will be given their reward without measure.\"", "Quran 39:10"),
+    ("\"Call upon Me; I will respond to you.\"", "Quran 40:60"),
+    ("\"Whoever is grateful — his gratitude is for his own good.\"", "Quran 31:12"),
+    ("\"Cleanliness is half of faith.\"", "Muslim"),
+    ("\"Richness is not having many possessions, but richness is contentment of the soul.\"", "Bukhari & Muslim"),
+    ("\"Be in this world as if you were a stranger or a traveller.\"", "Bukhari"),
+    ("\"Allah does not look at your bodies or wealth, but at your hearts and deeds.\"", "Muslim"),
+    ("\"The dua of a Muslim for his brother in his absence is answered.\"", "Muslim"),
+    ("\"And lower your wing in tenderness to the believers.\"", "Quran 15:88"),
+]
+
+def get_daily_islamic_reminder(mvt_now):
+    """Pick a reminder that rotates by day — different each day, stable within a day."""
+    day_index = mvt_now.timetuple().tm_yday  # 1..366
+    text, source = ISLAMIC_REMINDERS[day_index % len(ISLAMIC_REMINDERS)]
+    return {"text": text, "source": source}
+
 def get_prayer_times():
     """
     Fetch today's prayer times + Hijri date for Malé, Maldives.
-    Uses AlAdhan API — completely free, no key needed.
+    Uses AlAdhan API — free, no key. Uses exact Malé coordinates and the
+    Maldives-correct calculation so times match the official Islamic Ministry.
     Returns dict or None on failure.
     """
     try:
@@ -2592,19 +2635,31 @@ def get_prayer_times():
         mvt_now = datetime.now(timezone.utc) + _td(hours=5)
         date_str = mvt_now.strftime("%d-%m-%Y")
 
-        # Method 4 = Umm al-Qura (standard across Maldives/Gulf)
-        url = (f"https://api.aladhan.com/v1/timingsByCity/{date_str}"
-               f"?city=Male&country=Maldives&method=4")
+        # Exact Malé coordinates (Islamic Centre area) + timezone.
+        # Maldives officially uses a fixed 90-min Isha interval, Shafi'i Asr.
+        # method=99 (custom): Fajr 19.5°, Maghrib default, Isha = 90 mins after Maghrib.
+        # tune offsets nudge to match Maldives Islamic Ministry published times.
+        MALE_LAT, MALE_LON = 4.1755, 73.5093
+        url = (f"https://api.aladhan.com/v1/timings/{date_str}"
+               f"?latitude={MALE_LAT}&longitude={MALE_LON}"
+               f"&method=99&methodSettings=19.5,null,90%20min"
+               f"&school=0"
+               f"&timezonestring=Indian/Maldives"
+               f"&tune=0,2,2,3,3,2,2,2,0")
         resp = requests.get(url, timeout=10)
         if resp.status_code != 200:
-            log.warning(f"Prayer times API: HTTP {resp.status_code}")
-            return None
+            log.warning(f"Prayer times API: HTTP {resp.status_code} — trying fallback")
+            # Fallback: simple city query with Umm al-Qura
+            url2 = (f"https://api.aladhan.com/v1/timingsByCity/{date_str}"
+                    f"?city=Male&country=Maldives&method=4")
+            resp = requests.get(url2, timeout=10)
+            if resp.status_code != 200:
+                return None
 
         d = resp.json().get("data", {})
         timings = d.get("timings", {})
         hijri   = d.get("date", {}).get("hijri", {})
 
-        # Extract prayer times (strip timezone suffix like "+05:00")
         def clean_t(t): return t[:5] if t else "--:--"
 
         prayers = {
@@ -2615,7 +2670,6 @@ def get_prayer_times():
             "Isha":    clean_t(timings.get("Isha",    "")),
         }
 
-        # Hijri date
         h_day   = int(hijri.get("day", 0))
         h_month = hijri.get("month", {}).get("number", 0)
         h_month_name = hijri.get("month", {}).get("en", "")
@@ -2627,9 +2681,7 @@ def get_prayer_times():
         special_desc = ""
 
         if special_name:
-            # Try to enrich API holiday with a meaningful description
             special_desc = SPECIAL_DAY_DETAILS.get(special_name, "")
-            # Also try matching our built-in dict for description
             if not special_desc:
                 key = (h_month, h_day)
                 if key in HIJRI_SPECIAL_DAYS:
@@ -2639,7 +2691,13 @@ def get_prayer_times():
             if key in HIJRI_SPECIAL_DAYS:
                 special_name, special_desc = HIJRI_SPECIAL_DAYS[key]
 
-        log.info(f"🕌 Prayer times fetched — Hijri: {h_day} {h_month_name} {h_year}"
+        # If NOT a special day — pick a rotating Islamic reminder
+        reminder = None
+        if not special_name:
+            reminder = get_daily_islamic_reminder(mvt_now)
+
+        log.info(f"🕌 Prayer times — Fajr {prayers['Fajr']} Dhuhr {prayers['Dhuhr']} "
+                 f"Asr {prayers['Asr']} Maghrib {prayers['Maghrib']} Isha {prayers['Isha']}"
                  + (f" | {special_name}" if special_name else ""))
 
         return {
@@ -2649,6 +2707,7 @@ def get_prayer_times():
             "hijri_year":   h_year,
             "special_name": special_name,
             "special_desc": special_desc,
+            "reminder":     reminder,
         }
 
     except Exception as e:
@@ -3285,6 +3344,7 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
         h_year   = prayer_data.get("hijri_year", "")
         sp_name  = prayer_data.get("special_name", "")
         sp_desc  = prayer_data.get("special_desc", "")
+        reminder = prayer_data.get("reminder", None)
 
         flank_y = temp_y + 30   # align with top of big temperature
 
@@ -3316,12 +3376,11 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
         draw.text((rx, ry), f"{h_year} AH", font=f_body, fill=(200,225,255,165))
         ry += 70
 
-        # Special day box (gold) with wrapped description
+        # Special day box (gold) OR Islamic reminder box (subtle teal)
         if sp_name:
             box_left  = rx
             box_right = W - 80
             box_w_px  = box_right - box_left
-            # Wrap description to fit
             desc_lines = []
             if sp_desc:
                 words = sp_desc.split()
@@ -3341,6 +3400,35 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
             for dl in desc_lines:
                 draw.text((box_left+24, dyy), dl, font=F(28), fill=(255,205,90,210))
                 dyy += 38
+        elif reminder:
+            # Islamic reminder box — subtle teal/blue accent
+            box_left  = rx
+            box_right = W - 80
+            box_w_px  = box_right - box_left
+            r_text = reminder.get("text", "")
+            r_src  = reminder.get("source", "")
+            # Wrap the reminder text
+            words = r_text.split()
+            lines = []
+            cur = ""
+            for w in words:
+                test = (cur + " " + w).strip()
+                if draw.textlength(test, font=F(30)) <= box_w_px - 40:
+                    cur = test
+                else:
+                    lines.append(cur); cur = w
+            if cur: lines.append(cur)
+            box_h = 50 + len(lines)*40 + 50
+            draw.rounded_rectangle([(box_left, ry),(box_right, ry+box_h)],
+                                   radius=18, fill=(10,40,55,170))
+            # Small header
+            draw.text((box_left+24, ry+16), "✦ DAILY REMINDER", font=F(24,True), fill=(120,200,220,220))
+            dyy = ry + 56
+            for ln in lines:
+                draw.text((box_left+24, dyy), ln, font=F(30), fill=(220,240,250,225))
+                dyy += 40
+            # Source
+            draw.text((box_left+24, dyy+4), f"— {r_src}", font=F(26), fill=(150,200,220,190))
 
     # ── CONDITION ─────────────────────────────────────────────────────────────
     cond_y = temp_y + 440
