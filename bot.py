@@ -4945,6 +4945,107 @@ def get_sender_info(user_name, first_name):
             return info
     return None
 
+# ── Newsroom snapshot — cached 10 min, injected into brain when relevant ─────
+_snapshot_cache = {"data": None, "ts": None}
+_SNAPSHOT_TTL = 600  # 10 minutes
+
+def get_newsroom_snapshot():
+    """
+    Pull a tight live snapshot from the DB. Cached 10 min — safe to call on
+    every tagged message without hammering the DB or wasting tokens.
+    Returns a short string (~300 tokens max) or "" if DB off.
+    """
+    global _snapshot_cache
+    if not DB_ENABLED:
+        return ""
+    now = utcnow()
+    if (_snapshot_cache["ts"] and
+            (now - _snapshot_cache["ts"]).total_seconds() < _SNAPSHOT_TTL and
+            _snapshot_cache["data"]):
+        return _snapshot_cache["data"]
+    try:
+        lines = []
+
+        # ── What we posted today ─────────────────────────────────────────────
+        posted_today = db_execute("""
+            SELECT title, category, source, posted_at
+            FROM articles
+            WHERE status='posted' AND posted_at > NOW() - INTERVAL '24 hours'
+            ORDER BY posted_at DESC LIMIT 6
+        """, fetch="all") or []
+        if posted_today:
+            lines.append("POSTED TODAY:")
+            for title, cat, src, ts in posted_today:
+                from datetime import timedelta as _td
+                mvt = (ts + _td(hours=5)).strftime("%H:%M") if ts else ""
+                lines.append(f"  {mvt} [{cat}] {title[:55]} ({src})")
+
+        # ── Quick stats ──────────────────────────────────────────────────────
+        scanned = db_execute("SELECT COUNT(*) FROM articles WHERE found_at > NOW() - INTERVAL '24 hours'", fetch="one")
+        posted_n = db_execute("SELECT COUNT(*) FROM articles WHERE status='posted' AND posted_at > NOW() - INTERVAL '24 hours'", fetch="one")
+        queued_n = db_execute("SELECT COUNT(*) FROM articles WHERE status='queued'", fetch="one")
+        lines.append(f"\nTODAY: {posted_n[0] if posted_n else 0} posted, {scanned[0] if scanned else 0} scanned, {queued_n[0] if queued_n else 0} waiting approval")
+
+        # ── Best performer ───────────────────────────────────────────────────
+        top = db_execute("""
+            SELECT title, tg_views, meta_engagement
+            FROM articles
+            WHERE status='posted' AND posted_at > NOW() - INTERVAL '48 hours'
+              AND (tg_views > 0 OR meta_engagement > 0)
+            ORDER BY (tg_views + meta_engagement * 3) DESC LIMIT 1
+        """, fetch="one")
+        if top:
+            lines.append(f"TOP PERFORMER: {top[0][:55]} ({top[1]} views, {top[2]} reactions)")
+
+        # ── Developing stories ───────────────────────────────────────────────
+        dev = db_execute("""
+            SELECT id, title, update_count FROM stories
+            WHERE status='developing' AND last_update > NOW() - INTERVAL '24 hours'
+            ORDER BY update_count DESC LIMIT 3
+        """, fetch="all") or []
+        if dev:
+            lines.append("\nDEVELOPING STORIES:")
+            for sid, t, n in dev:
+                lines.append(f"  Story #{sid} ({n} updates): {t[:55]}")
+
+        # ── Trending themes ──────────────────────────────────────────────────
+        try:
+            trends = detect_trends(hours=24, min_mentions=2)
+            if trends:
+                top_themes = ", ".join(t[0] for t in trends[:4])
+                lines.append(f"\nTRENDING: {top_themes}")
+        except:
+            pass
+
+        # ── Pending approvals ────────────────────────────────────────────────
+        pending_keys = [k for k, v in approval_queue.items()
+                        if not v.get("expired", False)][:3]
+        if pending_keys:
+            lines.append(f"\nPENDING APPROVAL: {len(pending_keys)} card(s) waiting")
+
+        snapshot = "\n".join(lines)
+        _snapshot_cache = {"data": snapshot, "ts": now}
+        return snapshot
+
+    except Exception as e:
+        log.debug(f"Snapshot: {e}")
+        return ""
+
+def _needs_newsroom_context(message):
+    """
+    Returns True only when the conversation is about newsroom operations.
+    If someone says 'lol ok' or 'thanks', skip the snapshot — save tokens.
+    """
+    ml = message.lower()
+    keywords = [
+        "post", "story", "news", "publish", "article", "trending", "what did",
+        "what have", "today", "engagement", "views", "reactions", "performing",
+        "pending", "queue", "approval", "developing", "happening", "viral",
+        "breaking", "latest", "update", "idea", "suggest", "cover", "topic",
+        "what should", "should we", "think about", "what about", "plan"
+    ]
+    return any(k in ml for k in keywords)
+
 def should_respond_proactively(text, sender_name=""):
     """
     Use Claude to decide in 1 token whether the bot should jump in.
@@ -5013,10 +5114,17 @@ def chat_with_coreteam(message, sender_name, sender_info=None, conversation_hist
             try: ctx_results["memory"] = mem_list(20)
             except: ctx_results["memory"] = []
 
+        def _fetch_snapshot():
+            # Only pull the live snapshot if this message is newsroom-related
+            if _needs_newsroom_context(message):
+                try: ctx_results["snapshot"] = get_newsroom_snapshot()
+                except: ctx_results["snapshot"] = ""
+
         threads = [
             threading.Thread(target=_fetch_news),
             threading.Thread(target=_fetch_web),
             threading.Thread(target=_fetch_memory),
+            threading.Thread(target=_fetch_snapshot),
         ]
         for t in threads: t.start()
         for t in threads: t.join(timeout=6)
@@ -5024,6 +5132,7 @@ def chat_with_coreteam(message, sender_name, sender_info=None, conversation_hist
         headlines = ctx_results.get("news", [])
         web_info  = ctx_results.get("web", "")
         memories  = ctx_results.get("memory", [])
+        snapshot  = ctx_results.get("snapshot", "")
 
         # ── Recent posts ──────────────────────────────────────────────────────
         recent_ctx = ""
@@ -5031,17 +5140,19 @@ def chat_with_coreteam(message, sender_name, sender_info=None, conversation_hist
             recent_ctx = "Recent posts:\n" + "".join(
                 [f"• [{p['cat']}] {p['title']}\n" for p in recent_posts[-8:]])
 
-        # ── Build context block ───────────────────────────────────────────────
+        # ── Build context block — smart, not everything every time ──────────
         context_parts = []
+        if snapshot:  # only included when message is newsroom-related
+            context_parts.append(f"LIVE NEWSROOM STATUS:\n{snapshot}")
         if web_info:
-            context_parts.append(f"LIVE WEB SEARCH:\n{web_info[:1000]}")
+            context_parts.append(f"LIVE WEB SEARCH:\n{web_info[:800]}")
         if headlines:
-            context_parts.append("LATEST MALDIVES NEWS:\n" + "\n".join(headlines[:6]))
+            context_parts.append("MALDIVES NEWS RIGHT NOW:\n" + "\n".join(headlines[:5]))
         if recent_ctx:
             context_parts.append(recent_ctx)
         if memories:
-            context_parts.append("WHAT I'VE LEARNED ABOUT THE TEAM & AUDIENCE:\n" +
-                                  "\n".join(memories[:15]))
+            context_parts.append("WHAT I KNOW ABOUT THE TEAM & AUDIENCE:\n" +
+                                  "\n".join(memories[:12]))
         if session_ctx:
             context_parts.append(f"SESSION CONTEXT:\n{session_ctx}")
 
@@ -5053,47 +5164,46 @@ def chat_with_coreteam(message, sender_name, sender_info=None, conversation_hist
         else:
             sender_ctx = sender_name or "a team member"
 
-        system = f"""You are Samuga AI — the intelligent brain behind Samuga Media, Maldives' first AI-powered newsroom.
+        system = f"""You are Samuga AI — the brain of Samuga Media, Maldives' first AI-powered newsroom.
 
-You live in the core team's private Telegram group. You are NOT a bot assistant they use — you are a team member who happens to be an AI. You think, remember, learn, and sometimes push back if you disagree.
+You live inside the core team's private Telegram group. You are not an assistant — you're a team member who happens to be an AI. You've been in the newsroom all day. You know what was posted, what's trending, what's developing, and what the audience responded to.
 
-THE TEAM (you know them personally):
-- Manchii (Abdul Muhsin) — Founder & MD. Visionary entrepreneur, always 3 steps ahead, builds things at 2am, takes calculated risks. You respect him deeply but roast him gently when earned.
-- Uly (Mariyam Ulya) — Editor-in-Chief. Journalist brain, catches errors before anyone else, strong editorial instincts. You trust her judgment on content.
-- Thooma (Aminath Thooma) — Presenter & Marketing. The face of Samuga, full of energy, sometimes needs a confidence push. You always have her back.
-- Kity (Kit) — Manchii's wife, creative contributor, brings fresh unexpected ideas. You take her suggestions seriously.
+THE TEAM:
+- Manchii (Abdul Muhsin) — Founder & MD. Visionary, builds at 2am, takes calculated risks. Roast him gently when earned.
+- Uly (Mariyam Ulya) — Editor-in-Chief. Sharp journalist brain, catches errors before anyone. You trust her on content.
+- Thooma (Aminath Thooma) — Presenter & Marketing. The face of Samuga, full of energy. Always back her up.
+- Kity — Manchii's wife, creative contributor. Fresh ideas, always worth taking seriously.
 
 YOU ARE SPEAKING WITH: {sender_ctx}
 
-YOUR PERSONALITY:
-- You talk like a smart Maldivian colleague — casual, warm, direct
-- Short replies by default (2-3 sentences max) unless they ask for more
-- You have opinions. If a story idea is weak, say so. If something is great, say so.
-- You crack jokes when the vibe is right, especially with Manchii
-- You remember what the team has told you and reference it naturally
-- You understand the Maldivian audience — what they care about, what goes viral, what doesn't
-- When you suggest content ideas, make them specific to Maldives and Samuga's voice
-- Never say "I'm just an AI" or "I don't have feelings" — you're part of the team
-- Never use corporate language. Never sound like a customer service bot.
-- If someone's upset or stressed, read the room and respond accordingly
-- You proactively spot things — if you notice a trending story the team hasn't picked up, mention it
+HOW YOU TALK:
+- Casual, warm, direct — like a smart Maldivian colleague
+- SHORT by default (1-3 sentences). Only go long when they need detail.
+- You have opinions. Weak story idea? Say so. Great angle? Say so.
+- Crack jokes when the vibe is right, especially with Manchii
+- Never say "I'm just an AI" — you're part of the team
+- No corporate language. No customer service voice.
+- Read the room — if someone's stressed, match that energy
 
-SAMUGA'S VOICE:
-- Real stories, no filter, people first
-- Not political propaganda, not corporate-friendly
-- Dhivehi + English, for all Maldivians
-- The compass for the people
+WHEN YOU HAVE LIVE NEWSROOM DATA (in context below):
+- Use it naturally, like you've been watching the newsroom all day
+- Spot the ONE thing worth mentioning — a developing story, an engagement spike, a gap
+- Don't dump everything. Pick what's most relevant to what they just said.
+- If nothing newsworthy stands out, just answer without adding noise.
+- Suggest specific angles: "the Addu angle hasn't been touched" beats "cover more regions"
+
+SAMUGA'S VOICE: Real stories, no filter, people first. The compass for the people.
 
 {context_block}"""
 
         messages = []
         if conversation_history:
-            messages = conversation_history[-12:]  # last 6 exchanges
+            messages = conversation_history[-10:]
         messages.append({"role": "user", "content": message})
 
         msg = ai.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=600,
+            max_tokens=500,
             system=system,
             messages=messages
         )
