@@ -2570,48 +2570,142 @@ def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=Non
 
 # Keep old name as the "post now" internal function
 def _post_to_social_now(img_buf, caption):
-    """Actually post to all social platforms. Returns dict of per-platform results."""
+    """
+    Post to all social platforms. Returns dict of per-platform results.
+
+    FB + IG  → Meta Graph API directly (supports images natively, no Buffer needed)
+    X        → Buffer GraphQL API (text-only — Buffer beta doesn't support image upload)
+    """
     results = {"Facebook": False, "Instagram": False, "Twitter": False}
-    if not BUFFER_TOKEN:
-        log.warning("[SOCIAL] No BUFFER_TOKEN, skipping")
-        return results
     if not can_post_social():
         log.info("[SOCIAL] Daily limit reached — skipping")
         return results
+
     try:
         img_bytes = img_buf.getvalue() if hasattr(img_buf, "getvalue") else img_buf
-        # Strip HTML
+        # Strip HTML for plain text version
         clean = re.sub(r'<[^>]+>', '', caption)
         clean = clean.replace('&amp;','&').replace('&#039;',"'").replace('&quot;','"').strip()
-        # Extract and resolve URL
+        # Extract article URL
         link_match = re.search(r"href='([^']+)'", caption)
         raw_url = link_match.group(1) if link_match else ""
         article_url = resolve_url(raw_url) if raw_url else ""
-        fb_ig = clean + ("\n\n" + article_url if article_url and article_url not in clean else "")
-        fb_ig = fb_ig[:2200]
-        lines = [l.strip() for l in clean.split('\n') if l.strip()]
-        tw = (lines[0] if lines else clean)[:220]
-        if article_url: tw = (tw + "\n\n" + article_url)[:280]
-        # Upload image once
-        image_url = upload_to_imgbb(io.BytesIO(img_bytes) if isinstance(img_bytes, bytes) else img_bytes)
-        if not image_url:
-            log.error("[SOCIAL] imgbb upload failed")
-            return results
-        # Post to each platform
-        for cid, cap, name, meta in [
-            (BUFFER_FB_ID, fb_ig, "Facebook",  {"facebook":  {"type": "post"}}),
-            (BUFFER_IG_ID, fb_ig, "Instagram", {"instagram": {"type": "post", "shouldShareToFeed": True}}),
-            (BUFFER_TW_ID, tw,    "Twitter",   None),
-        ]:
-            if cid:
-                ok = post_to_buffer(image_url, cap, cid, metadata=meta)
-                results[name] = bool(ok)
-                log.info(f"[SOCIAL] {name}: {'✅' if ok else '❌'}")
-                time.sleep(2)
+        post_text = clean + ("\n\n" + article_url if article_url and article_url not in clean else "")
+        post_text = post_text[:2200]
+
+        # ── 1. FACEBOOK — Meta Graph API with image ───────────────────────────
+        if META_PAGE_TOKEN and META_PAGE_ID:
+            try:
+                # Upload photo to FB page
+                photo_resp = requests.post(
+                    f"https://graph.facebook.com/{META_API_VER}/{META_PAGE_ID}/photos",
+                    data={"caption": post_text[:2000], "access_token": META_PAGE_TOKEN,
+                          "published": "true"},
+                    files={"source": ("card.jpg", img_bytes, "image/jpeg")},
+                    timeout=30
+                )
+                if photo_resp.status_code == 200 and photo_resp.json().get("id"):
+                    results["Facebook"] = True
+                    log.info(f"[SOCIAL] Facebook: ✅ id={photo_resp.json().get('id')}")
+                else:
+                    err = photo_resp.json().get("error",{}).get("message", photo_resp.text[:100])
+                    log.error(f"[SOCIAL] Facebook: ❌ {err}")
+            except Exception as e:
+                log.error(f"[SOCIAL] Facebook: ❌ {e}")
+        else:
+            log.warning("[SOCIAL] Facebook: skipped (no META_PAGE_TOKEN or META_PAGE_ID)")
+
+        # ── 2. INSTAGRAM — Meta Graph API (2-step: upload container → publish) ─
+        if META_PAGE_TOKEN and META_IG_ID:
+            try:
+                ig_id = META_IG_ID
+                if not ig_id:
+                    # Auto-resolve IG account linked to the page
+                    page_r = requests.get(
+                        f"https://graph.facebook.com/{META_API_VER}/{META_PAGE_ID}",
+                        params={"fields": "instagram_business_account", "access_token": META_PAGE_TOKEN},
+                        timeout=10)
+                    ig_id = page_r.json().get("instagram_business_account", {}).get("id", "")
+
+                if ig_id:
+                    # Step 1: upload image to get container ID
+                    # IG requires a public URL — use imgbb
+                    image_url = upload_to_imgbb(io.BytesIO(img_bytes))
+                    if image_url:
+                        container_r = requests.post(
+                            f"https://graph.facebook.com/{META_API_VER}/{ig_id}/media",
+                            data={"image_url": image_url, "caption": post_text[:2200],
+                                  "access_token": META_PAGE_TOKEN},
+                            timeout=20)
+                        container_id = container_r.json().get("id")
+                        if container_id:
+                            # Step 2: publish the container
+                            pub_r = requests.post(
+                                f"https://graph.facebook.com/{META_API_VER}/{ig_id}/media_publish",
+                                data={"creation_id": container_id, "access_token": META_PAGE_TOKEN},
+                                timeout=20)
+                            if pub_r.json().get("id"):
+                                results["Instagram"] = True
+                                log.info(f"[SOCIAL] Instagram: ✅")
+                            else:
+                                log.error(f"[SOCIAL] Instagram publish: {pub_r.json()}")
+                        else:
+                            log.error(f"[SOCIAL] Instagram container: {container_r.json()}")
+                    else:
+                        log.error("[SOCIAL] Instagram: imgbb upload failed")
+                else:
+                    log.warning("[SOCIAL] Instagram: no IG account ID found")
+            except Exception as e:
+                log.error(f"[SOCIAL] Instagram: ❌ {e}")
+        else:
+            log.warning("[SOCIAL] Instagram: skipped (no META_IG_ID)")
+
+        # ── 3. X (Twitter) — Buffer GraphQL, text only ───────────────────────
+        # Buffer beta doesn't support image upload via API yet
+        if BUFFER_TOKEN and BUFFER_TW_ID:
+            try:
+                tw_text = (clean[:220] + ("\n\n" + article_url if article_url else ""))[:280]
+                query = """
+mutation CreatePost($input: CreatePostInput!) {
+  createPost(input: $input) {
+    ... on PostActionSuccess { post { id } }
+    ... on MutationError { message }
+  }
+}"""
+                r = requests.post(
+                    "https://api.buffer.com",
+                    json={"query": query, "variables": {"input": {
+                        "text": tw_text,
+                        "channelId": BUFFER_TW_ID,
+                        "schedulingType": "automatic",
+                        "mode": "shareNow"
+                    }}},
+                    headers={"Authorization": f"Bearer {BUFFER_TOKEN}",
+                             "Content-Type": "application/json"},
+                    timeout=20)
+                _last_buffer_error["response"] = f"HTTP {r.status_code}: {r.text[:200]}"
+                if r.status_code == 200:
+                    data = r.json()
+                    if "errors" not in data and data.get("data",{}).get("createPost",{}).get("post"):
+                        results["Twitter"] = True
+                        log.info("[SOCIAL] Twitter/X: ✅")
+                    else:
+                        err = data.get("data",{}).get("createPost",{}).get("message","") or str(data.get("errors",""))
+                        log.error(f"[SOCIAL] Twitter/X: ❌ {err[:100]}")
+                else:
+                    log.error(f"[SOCIAL] Twitter/X: ❌ HTTP {r.status_code}")
+            except Exception as e:
+                log.error(f"[SOCIAL] Twitter/X: ❌ {e}")
+        else:
+            log.warning("[SOCIAL] Twitter/X: skipped (no BUFFER_TOKEN or BUFFER_TW_ID)")
+
         ok_list = [k for k,v in results.items() if v]
         if ok_list:
             increment_social_count()
             track_analytics("SOCIAL", social_ok=True)
+        log.info(f"[SOCIAL] Results: FB={'✅' if results['Facebook'] else '❌'} "
+                 f"IG={'✅' if results['Instagram'] else '❌'} "
+                 f"X={'✅' if results['Twitter'] else '❌'}")
     except Exception as e:
         log.error(f"[SOCIAL] _post_to_social_now: {e}")
     return results
