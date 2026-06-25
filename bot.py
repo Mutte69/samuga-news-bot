@@ -5808,6 +5808,10 @@ def should_respond_proactively(text, sender_name=""):
     # Skip if it's clearly a command or approval
     if t.startswith("/") or t.lower().startswith("/approved") or t.lower().startswith("/reject"):
         return False, False
+    # Also skip fuzzy approve/reject attempts (e.g. "approved dv48", "reject en12")
+    import re as _re2
+    if _re2.match(r'^(appro|appr|rejec)[a-z]*\s+[a-z]{1,3}\d+', t.lower()):
+        return False, False
 
     try:
         prompt = f"""You are deciding if an AI team member should respond to a Telegram message.
@@ -6069,11 +6073,71 @@ def handle_updates():
                         sender_info = get_sender_info(display_name, first_name)
                         history = get_conversation(user_id)
 
+                        # ── Fuzzy command normaliser ──────────────────────────────────────
+                        # Accepts typos, missing slash, wrong spelling — as long as intent
+                        # and key are clear. Ulya-proof.
+                        # approve variants: /approved, /approve, /aprroved, /aprrove, approved, approve
+                        # reject variants:  /reject, /rejected, /rejecte, /rejects, reject, rejected
+                        def _parse_fuzzy_cmd(raw):
+                            """
+                            Returns (cmd, key, extra) where cmd is 'approve' or 'reject',
+                            key is e.g. 'dv48' or 'en12', extra is optional corrected text.
+                            Returns (None, None, None) if not recognised.
+                            """
+                            import re as _re
+                            t = raw.strip()
+                            # Remove leading slash if present
+                            if t.startswith("/"): t = t[1:]
+                            tl = t.lower()
+                            # Split on whitespace — first token is the command word
+                            tokens = tl.split()
+                            if not tokens: return (None, None, None)
+                            cmd_word = tokens[0]
+                            # Normalise doubled letters: "aprroved" → "aproved", "rejecte" → "rejecte"
+                            import re as _re
+                            cmd_norm = _re.sub(r'(.)\1+', r'\1', cmd_word)
+                            # Approve variants: /approved /approve /aprroved /aprrove approved approve
+                            is_approve = (cmd_word.startswith("appro") or
+                                          cmd_norm.startswith("appro") or
+                                          cmd_norm.startswith("apro") or
+                                          cmd_word in ["approve", "approved"])
+                            # Reject variants: /reject /rejected /rejecte /rejects reject rejected
+                            is_reject  = (cmd_word.startswith("rejec") or
+                                          cmd_norm.startswith("rejec") or
+                                          cmd_word in ["reject", "rejected"])
+                            if not is_approve and not is_reject:
+                                return (None, None, None)
+                            # Find the key — pattern like dv48, en12, en50 etc.
+                            # Can be in any token after the command word
+                            rest_raw = raw.strip()
+                            if rest_raw.startswith("/"): rest_raw = rest_raw[1:]
+                            rest_tokens = rest_raw.split()
+                            key = None
+                            key_idx = None
+                            for i, tok in enumerate(rest_tokens[1:], 1):
+                                if _re.match(r'^[a-zA-Z]{1,3}\d+$', tok):
+                                    key = tok.lower()
+                                    key_idx = i
+                                    break
+                            if not key: return (None, None, None)
+                            # Extra text after the key = corrected Dhivehi
+                            extra = None
+                            if key_idx is not None and len(rest_tokens) > key_idx + 1:
+                                extra = " ".join(rest_tokens[key_idx+1:]).strip() or None
+                            cmd = "approve" if is_approve else "reject"
+                            return (cmd, key, extra)
+
+                        _fcmd, _fkey, _fextra = _parse_fuzzy_cmd(text)
+
                         # /approved <key> [optional corrected dhivehi text]
-                        if text.strip().lower().startswith("/approved "):
-                            parts = text.strip()[10:].strip().split(" ", 1)
-                            key = parts[0].strip().lower()
-                            corrected = parts[1].strip() if len(parts) > 1 else None
+                        if _fcmd == "approve" or text.strip().lower().startswith("/approved "):
+                            if _fcmd == "approve" and _fkey:
+                                key      = _fkey
+                                corrected = _fextra
+                            else:
+                                parts     = text.strip()[10:].strip().split(" ", 1)
+                                key       = parts[0].strip().lower()
+                                corrected = parts[1].strip() if len(parts) > 1 else None
 
                             # Always acknowledge immediately — team should NEVER get silence
                             send_text(chat_id, f"⏳ Got it {first_name}! Processing <b>{key.upper()}</b>...", reply_to=msg_id, thread_id=thread_id)
@@ -6204,8 +6268,8 @@ def handle_updates():
                                     reply_to=msg_id, thread_id=thread_id)
 
                         # /reject <key>
-                        elif text.strip().lower().startswith("/reject "):
-                            key = text.strip()[8:].strip()
+                        elif _fcmd == "reject" or text.strip().lower().startswith("/reject "):
+                            key = _fkey if (_fcmd == "reject" and _fkey) else text.strip()[8:].strip().lower()
                             if key in approval_queue:
                                 rej_item  = approval_queue[key]
                                 rej_title = rej_item.get("title","")[:70]
