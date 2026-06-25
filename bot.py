@@ -1469,11 +1469,11 @@ def fetch_mvcrisis():
 # and scrapeable — same technique as MvCrisis. Each returns native Dhivehi text.
 
 DV_TELEGRAM_CHANNELS = [
-    {"handle": "mihaaru",      "source": "Mihaaru",  "reliability": 95},
-    {"handle": "avas_news",    "source": "Avas",     "reliability": 88},
-    {"handle": "vnewsmv",      "source": "VNews",    "reliability": 82},
-    {"handle": "raajjemv",     "source": "Raajje",   "reliability": 85},
-    {"handle": "thepress_mv",  "source": "ThePress", "reliability": 80},
+    {"handle": "mihaarulive",  "source": "Mihaaru",   "reliability": 95},
+    {"handle": "avasonline",   "source": "Avas",      "reliability": 88},
+    {"handle": "raajjemvlive", "source": "Raajje",    "reliability": 85},
+    {"handle": "voicemaldives","source": "VoiceMV",   "reliability": 80},
+    {"handle": "mvplusmedia",  "source": "MV+",       "reliability": 82},
 ]
 
 def fetch_dv_telegram(handle, source, reliability=80):
@@ -2037,11 +2037,11 @@ def send_text(chat_id, text, reply_to=None, thread_id=None):
     except Exception as e: log.error(f"Send text: {e}")
 
 # ── Gemini Dhivehi Caption ────────────────────────────────────────────────────
-# Model fallback chain — try newer models first, fall back if quota/deprecated
+# Model fallback chain — newest first, fall back if quota/deprecated
 GEMINI_MODELS = [
+    "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.0-flash-lite",
-    "gemini-1.5-flash-8b",
     "gemini-1.5-flash",
 ]
 
