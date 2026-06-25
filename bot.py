@@ -212,7 +212,10 @@ _ai_proactive_mode = True   # on by default — team can toggle
 # ── Universal Approval Queue (in-memory) ─────────────────────────────────────
 # Every card (English + Dhivehi) waits here for Content Lab approval before posting.
 # Cards expire after 2 hours if not approved.
-ENGLISH_AUTOPOST_SECONDS = 900    # English: auto-post after 15 min if not approved
+ENGLISH_AUTOPOST_SECONDS = 2700   # Regular: auto-post after 45 min if nobody reviews
+BREAKING_AUTOPOST_SECONDS = 1800  # Breaking held for confidence: auto-posts in 30 min
+TELEGRAM_GAP_SECONDS    = 7200   # 2 hours between regular Telegram posts
+DAILY_TG_POST_MAX       = 12     # Max regular posts per day to Telegram
 DHIVEHI_EXPIRY_SECONDS   = 7200   # Dhivehi: expire (delete) after 2h if not approved
 
 approval_queue = {}  # key -> {card_bytes, caption, title, link, cat, lang, dv_text, created_at, ...}
@@ -249,31 +252,53 @@ def store_pending_approval(card_bytes, caption, title, link, cat="LOCAL", lang="
 def expire_old_approvals():
     """
     Runs every few minutes:
-      - English cards not approved within 15 min → AUTO-POST to community + social
-      - Dhivehi cards not approved within 2 hours → DELETE (never auto-post unreviewed Dhivehi)
+    - Breaking held (low confidence): auto-posts after 30 min if no team action
+    - Regular English: auto-posts after 45 min via queue
+    - Dhivehi breaking: auto-posts after 2h
+    - Regular Dhivehi: deleted after 2h
     """
     now = utcnow()
 
-    # English auto-post after 15 min — goes through queue (Telegram + social)
+    # Breaking held for confidence — auto-post after 30 min
+    breaking_held = [k for k, v in approval_queue.items()
+                     if v.get("lang") == "en"
+                     and v.get("is_breaking", False)
+                     and v.get("_held_for_confidence", False)
+                     and (now - v["created_at"]).total_seconds() > BREAKING_AUTOPOST_SECONDS]
+    for k in breaking_held:
+        item = approval_queue.pop(k)
+        log.info(f"⏰ Breaking {k} auto-posting (30min, no review): {item.get('title','')[:50]}")
+        try:
+            buf = io.BytesIO(item["card_bytes"])
+            queue_for_social(buf, item["caption"],
+                key_label=f"{k.upper()} (breaking auto)",
+                tg_ok=False, post_telegram=True, is_breaking=True)
+            send_text(CORE_TEAM_CHAT_ID,
+                f"⏰ <b>{k.upper()} Breaking auto-posted</b> (30min, no review)\n"
+                f"📰 {item.get('title','')[:80]}",
+                thread_id=ALERT_THREAD_ID)
+        except Exception as e:
+            log.error(f"Breaking auto-post {k}: {e}")
+
+    # Regular English auto-post after 45 min
     en_due = [k for k, v in approval_queue.items()
-              if v["lang"] == "en" and (now - v["created_at"]).total_seconds() > ENGLISH_AUTOPOST_SECONDS]
+              if v.get("lang") == "en"
+              and not v.get("is_breaking", False)
+              and (now - v["created_at"]).total_seconds() > ENGLISH_AUTOPOST_SECONDS]
     for k in en_due:
         item = approval_queue.pop(k)
         title = item.get("title","")[:50]
-        log.info(f"⏰ English {k} auto-queuing (no approval in 15min): {title}")
+        log.info(f"⏰ English {k} auto-queuing (45min, no review): {title}")
         try:
             buf = io.BytesIO(item["card_bytes"])
-            queue_for_social(
-                buf, item["caption"],
+            queue_for_social(buf, item["caption"],
                 key_label=f"{k.upper()} (auto)",
-                tg_ok=False,
-                post_telegram=True  # queue posts Telegram too
-            )
+                tg_ok=False, post_telegram=True)
             send_text(CORE_TEAM_CHAT_ID,
-                      f"⏰ <b>{k.upper()}</b> queued for posting (no approval in 15min)\n📰 {item['title'][:80]}",
-                      thread_id=ALERT_THREAD_ID)
+                f"⏰ <b>{k.upper()}</b> auto-posted (45min, no review)\n📰 {item.get('title','')[:80]}",
+                thread_id=ALERT_THREAD_ID)
         except Exception as e:
-            log.error(f"Auto-post queue {k} failed: {e}")
+            log.error(f"Auto-post queue {k}: {e}")
 
     # Dhivehi expiry — breaking ones auto-post after 2h, regular ones delete
     dv_due = [k for k, v in approval_queue.items()
@@ -1340,8 +1365,10 @@ def track_analytics(cat, is_breaking=False, social_ok=None):
     if social_ok is True: analytics["social_success"] += 1
     if social_ok is False: analytics["social_fail"] += 1
 
-def remember_post(title, cat, timestamp):
-    recent_posts.append({"title":title,"cat":cat,"time":timestamp})
+def remember_post(title, cat, timestamp, is_breaking=False):
+    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+    recent_posts.append({"title": title, "cat": cat, "time": timestamp,
+                          "is_breaking": is_breaking, "date": today})
     if len(recent_posts) > 50: recent_posts.pop(0)
     track_analytics(cat)
     persist_state()
@@ -1418,9 +1445,26 @@ def increment_cat_count(counter_dict):
     persist_state()
 
 def can_post_regular():
+    """
+    Returns True only if:
+    1. At least 2 hours have passed since last regular post, AND
+    2. Daily regular post cap (12) hasn't been hit.
+    Breaking news ignores this entirely.
+    """
     global last_regular_post_time
-    if not last_regular_post_time: return True
-    return (utcnow()-last_regular_post_time).total_seconds() >= 5400  # 1hr 30min
+    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+
+    # Check daily cap
+    posts_today = sum(1 for p in recent_posts
+                      if p.get("date","") == today and not p.get("is_breaking", False))
+    if posts_today >= DAILY_TG_POST_MAX:
+        log.info(f"📵 Daily post cap reached ({posts_today}/{DAILY_TG_POST_MAX}) — skipping regular post")
+        return False
+
+    # Check time gap
+    if not last_regular_post_time:
+        return True
+    return (utcnow() - last_regular_post_time).total_seconds() >= TELEGRAM_GAP_SECONDS
 
 # ── Social filter — only quality LOCAL/DISASTER/relevant WORLD goes to socials ─
 def allowed_for_social(article):
@@ -2438,17 +2482,32 @@ def _social_queue_worker():
             notify_tid = item.get("notify_thread_id")
             log.info(f"[QUEUE] Posting {key_label} (Telegram + FB+IG+X) — {remaining} remaining")
 
-            # 1. Post to Telegram community
+            # 1. Post to Telegram community (respects daily cap + 2hr gap for regular posts)
             tg_ok = False
             if item.get("post_telegram", True):
-                try:
-                    buf = io.BytesIO(item["img_bytes"])
-                    tg_ok = bool(send_to_telegram(buf, item["caption"]))
-                    log.info(f"[QUEUE] Telegram: {'✅' if tg_ok else '❌'}")
-                except Exception as e:
-                    log.error(f"[QUEUE] Telegram: {e}")
+                is_breaking_item = item.get("is_breaking", False)
+                if is_breaking_item or can_post_regular():
+                    try:
+                        buf = io.BytesIO(item["img_bytes"])
+                        tg_ok = bool(send_to_telegram(buf, item["caption"]))
+                        if tg_ok and not is_breaking_item:
+                            global last_regular_post_time
+                            last_regular_post_time = utcnow()
+                            persist_state()
+                        log.info(f"[QUEUE] Telegram: {'✅' if tg_ok else '❌'}")
+                    except Exception as e:
+                        log.error(f"[QUEUE] Telegram: {e}")
+                else:
+                    log.info("[QUEUE] Telegram skipped — daily cap or 2hr gap not met")
+                    # Re-queue for later unless it's been waiting too long
+                    age_mins = (utcnow() - item.get("queued_at", utcnow())).total_seconds() / 60
+                    if age_mins < 180:  # give up after 3 hours
+                        with _social_queue_lock:
+                            _social_queue.insert(0, item)  # put back at front
+                        time.sleep(60)  # wait a minute before re-checking
+                        continue
             else:
-                tg_ok = item.get("tg_ok", False)  # already posted separately
+                tg_ok = item.get("tg_ok", False)
 
             # 2. Post to FB + IG + X
             results = _post_to_social_now(
@@ -2834,12 +2893,14 @@ def post_article(article, seen, social_only=False, allow_social=True):
                 approval_queue[key]["_hold_reason"] = hold_reason
                 _send_approval_card(key, approval_queue[key])
                 db_mark_status(article["id"], "queued")
+                approval_queue[key]["_held_for_confidence"] = True
                 # Alert goes to Alert thread (not Content Lab — keeps approvals clean)
                 send_text(CORE_TEAM_CHAT_ID,
                     f"⚠️ <b>BREAKING held for review</b>\n{hold_reason}\n\n"
                     f"<b>{article['title'][:90]}</b>\n"
                     f"Source: {article.get('source','?')} · Confidence: {confidence}%\n\n"
-                    f"Approve with <code>/approved {key}</code> if verified.",
+                    f"Approve with <code>/approved {key}</code> if verified.\n"
+                    f"<i>Auto-posts in 30 min if no action.</i>",
                     thread_id=ALERT_THREAD_ID)
             except Exception as e:
                 log.error(f"Breaking hold queue: {e}")
@@ -3229,10 +3290,12 @@ def format_score_breakdown(a):
 def run_job(social_only=False, breaking_only=False):
     """
     Every 15-min scan:
-      - Post 1 breaking article immediately (Telegram + social) if found
-      - If 90-min regular window is OPEN: post 1 best regular article (Telegram + social)
-      - If 90-min window is CLOSED: do NOT post anything — no social-only spillover
-    Social media ONLY posts alongside Telegram. Never independently on a timer.
+      - Breaking news: posts immediately to all platforms (no queue, no limit)
+      - Breaking low-confidence: goes to Alert, auto-posts in 30 min if no action
+      - Regular English: max 2-3 best per HOUR go to Content Lab — bot picks, not all
+      - Regular Dhivehi: max 2-3 best per HOUR go to Content Lab
+      - Total Content Lab cards: max 6 per hour (3 EN + 3 DV)
+      - Breaking is completely separate — never counts toward hourly budget
     """
     global daily_sports_count, daily_world_count, daily_tourism_count, _pending_article
     h = get_mvt_hour()
@@ -3244,9 +3307,7 @@ def run_job(social_only=False, breaking_only=False):
     if not fresh:
         log.info("No fresh articles."); return
 
-    # ── Pre-build story clusters: register every fresh article's source FIRST ──
-    # This way, by the time we pick the best one, we already know how many
-    # sources are reporting the same event (corroboration = stronger story).
+    # Pre-build clusters for corroboration scoring
     for a in fresh:
         size, srcs = register_in_cluster(a["title"], a.get("source",""))
         a["_cluster_size"] = size
@@ -3262,103 +3323,106 @@ def run_job(social_only=False, breaking_only=False):
 
     log.info(f"🔴 {len(breaking_articles)} breaking | 🟡 {len(regular_articles)} regular")
 
-    # ── 1. Breaking news: post immediately, no throttle, Telegram + social ──
+    # ── 1. BREAKING — fires immediately, no budget, no throttle ─────────────
     if breaking_articles:
         a = breaking_articles[0]
-        log.info(f"🔴 BREAKING in run_job: {a['title'][:60]}")
+        log.info(f"🔴 BREAKING: {a['title'][:60]}")
         post_article(a, seen, social_only=False, allow_social=True)
 
     if breaking_only:
         return
 
-    # ── 2a. Dhivehi articles — process regardless of throttle ──────────────
-    # Dhivehi articles always go to the approval queue (never auto-post),
-    # so the 90-min Telegram throttle doesn't apply to them.
+    # ── 2. HOURLY BUDGET — Content Lab gets max 6 cards/hr (3 EN + 3 DV) ───
+    # Count how many cards were already sent to Content Lab THIS hour
+    now_mvt = utcnow() + timedelta(hours=5)
+    hour_start = now_mvt.replace(minute=0, second=0, microsecond=0)
+    hour_start_utc = hour_start - timedelta(hours=5)
+
+    # Count queued cards this hour (from approval_queue creation times)
+    en_this_hour = sum(1 for v in approval_queue.values()
+                       if v.get("lang") == "en"
+                       and v.get("created_at", utcnow()) >= hour_start_utc)
+    dv_this_hour = sum(1 for v in approval_queue.values()
+                       if v.get("lang") == "dv"
+                       and v.get("created_at", utcnow()) >= hour_start_utc)
+
+    en_budget = max(0, 3 - en_this_hour)   # max 3 English per hour
+    dv_budget = max(0, 3 - dv_this_hour)   # max 3 Dhivehi per hour
+
+    log.info(f"📊 Hourly budget: {en_budget} EN + {dv_budget} DV remaining "
+             f"({en_this_hour}+{dv_this_hour} already sent this hour)")
+
+    if en_budget == 0 and dv_budget == 0:
+        log.info("📵 Hourly Content Lab budget exhausted — skipping regular articles")
+        return
+
+    # ── 2a. Dhivehi — best DV articles up to budget ─────────────────────────
     dv_articles = [a for a in regular_articles if a.get("lang") == "dv"]
-    dv_queued = 0
-    for a in dv_articles[:3]:  # max 3 Dhivehi per run to avoid flooding queue
+    dv_sent = 0
+    for a in dv_articles:
+        if dv_sent >= dv_budget:
+            break
         if not is_duplicate_story(a["title"]):
-            log.info(f"🇲🇻 DV queue: {a['title'][:55]}")
+            log.info(f"🇲🇻 DV → Content Lab (budget {dv_sent+1}/{dv_budget}): {a['title'][:55]}")
             post_article(a, seen, social_only=False, allow_social=False)
-            dv_queued += 1
-    if dv_queued:
-        log.info(f"🇲🇻 {dv_queued} Dhivehi article(s) queued for approval")
+            dv_sent += 1
+    if dv_sent:
+        log.info(f"🇲🇻 {dv_sent} Dhivehi card(s) sent to Content Lab")
 
-    # ── 2b. Regular news: ONLY post if 90-min Telegram window is open ──────
+    # ── 2b. English — best EN articles up to budget ──────────────────────────
     if not can_post_regular():
-        secs_left = int(5400 - (utcnow() - last_regular_post_time).total_seconds())
-        log.info(f"⏳ Telegram throttled — {secs_left//60}m left. No social posting either. Waiting.")
-        return  # Nothing. No social. No exceptions.
+        secs_left = int(TELEGRAM_GAP_SECONDS - (utcnow() - last_regular_post_time).total_seconds())
+        log.info(f"⏳ Telegram 2hr gap active — {secs_left//60}m left (but still sending to Content Lab)")
+        # Still queue for Content Lab review even if Telegram window is closed
+        # The approval/auto-expiry handles the actual posting timing
 
-    # ── Window is open — post the BEST articles ──
-    # Top story always goes. Additional stories (#2-5) post too IF they score
-    # high enough AND are a different category (no two LOCAL in a row).
-    # This means a big day (election + crime + economy) isn't bottlenecked to 1.
-    MAX_PER_RUN = 5
-    STRONG_SCORE = 120   # #2+ must clear this to ride along with the top story
-    posted_count = 0
+    en_articles = [a for a in regular_articles if a.get("lang","en") == "en"]
+    en_sent = 0
     posted_cats = set()
 
-    for a in regular_articles:
-        if posted_count >= MAX_PER_RUN:
+    for a in en_articles:
+        if en_sent >= en_budget:
             break
         cat = a["cat"]
-        text_lower = (a["title"] + " " + a.get("summary","")).lower()
         a_score = score_article(a)
+        text_lower = (a["title"] + " " + a.get("summary","")).lower()
 
         # Sports: Maldives national team only, max 1/day
         if cat in ["SPORTS", "FOOTBALL"]:
             mv_sports = ["maldives","dhivehi","raajje","national team","team maldives"]
             if not any(kw in text_lower for kw in mv_sports):
-                log.info(f"⛔ Non-Maldives sports — skipping: {a['title'][:50]}")
                 continue
             if not can_post_cat_today(daily_sports_count, 1):
-                log.info("⛔ Sports daily limit (1) reached")
                 continue
 
         # World: Maldives-relevant only, max 2/day
         elif cat == "WORLD":
-            mv_world = ["maldives","indian ocean","south asia","india","china","un ","dollar","oil","global economy"]
+            mv_world = ["maldives","indian ocean","south asia","india","china",
+                        "un ","dollar","oil","global economy"]
             if not any(kw in text_lower for kw in mv_world):
-                log.info(f"⛔ Non-relevant world news — skipping: {a['title'][:50]}")
                 continue
             if not can_post_cat_today(daily_world_count, 2):
-                log.info("⛔ World daily limit (2) reached")
                 continue
 
         # Tourism: max 2/day
         elif cat == "TOURISM":
             if not can_post_cat_today(daily_tourism_count, 2):
-                log.info("⛔ Tourism daily limit (2) reached")
                 continue
 
-        # Weather: never post as regular article (weather card handles this)
-        elif cat == "WEATHER":
-            log.info("⛔ Weather — skipping (weather card handles this)")
+        # No two same category unless score is exceptional
+        if cat in posted_cats and a_score < 160:
             continue
 
-        # ── Multi-post gating ──
-        # First article (top story) always posts. Extras must be STRONG + new category.
-        if posted_count >= 1:
-            disp_cat = canonical_category(cat, a["title"], a.get("summary",""))
-            if a_score < STRONG_SCORE:
-                log.info(f"⏹️ Stopping extras — next best score {a_score} < {STRONG_SCORE}")
-                break  # articles are sorted, so nothing below will qualify either
-            if disp_cat in posted_cats:
-                log.info(f"⏭️ Already posted a {disp_cat} this run — skipping for variety")
-                continue
+        if not is_duplicate_story(a["title"]):
+            log.info(f"🟡 EN → Content Lab (budget {en_sent+1}/{en_budget}, score {a_score}): {a['title'][:55]}")
+            post_article(a, seen, social_only=False, allow_social=True)
+            posted_cats.add(cat)
+            en_sent += 1
 
-        # Post to Telegram. Social only fires if article passes social filter.
-        allow_social = allowed_for_social(a)
-        log.info(f"🟡 REGULAR [{cat}] score={a_score} social={'yes' if allow_social else 'no'}: {a['title'][:55]}")
-        if post_article(a, seen, social_only=False, allow_social=allow_social):
-            posted_count += 1
-            posted_cats.add(canonical_category(cat, a["title"], a.get("summary","")))
-            if cat in ["SPORTS","FOOTBALL"]: increment_cat_count(daily_sports_count)
-            elif cat == "WORLD": increment_cat_count(daily_world_count)
-            elif cat == "TOURISM": increment_cat_count(daily_tourism_count)
+    if en_sent:
+        log.info(f"📰 {en_sent} English card(s) sent to Content Lab")
 
-    log.info(f"✅ run_job done — {posted_count} article(s) queued/posted this run.")
+    log.info(f"✅ run_job done — {en_sent} EN + {dv_sent} DV sent to Content Lab this run")
 
 # Sources scanned in the fast breaking-news check (5 min cycle)
 BREAKING_SOURCES = [
@@ -6290,6 +6354,59 @@ def handle_updates():
                                 log.info(f"🗑️ {key} rejected by {first_name}")
                             else:
                                 send_text(chat_id, f"Key <code>{key}</code> not found — maybe already posted or rejected.", reply_to=msg_id, thread_id=thread_id)
+
+                        # /buffercheck — test imgbb + Buffer connection live
+                        elif text.strip().lower() in ["/buffercheck", "/socialcheck", "/checkbuffer"]:
+                            send_text(chat_id, "🔍 Testing imgbb + Buffer connection... ⏳",
+                                      reply_to=msg_id, thread_id=thread_id)
+                            def _buffercheck(_cid=chat_id, _tid=thread_id):
+                                lines = ["🔍 <b>Social Platform Check</b>\n"]
+                                # 1. imgbb
+                                try:
+                                    import base64 as _b64
+                                    test_img = Image.new("RGB", (10,10), color=(20,40,80))
+                                    buf = io.BytesIO()
+                                    test_img.save(buf, format="JPEG"); buf.seek(0)
+                                    resp = requests.post("https://api.imgbb.com/1/upload",
+                                        data={"key": IMGBB_API_KEY,
+                                              "image": _b64.b64encode(buf.getvalue()).decode()},
+                                        timeout=15)
+                                    if resp.status_code == 200 and resp.json().get("data",{}).get("url"):
+                                        test_url = resp.json()["data"]["url"]
+                                        lines.append(f"🖼️ <b>imgbb:</b> ✅ Working")
+                                    else:
+                                        lines.append(f"🖼️ <b>imgbb:</b> ❌ Failed (HTTP {resp.status_code})\n"
+                                                     f"   Check IMGBB_API_KEY in Railway vars")
+                                        test_url = None
+                                except Exception as e:
+                                    lines.append(f"🖼️ <b>imgbb:</b> ❌ {str(e)[:60]}")
+                                    test_url = None
+                                # 2. Buffer token
+                                if not BUFFER_TOKEN:
+                                    lines.append("\n📡 <b>Buffer:</b> ❌ BUFFER_ACCESS_TOKEN not set")
+                                else:
+                                    try:
+                                        r = requests.get("https://api.buffer.com/1/user.json",
+                                            headers={"Authorization": f"Bearer {BUFFER_TOKEN}"},
+                                            timeout=10)
+                                        if r.status_code == 200:
+                                            name = r.json().get("name","?")
+                                            lines.append(f"\n📡 <b>Buffer token:</b> ✅ Valid ({name})")
+                                        elif r.status_code == 401:
+                                            lines.append(f"\n📡 <b>Buffer token:</b> ❌ EXPIRED\n"
+                                                         f"   buffer.com → Settings → Apps → regenerate token\n"
+                                                         f"   Update BUFFER_ACCESS_TOKEN in Railway")
+                                        else:
+                                            lines.append(f"\n📡 <b>Buffer token:</b> ⚠️ HTTP {r.status_code}")
+                                    except Exception as e:
+                                        lines.append(f"\n📡 <b>Buffer:</b> ❌ {str(e)[:60]}")
+                                # 3. Channel IDs
+                                lines.append("\n📋 <b>Channel IDs configured:</b>")
+                                lines.append(f"  FB: {'✅' if BUFFER_FB_ID else '❌ not set'}")
+                                lines.append(f"  IG: {'✅' if BUFFER_IG_ID else '❌ not set'}")
+                                lines.append(f"  X:  {'✅' if BUFFER_TW_ID else '❌ not set'}")
+                                send_text(_cid, "\n".join(lines), thread_id=_tid)
+                            threading.Thread(target=_buffercheck, daemon=True).start()
 
                         # /diag — diagnose feeds, Gemini (Dhivehi), and queue health
                         elif text.strip().lower() in ["/diag", "/health", "/diagnose"]:
