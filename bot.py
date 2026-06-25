@@ -2635,6 +2635,92 @@ def generate_outlook(hourly_slots, mvt_now):
 
     return f"{desc.capitalize()} {time_hint}"
 
+def get_weather_data():
+    """
+    Fetch real-time weather for Malé, Maldives.
+    Primary: Tomorrow.io. Fallback: Open-Meteo.
+    """
+    TOMORROW_API_KEY = os.environ.get("TOMORROW_API_KEY", "")
+
+    if TOMORROW_API_KEY:
+        try:
+            base   = "https://api.tomorrow.io/v4/weather"
+            params = f"?location=4.1755,73.5093&apikey={TOMORROW_API_KEY}&units=metric"
+            rt = requests.get(f"{base}/realtime{params}", timeout=15)
+            fc = requests.get(f"{base}/forecast{params}", timeout=15)
+
+            if rt.status_code == 200 and fc.status_code == 200:
+                rv = rt.json()["data"]["values"]
+                fd = fc.json()
+                wmo = _tomorrow_code_to_wmo(rv.get("weatherCode", 1000))
+                current = {
+                    "temperature_2m":       rv.get("temperature", 29),
+                    "apparent_temperature":  rv.get("temperatureApparent", 29),
+                    "relativehumidity_2m":   rv.get("humidity", 80),
+                    "windspeed_10m":         rv.get("windSpeed", 10),
+                    "windgust_10m":          rv.get("windGust", 0),
+                    "weathercode":           wmo,
+                    "uv_index":              rv.get("uvIndex", 0),
+                    "visibility":            rv.get("visibility", 10),
+                    "dewpoint_2m":           rv.get("dewPoint", 25),
+                    "pressure_msl":          rv.get("pressureSurfaceLevel", 1010),
+                    "precipitation_prob":    rv.get("precipitationProbability", 0),
+                    "_source":               "Tomorrow.io",
+                }
+                hourly_t, hourly_wmo, hourly_precip, hourly_times = [], [], [], []
+                for slot in fd.get("timelines", {}).get("hourly", [])[:12]:
+                    v = slot.get("values", {})
+                    hourly_times.append(slot.get("time", ""))
+                    hourly_t.append(v.get("temperature", 29))
+                    hourly_wmo.append(_tomorrow_code_to_wmo(v.get("weatherCode", 1000)))
+                    hourly_precip.append(v.get("precipitationProbability", 0))
+                hourly = {"time": hourly_times, "temperature_2m": hourly_t,
+                          "weathercode": hourly_wmo, "precipitation_probability": hourly_precip}
+                daily_max, daily_min, daily_wmo = [], [], []
+                sunrise_str, sunset_str = "06:00", "18:00"
+                for day in fd.get("timelines", {}).get("daily", [])[:1]:
+                    v = day.get("values", {})
+                    daily_max.append(v.get("temperatureMax", 32))
+                    daily_min.append(v.get("temperatureMin", 26))
+                    daily_wmo.append(_tomorrow_code_to_wmo(v.get("weatherCodeMax", 1000)))
+                    sr = v.get("sunriseTime", ""); ss = v.get("sunsetTime", "")
+                    if sr: sunrise_str = sr[11:16]
+                    if ss: sunset_str  = ss[11:16]
+                daily = {
+                    "temperature_2m_max": daily_max or [32],
+                    "temperature_2m_min": daily_min or [26],
+                    "weathercode":        daily_wmo or [wmo],
+                    "sunrise":            [f"2026-01-01T{sunrise_str}"],
+                    "sunset":             [f"2026-01-01T{sunset_str}"],
+                }
+                log.info(f"🌤️ Tomorrow.io: {current['temperature_2m']:.1f}°C UV={current['uv_index']} wind={current['windspeed_10m']}km/h")
+                return {"current": current, "hourly": hourly, "daily": daily, "_source": "Tomorrow.io"}
+            else:
+                log.warning(f"Tomorrow.io HTTP rt={rt.status_code} fc={fc.status_code} — falling back")
+        except Exception as e:
+            log.error(f"Tomorrow.io weather: {e} — falling back to Open-Meteo")
+
+    # Fallback: Open-Meteo
+    try:
+        url = ("https://api.open-meteo.com/v1/forecast"
+               "?latitude=4.1755&longitude=73.5093"
+               "&current=temperature_2m,weathercode,windspeed_10m,relativehumidity_2m,apparent_temperature"
+               "&hourly=temperature_2m,weathercode,precipitation_probability"
+               "&daily=temperature_2m_max,temperature_2m_min,sunrise,sunset,weathercode"
+               "&timezone=Indian%2FMaldives&forecast_days=1")
+        resp = requests.get(url, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            data["_source"] = "Open-Meteo"
+            c = data.get("current", {})
+            c.update({"uv_index":0,"visibility":10,"windgust_10m":0,
+                      "dewpoint_2m":25,"pressure_msl":1010,"precipitation_prob":0,"_source":"Open-Meteo"})
+            log.info(f"🌤️ Open-Meteo fallback: {c.get('temperature_2m',29):.1f}°C")
+            return data
+    except Exception as e:
+        log.error(f"Open-Meteo fallback: {e}")
+    return None
+
 def get_island_forecasts():
     """
     Fetch 12-hour hourly forecast for all 5 islands via Tomorrow.io.
@@ -4555,11 +4641,11 @@ def handle_updates():
                         elif text.strip().lower() in ["/weather", "/wx"]:
                             send_text(chat_id, "🌤️ Fetching weather + island data... ⏳",
                                       reply_to=msg_id, thread_id=thread_id)
-                            def _send_weather_preview():
+                            def _send_weather_preview(_chat_id=chat_id, _thread_id=thread_id, _name=first_name):
                                 try:
                                     data = get_weather_data()
                                     if not data:
-                                        send_text(chat_id, "❌ Weather data unavailable right now.", thread_id=thread_id)
+                                        send_text(_chat_id, "❌ Weather data unavailable right now.", thread_id=_thread_id)
                                         return
                                     islands = get_island_forecasts()
                                     card = generate_weather_card(data, island_data=islands if islands else None)
@@ -4579,11 +4665,11 @@ def handle_updates():
                                         f"{island_lines}\n"
                                         f"<i>Data: {source} · Preview only, not posted to community</i>"
                                     )
-                                    send_photo(chat_id, card, caption, thread_id=thread_id)
-                                    log.info(f"🌤️ Weather preview sent to core team by {first_name}")
+                                    send_photo(_chat_id, card, caption, thread_id=_thread_id)
+                                    log.info(f"🌤️ Weather preview sent to core team by {_name}")
                                 except Exception as e:
                                     log.error(f"/weather preview: {e}")
-                                    send_text(chat_id, f"❌ Error: {e}", thread_id=thread_id)
+                                    send_text(_chat_id, f"❌ Error: {e}", thread_id=_thread_id)
                             threading.Thread(target=_send_weather_preview, daemon=True).start()
 
                         # /brief — generate the AI nightly editorial brief on demand
