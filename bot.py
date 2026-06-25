@@ -317,11 +317,23 @@ REJECT_RESPONSES = [
     "Okay okay, deleted. The article didn't make the cut. Just like my invite to your last outing. 💔",
     "Gone. Rejected. Just like that one pitch Manchii had at 2am. We don't talk about it. 🗑️",
     "Poof. Vanished. The article felt it too. 😭",
-    "Rejected faster than a loan application. Card deleted bro. 🚮",
+    "Rejected faster than a loan application. Card deleted. 🚮",
     "Understood. We move. The article does not. 👋",
     "That article just got voted off the island. Maldivian style. 🏝️",
     "Fine fine, I'll delete it. But between us — I thought it was good. Just saying. 🤷",
     "Deleted! The article is now in a better place. (The bin.) 🗑️✨",
+    "I already knew you'd reject it. I just wanted to see if you'd catch it. You did. Respect. 🫡",
+    "Card deleted. The source is probably crying somewhere. Not my problem. 😌",
+    "Gone with the wind. And the article. Bye bye. 🌬️",
+    "Noted, rejected, deleted. Three words that describe both this article and my weekend plans. 🙂",
+    "You know what, I respect the standards. Card is gone. Moving on. 💪",
+    "Deleted so fast the article didn't even see it coming. Neither did I honestly. 😅",
+    "That one wasn't it. Removed. You're basically my editor brain at this point. 🧠",
+    "Rejected. I'll add it to the list of things that didn't make it. The list is getting long. 📋",
+    "Gone. The article will not be missed. By anyone. Especially not the readers. 🫠",
+    "Okay the bin got a new resident. Hope it's comfortable in there. 🗑️",
+    "Deleted faster than Manchii's sleep schedule. Which is saying something. ⚡",
+    "Fair enough. Some stories aren't worth telling. This was one of them. Card gone. ✂️",
 ]
 
 BREAKING_KEYWORDS = [
@@ -632,7 +644,7 @@ def _caption_match_key(text):
     t = text.lower()
     # Drop the boilerplate Samuga tagline so it doesn't dominate the key
     for junk in ["samuga media", "samuga creative", "@samugacommunity",
-                 "ސަމޫގާ މީޑިއާ", "📡", "🇲🇻"]:
+                 "ސަމުގާ މީޑިއާ", "📡", "🇲🇻"]:
         t = t.replace(junk.lower(), " ")
     # Fold accents to plain ASCII per-character so "Malé"->"male", but keep
     # thaana characters exactly in place (NFKD on thaana would corrupt them).
@@ -2553,6 +2565,14 @@ def post_article(article, seen, social_only=False, allow_social=True):
             approval_queue[key]["_cluster_size"] = article.get("_cluster_size", 1)
             approval_queue[key]["_trend_theme"] = article.get("_trend_theme", "")
             approval_queue[key]["summary"] = article.get("summary", "")
+            # Pre-fetch background in background thread so card builds instantly on approval
+            def _prefetch_bg(_key=key, _kw=keyword):
+                try:
+                    bg = fetch_background_image(_kw)
+                    if _key in approval_queue:
+                        approval_queue[_key]["_bg_image"] = bg
+                except Exception: pass
+            threading.Thread(target=_prefetch_bg, daemon=True).start()
             _send_approval_card(key, approval_queue[key])
             db_mark_status(article["id"], "queued")
             return True
@@ -5724,27 +5744,56 @@ def handle_updates():
                                 try:
                                     ok = False
                                     if item["lang"] == "dv":
-                                        # Build Dhivehi card now (with optional correction)
-                                        final_dv = corrected if corrected else item["dv_text"]
-                                        kw = item.get("keyword", item["cat"].lower())
-                                        bg = fetch_background_image(kw)
-                                        ts_now = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
-                                        card = generate_card(final_dv, item["source"], ts_now, item["cat"], bg)
-                                        full_caption = (
-                                            f"🇲🇻 <b>{item['title']}</b>\n\n"
-                                            f"{final_dv}\n\n"
-                                            f"📡 <b>ސަމޫގާ މީޑިއާ</b> | @samugacommunity"
-                                        )
-                                        card.seek(0)
-                                        ok = send_to_telegram(card, full_caption)
-                                        if isinstance(ok, int) and item.get("article_id"):
-                                            db_set_article_message(item["article_id"], ok)
-                                            db_set_article_matchkey(item["article_id"], item["title"])
-                                        if ok:
-                                            remember_post(item["title"], item["cat"], ts_now)
-                                            if item.get("allow_social"):
+                                        # Run card generation in background — gives Uly instant feedback
+                                        def _process_dv(_item=item, _key=key, _corrected=corrected,
+                                                        _cid=chat_id, _tid=thread_id, _fname=first_name, _mid=msg_id):
+                                            try:
+                                                final_dv = _corrected if _corrected else _item["dv_text"]
+                                                kw = _item.get("keyword", _item["cat"].lower())
+                                                # Use pre-fetched bg if available, else fetch now
+                                                bg = _item.get("_bg_image") or fetch_background_image(kw)
+                                                ts_now = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+                                                card = generate_card(final_dv, _item["source"], ts_now, _item["cat"], bg)
+                                                full_caption = (
+                                                    f"🇲🇻 <b>{_item['title']}</b>\n\n"
+                                                    f"{final_dv}\n\n"
+                                                    f"📡 <b>ސަމުގާ މީޑިއާ</b> | @samugacommunity"
+                                                )
                                                 card.seek(0)
-                                                threading.Thread(target=post_to_social, args=(io.BytesIO(card.getvalue()), full_caption), daemon=True).start()
+                                                ok = send_to_telegram(card, full_caption)
+                                                if isinstance(ok, int) and _item.get("article_id"):
+                                                    db_set_article_message(_item["article_id"], ok)
+                                                    db_set_article_matchkey(_item["article_id"], _item["title"])
+                                                if ok:
+                                                    remember_post(_item["title"], _item["cat"], ts_now)
+                                                    db_mark_status(_item.get("article_id",""), "posted", posted=True)
+                                                    db_log_learning(
+                                                        article_id=_item.get("article_id"),
+                                                        action=("edited" if _corrected else "approved"),
+                                                        member=_fname,
+                                                        category=_item.get("cat",""),
+                                                        source=_item.get("source",""),
+                                                        theme=_item.get("_trend_theme",""),
+                                                        original_caption=_item.get("dv_text",""),
+                                                        final_caption=(_corrected or _item.get("dv_text","")),
+                                                        lang="dv")
+                                                    # Always post to all platforms (Telegram + FB + IG + X)
+                                                    card.seek(0)
+                                                    threading.Thread(target=post_to_social,
+                                                        args=(io.BytesIO(card.getvalue()), full_caption), daemon=True).start()
+                                                    send_text(_cid,
+                                                        f"✅ <b>{_key.upper()}</b> posted to Telegram + FB + IG + X 🇲🇻",
+                                                        thread_id=_tid)
+                                                else:
+                                                    send_text(_cid,
+                                                        f"❌ <b>{_key.upper()} — Telegram failed.</b>\n"
+                                                        f"Card gone from queue. Try creating a new one.",
+                                                        thread_id=_tid)
+                                            except Exception as e:
+                                                log.error(f"DV approval processing: {e}")
+                                                send_text(_cid, f"❌ Error processing {_key}: {e}", thread_id=_tid)
+                                        threading.Thread(target=_process_dv, daemon=True).start()
+                                        ok = True  # optimistic — thread handles actual result
                                     else:
                                         # English — publish + report per platform back to Content Lab
                                         tg_ok, social_res = _publish_now(
@@ -5759,7 +5808,10 @@ def handle_updates():
                                         )
                                         ok = tg_ok
 
-                                    if ok:
+                                    # DV cards handled entirely in background thread above
+                                    if item.get("lang") == "dv":
+                                        pass  # thread handles posting, confirmation and logging
+                                    elif ok:
                                         if item.get("article_id"):
                                             db_mark_status(item["article_id"], "posted", posted=True)
                                         db_log_learning(
