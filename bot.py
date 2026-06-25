@@ -1404,14 +1404,10 @@ def increment_social_count():
 
 # ── Gemini Translate ──────────────────────────────────────────────────────────
 def gemini_translate(text):
+    """Translate Dhivehi to English using Gemini (with model fallback)."""
     if not GEMINI_API_KEY: return text
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={GEMINI_API_KEY}"
-        resp = requests.post(url, json={"contents":[{"parts":[{"text":f"Translate this Dhivehi text to English. Return ONLY the English translation:\n\n{text}"}]}]}, timeout=15)
-        if resp.status_code == 200:
-            return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception as e: log.error(f"Gemini: {e}")
-    return text
+    result = _gemini_post(f"Translate this Dhivehi text to English. Return ONLY the English translation:\n\n{text}")
+    return result if result else text
 
 # ── Fetch News ────────────────────────────────────────────────────────────────
 # Words that signal an ad/promo/spam — never treat these as news
@@ -1505,7 +1501,8 @@ def fetch_dv_telegram(handle, source, reliability=80):
             if _looks_like_ad(text): continue
             # Detect language from Thaana script presence
             dv_chars = sum(1 for ch in text if "ހ" <= ch <= "޿")
-            lang = "dv" if dv_chars > 5 else "en"
+            # Lower threshold — even 1-2 Thaana chars in a mixed post = Dhivehi
+            lang = "dv" if dv_chars >= 1 else "en"
             art_id = f"tg_{handle}_" + hashlib.md5(text[:60].encode()).hexdigest()[:8]
             articles.append({
                 "id":          art_id,
@@ -2040,28 +2037,53 @@ def send_text(chat_id, text, reply_to=None, thread_id=None):
     except Exception as e: log.error(f"Send text: {e}")
 
 # ── Gemini Dhivehi Caption ────────────────────────────────────────────────────
-def make_dhivehi_caption(english_text, title):
-    """Convert English news caption to Dhivehi using Gemini"""
+# Model fallback chain — try newer models first, fall back if quota/deprecated
+GEMINI_MODELS = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash-8b",
+    "gemini-1.5-flash",
+]
+
+def _gemini_post(prompt, timeout=15):
+    """Try Gemini models in order until one works. Returns text or None."""
     if not GEMINI_API_KEY:
         return None
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={GEMINI_API_KEY}"
-        prompt = f"""You are a Maldivian news writer. Write a short news caption in Dhivehi (Thaana script) for this news.
+    for model in GEMINI_MODELS:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+            resp = requests.post(url, json={"contents":[{"parts":[{"text":prompt}]}]}, timeout=timeout)
+            if resp.status_code == 200:
+                text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                log.info(f"[AI] Gemini {model}: OK")
+                return text
+            elif resp.status_code in [429, 503]:
+                log.warning(f"[AI] Gemini {model}: quota/unavailable ({resp.status_code}), trying next")
+                continue
+            else:
+                log.warning(f"[AI] Gemini {model}: HTTP {resp.status_code}")
+                continue
+        except Exception as e:
+            log.warning(f"[AI] Gemini {model}: {e}")
+            continue
+    log.error("[AI] All Gemini models failed")
+    return None
+
+def make_dhivehi_caption(english_text, title):
+    """Convert English news caption to Dhivehi using Gemini (with model fallback)."""
+    if not GEMINI_API_KEY:
+        return None
+    prompt = f"""You are a Maldivian news writer. Write a short news caption in Dhivehi (Thaana script) for this news.
 
 English title: {title}
 English summary: {english_text}
 
 Write 2-3 sentences in natural Dhivehi as it would appear in a Maldivian news channel.
-Return ONLY the Dhivehi text, nothing else."""
-
-        resp = requests.post(url, json={"contents":[{"parts":[{"text":prompt}]}]}, timeout=15)
-        if resp.status_code == 200:
-            dv_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            log.info("✅ Gemini Dhivehi caption done")
-            return dv_text
-    except Exception as e:
-        log.error(f"Gemini Dhivehi caption: {e}")
-    return None
+Return ONLY the Dhivehi text in Thaana script, nothing else."""
+    result = _gemini_post(prompt)
+    if result:
+        log.info("✅ Gemini Dhivehi caption done")
+    return result
 
 # ── Auto Poll ─────────────────────────────────────────────────────────────────
 POLL_KEYWORDS = [
@@ -5104,8 +5126,6 @@ def chat_with_gemini_dhivehi(user_message, context="", conversation_history=None
         log.warning("No GEMINI_API_KEY — falling back to Claude for Dhivehi")
         return None
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={GEMINI_API_KEY}"
-
         # Try web search for Dhivehi queries too
         web_context = ""
         try:
@@ -5155,13 +5175,24 @@ def chat_with_gemini_dhivehi(user_message, context="", conversation_history=None
             "generationConfig": {"maxOutputTokens": 400, "temperature": 0.7}
         }
 
-        resp = requests.post(url, json=payload, timeout=15)
-        if resp.status_code == 200:
-            reply = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            log.info("✅ Gemini Dhivehi chat reply done")
-            return reply
-        else:
-            log.error(f"Gemini Dhivehi chat HTTP {resp.status_code}: {resp.text[:200]}")
+        # Try models in fallback order
+        for model in GEMINI_MODELS:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+                resp = requests.post(url, json=payload, timeout=15)
+                if resp.status_code == 200:
+                    reply = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    log.info(f"✅ Gemini Dhivehi chat done ({model})")
+                    return reply
+                elif resp.status_code in [429, 503]:
+                    log.warning(f"[AI] Gemini {model} quota/unavailable, trying next")
+                    continue
+                else:
+                    log.error(f"Gemini {model} HTTP {resp.status_code}")
+                    break
+            except Exception as e:
+                log.warning(f"[AI] Gemini {model}: {e}")
+                continue
     except Exception as e:
         log.error(f"Gemini Dhivehi chat error: {e}")
     return None
@@ -5788,17 +5819,20 @@ def handle_updates():
                             def _run_diag(_cid=chat_id, _tid=thread_id):
                                 try:
                                     lines = ["🔍 <b>Samuga AI Diagnostics</b>\n"]
-                                    # 1. Gemini (Dhivehi) test
+                                    # 1. Gemini test — try all models in fallback order
                                     if GEMINI_API_KEY:
                                         test_dv = make_dhivehi_caption("The government announced a new policy today.", "Test news")
                                         if test_dv and any("ހ" <= c <= "޿" for c in test_dv):
                                             lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ✅ Working")
                                         elif test_dv:
-                                            lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ⚠️ Responded but no Thaana script")
+                                            lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ⚠️ Responded but no Thaana — check prompt")
                                         else:
-                                            lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ❌ No response (check key/quota)")
+                                            # Show which models failed
+                                            lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ❌ All models failed")
+                                            lines.append(f"   Models tried: {', '.join(GEMINI_MODELS)}")
+                                            lines.append("   Check GEMINI_API_KEY in Railway vars")
                                     else:
-                                        lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ❌ GEMINI_API_KEY not set")
+                                        lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ❌ GEMINI_API_KEY not set in Railway")
                                     # 2. Dhivehi feed check (RSS — expected to fail, kept for reference)
                                     dv_feeds = [f for f in LOCAL_FEEDS if f.get("lang")=="dv"]
                                     lines.append(f"\n📡 <b>Dhivehi RSS feeds ({len(dv_feeds)}) — now replaced by Telegram:</b>")
