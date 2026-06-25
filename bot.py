@@ -2571,143 +2571,62 @@ def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=Non
 # Keep old name as the "post now" internal function
 def _post_to_social_now(img_buf, caption):
     """
-    Post to all social platforms. Returns dict of per-platform results.
+    Post to all social platforms via Buffer (FB + IG + X), with the card image.
 
-    FB + IG  → Meta Graph API directly (supports images natively, no Buffer needed)
-    X        → Buffer GraphQL API (text-only — Buffer beta doesn't support image upload)
+    REVERTED TO BUFFER: previously this used the Meta Graph API for FB/IG, which
+    hit a #200 permissions error. Buffer was working perfectly before, so all
+    three platforms now go through Buffer's GraphQL API (image hosted via imgbb).
+    Returns the same {"Facebook","Instagram","Twitter"} dict the queue expects.
     """
     results = {"Facebook": False, "Instagram": False, "Twitter": False}
+    if not BUFFER_TOKEN:
+        log.warning("[SOCIAL] no BUFFER_TOKEN, skipping")
+        return results
     if not can_post_social():
         log.info("[SOCIAL] Daily limit reached — skipping")
         return results
 
     try:
         img_bytes = img_buf.getvalue() if hasattr(img_buf, "getvalue") else img_buf
-        # Strip HTML for plain text version
+        image_url = upload_to_imgbb(img_bytes)
+        if not image_url:
+            log.error("[SOCIAL] imgbb upload failed, skipping")
+            return results
+
+        # Strip HTML for all social platforms
         clean = re.sub(r'<[^>]+>', '', caption)
-        clean = clean.replace('&amp;','&').replace('&#039;',"'").replace('&quot;','"').strip()
-        # Extract article URL
+        clean = clean.replace('&amp;', '&').replace('&#039;', "'").replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>').strip()
+
+        # Extract and resolve article URL (fixes Google News redirects)
         link_match = re.search(r"href='([^']+)'", caption)
         raw_url = link_match.group(1) if link_match else ""
         article_url = resolve_url(raw_url) if raw_url else ""
-        post_text = clean + ("\n\n" + article_url if article_url and article_url not in clean else "")
-        post_text = post_text[:2200]
 
-        # ── 1. FACEBOOK — Meta Graph API with image ───────────────────────────
-        if META_PAGE_TOKEN and META_PAGE_ID:
-            try:
-                # FIX: the card is PNG but was being sent as image/jpeg, which Meta
-                # can reject. Convert to a real JPEG so the upload always matches.
-                try:
-                    _pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                    _jbuf = io.BytesIO()
-                    _pil.save(_jbuf, format="JPEG", quality=92)
-                    fb_img_bytes = _jbuf.getvalue()
-                except Exception as _conv_e:
-                    log.warning(f"[SOCIAL] Facebook: JPEG convert failed, using raw bytes: {_conv_e}")
-                    fb_img_bytes = img_bytes
-                photo_resp = requests.post(
-                    f"https://graph.facebook.com/{META_API_VER}/{META_PAGE_ID}/photos",
-                    data={"caption": post_text[:2000], "access_token": META_PAGE_TOKEN,
-                          "published": "true"},
-                    files={"source": ("card.jpg", fb_img_bytes, "image/jpeg")},
-                    timeout=30
-                )
-                if photo_resp.status_code == 200 and photo_resp.json().get("id"):
-                    results["Facebook"] = True
-                    log.info(f"[SOCIAL] Facebook: ✅ id={photo_resp.json().get('id')}")
-                else:
-                    err = photo_resp.json().get("error",{})
-                    err_msg = err.get("message", photo_resp.text[:150])
-                    err_code = err.get("code","?")
-                    log.error(f"[SOCIAL] Facebook: ❌ code={err_code} {err_msg}")
-                    _last_buffer_error["fb_error"] = f"code={err_code}: {err_msg}"
-            except Exception as e:
-                log.error(f"[SOCIAL] Facebook: ❌ {e}")
-                _last_buffer_error["fb_error"] = str(e)[:100]
-        else:
-            log.warning("[SOCIAL] Facebook: skipped (no META_PAGE_TOKEN or META_PAGE_ID)")
+        # FB/IG: full text + real link
+        fb_ig = clean
+        if article_url and article_url not in fb_ig:
+            fb_ig = fb_ig + "\n\n" + article_url
+        fb_ig = fb_ig[:2200]
 
-        # ── 2. INSTAGRAM — Meta Graph API (2-step: upload container → publish) ─
-        # FIX: auto-resolve the IG id from the linked FB page if META_IG_ID is blank,
-        # so IG posting works without manually setting META_IG_ID in Railway.
-        ig_id = _resolve_ig_id()
-        if META_PAGE_TOKEN and ig_id:
-            try:
-                image_url = upload_to_imgbb(io.BytesIO(img_bytes))
-                if image_url:
-                    container_r = requests.post(
-                        f"https://graph.facebook.com/{META_API_VER}/{ig_id}/media",
-                        data={"image_url": image_url, "caption": post_text[:2200],
-                              "access_token": META_PAGE_TOKEN},
-                        timeout=20)
-                    container_data = container_r.json()
-                    container_id = container_data.get("id")
-                    if container_id:
-                        pub_r = requests.post(
-                            f"https://graph.facebook.com/{META_API_VER}/{ig_id}/media_publish",
-                            data={"creation_id": container_id, "access_token": META_PAGE_TOKEN},
-                            timeout=20)
-                        if pub_r.json().get("id"):
-                            results["Instagram"] = True
-                            log.info("[SOCIAL] Instagram: ✅")
-                        else:
-                            err = pub_r.json().get("error",{})
-                            log.error(f"[SOCIAL] Instagram publish: code={err.get('code','?')} {err.get('message',pub_r.text[:100])}")
-                            _last_buffer_error["ig_error"] = f"publish: {err.get('message','?')[:100]}"
-                    else:
-                        err = container_data.get("error",{})
-                        log.error(f"[SOCIAL] Instagram container: code={err.get('code','?')} {err.get('message',str(container_data)[:100])}")
-                        _last_buffer_error["ig_error"] = f"container: {err.get('message','?')[:100]}"
-                else:
-                    log.error("[SOCIAL] Instagram: imgbb upload failed")
-            except Exception as e:
-                log.error(f"[SOCIAL] Instagram: ❌ {e}")
-                _last_buffer_error["ig_error"] = str(e)[:100]
-        else:
-            log.warning("[SOCIAL] Instagram: skipped (no IG business account — set META_IG_ID "
-                        "or link an IG Professional account to the FB page)")
+        # Twitter: first line + link (280 char hard limit)
+        lines = [l.strip() for l in clean.split('\n') if l.strip()]
+        tw = (lines[0] if lines else clean)[:220]
+        if article_url:
+            tw = tw + "\n\n" + article_url
+        tw = tw[:280]
 
-        # ── 3. X (Twitter) — Buffer GraphQL, text only ───────────────────────
-        # Buffer beta doesn't support image upload via API yet
-        if BUFFER_TOKEN and BUFFER_TW_ID:
-            try:
-                tw_text = (clean[:220] + ("\n\n" + article_url if article_url else ""))[:280]
-                query = """
-mutation CreatePost($input: CreatePostInput!) {
-  createPost(input: $input) {
-    ... on PostActionSuccess { post { id } }
-    ... on MutationError { message }
-  }
-}"""
-                r = requests.post(
-                    "https://api.buffer.com",
-                    json={"query": query, "variables": {"input": {
-                        "text": tw_text,
-                        "channelId": BUFFER_TW_ID,
-                        "schedulingType": "automatic",
-                        "mode": "shareNow"
-                    }}},
-                    headers={"Authorization": f"Bearer {BUFFER_TOKEN}",
-                             "Content-Type": "application/json"},
-                    timeout=20)
-                _last_buffer_error["response"] = f"HTTP {r.status_code}: {r.text[:200]}"
-                if r.status_code == 200:
-                    data = r.json()
-                    if "errors" not in data and data.get("data",{}).get("createPost",{}).get("post"):
-                        results["Twitter"] = True
-                        log.info("[SOCIAL] Twitter/X: ✅")
-                    else:
-                        err = data.get("data",{}).get("createPost",{}).get("message","") or str(data.get("errors",""))
-                        log.error(f"[SOCIAL] Twitter/X: ❌ {err[:100]}")
-                else:
-                    log.error(f"[SOCIAL] Twitter/X: ❌ HTTP {r.status_code}")
-            except Exception as e:
-                log.error(f"[SOCIAL] Twitter/X: ❌ {e}")
-        else:
-            log.warning("[SOCIAL] Twitter/X: skipped (no BUFFER_TOKEN or BUFFER_TW_ID)")
+        for cid, cap, name, meta in [
+            (BUFFER_FB_ID, fb_ig, "Facebook",  {"facebook":  {"type": "post"}}),
+            (BUFFER_IG_ID, fb_ig, "Instagram", {"instagram": {"type": "post", "shouldShareToFeed": True}}),
+            (BUFFER_TW_ID, tw,    "Twitter",   None),
+        ]:
+            if not cid:
+                log.warning(f"[SOCIAL] skipping {name} — no channel ID set")
+                continue
+            results[name] = post_to_buffer(image_url, cap, cid, metadata=meta)
+            time.sleep(2)
 
-        ok_list = [k for k,v in results.items() if v]
+        ok_list = [k for k, v in results.items() if v]
         if ok_list:
             increment_social_count()
             track_analytics("SOCIAL", social_ok=True)
@@ -2719,14 +2638,6 @@ mutation CreatePost($input: CreatePostInput!) {
     return results
 
 def post_to_social(img_buf, caption):
-    # FIX: breaking news used to push FB + IG through Buffer, which can't upload
-    # images and silently fails. Route everything through _post_to_social_now,
-    # which uses the Meta Graph API for FB/IG (with images) and Buffer for X.
-    return _post_to_social_now(img_buf, caption)
-
-
-def _post_to_social_buffer_legacy(img_buf, caption):
-    """Legacy Buffer-only path (kept for reference, no longer used)."""
     if not BUFFER_TOKEN:
         log.warning("Social: no BUFFER_TOKEN, skipping")
         return
