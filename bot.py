@@ -2668,7 +2668,7 @@ def get_weather_data():
                     "_source":               "Tomorrow.io",
                 }
                 hourly_t, hourly_wmo, hourly_precip, hourly_times = [], [], [], []
-                for slot in fd.get("timelines", {}).get("hourly", [])[:12]:
+                for slot in fd.get("timelines", {}).get("hourly", [])[:24]:
                     v = slot.get("values", {})
                     hourly_times.append(slot.get("time", ""))
                     hourly_t.append(v.get("temperature", 29))
@@ -2974,24 +2974,63 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
 
     # Background gradient — weather-aware
     if alert_mode:
+        # Alert — dark red dramatic
         for y in range(H):
-            t=y/H; draw.line([(0,y),(W,y)], fill=(int(40+t*20),int(5+t*8),int(5+t*10),255))
-    elif code in [95,96,99]:
-        for y in range(H):
-            t=y/H; draw.line([(0,y),(W,y)], fill=(int(15+t*25),int(8+t*15),int(35+t*50),255))
-    elif code in [61,63,65,80,81,82,51,53,55]:
-        for y in range(H):
-            t=y/H; draw.line([(0,y),(W,y)], fill=(int(20+t*20),int(40+t*30),int(80+t*50),255))
-    elif code == 0:
-        for y in range(H):
-            t=y/H; draw.line([(0,y),(W,y)], fill=(int(10+t*8),int(60+t*35),int(155+t*35),255))
+            t=y/H; draw.line([(0,y),(W,y)], fill=(int(35+t*15),int(4+t*6),int(4+t*8),255))
+        # Red glow top-centre
+        for r in range(200,0,-1):
+            a = int(40*(1-r/200))
+            draw.ellipse([(W//2-r,30-r),(W//2+r,30+r)], fill=(180,20,20,a))
     else:
+        # Samuga cinematic — deep navy base, midnight blue fade
+        TOP  = (8, 15, 45)
+        MID  = (12, 25, 68)
+        BOT  = (5, 10, 32)
         for y in range(H):
-            t=y/H; draw.line([(0,y),(W,y)], fill=(int(40+t*20),int(60+t*30),int(100+t*50),255))
+            t = y / H
+            if t < 0.5:
+                f = t * 2
+                r = int(TOP[0] + (MID[0]-TOP[0])*f)
+                g = int(TOP[1] + (MID[1]-TOP[1])*f)
+                b = int(TOP[2] + (MID[2]-TOP[2])*f)
+            else:
+                f = (t-0.5)*2
+                r = int(MID[0] + (BOT[0]-MID[0])*f)
+                g = int(MID[1] + (BOT[1]-MID[1])*f)
+                b = int(MID[2] + (BOT[2]-MID[2])*f)
+            draw.line([(0,y),(W,y)], fill=(r,g,b,255))
 
-    # Dark vignette at top so logo is readable
-    for y in range(110):
-        draw.line([(0,y),(W,y)], fill=(0,0,0,int(130*(1-y/110))))
+        # Subtle SKY blue radial glow at top-centre — depth and warmth
+        from PIL import Image as _Img, ImageFilter as _IF
+        glow_layer = _Img.new("RGBA", (W,H), (0,0,0,0))
+        gd = ImageDraw.Draw(glow_layer)
+        for r in range(320,0,-1):
+            a = int(22*(1-r/320))
+            gd.ellipse([(W//2-r, 80-r),(W//2+r, 80+r)], fill=(41,171,226,a))
+        glow_layer = glow_layer.filter(_IF.GaussianBlur(30))
+        img_rgba = img.convert("RGBA")
+        img_rgba = _Img.alpha_composite(img_rgba, glow_layer)
+        img = img_rgba.convert("RGB")
+        draw = ImageDraw.Draw(img, "RGBA")
+
+        # Weather-specific accent tint — rain = slight blue shift, storm = purple tint
+        if code in [95,96,99]:
+            tint = _Img.new("RGBA", (W,H), (20,0,40,35))
+            img = _Img.alpha_composite(img.convert("RGBA"), tint).convert("RGB")
+            draw = ImageDraw.Draw(img, "RGBA")
+        elif code in [61,63,65,80,81,82,51,53,55]:
+            tint = _Img.new("RGBA", (W,H), (0,20,60,25))
+            img = _Img.alpha_composite(img.convert("RGBA"), tint).convert("RGB")
+            draw = ImageDraw.Draw(img, "RGBA")
+
+    # Gold accent bar — top (Samuga signature)
+    draw.rectangle([(0,0),(W,4)], fill=(224,180,0,255))
+    # SKY accent bar — left edge
+    draw.rectangle([(0,0),(3,H)], fill=(41,171,226,255))
+
+    # Dark vignette at very top so logo is readable
+    for y in range(100):
+        draw.line([(0,y),(W,y)], fill=(0,0,0,int(100*(1-y/100))))
 
     def F(sz, bold=False):
         try:
