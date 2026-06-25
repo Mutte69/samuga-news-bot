@@ -273,7 +273,7 @@ def expire_old_approvals():
             if ok:
                 send_text(CORE_TEAM_CHAT_ID,
                           f"⏰ <b>{k.upper()} Auto-posted</b> (no approval in 15min):\n📰 {item['title'][:80]}",
-                          thread_id=CONTENT_LAB_THREAD_ID)
+                          thread_id=ALERT_THREAD_ID)
         except Exception as e:
             log.error(f"Auto-post {k} failed: {e}")
 
@@ -305,7 +305,7 @@ def expire_old_approvals():
                     send_text(CORE_TEAM_CHAT_ID,
                         f"⏰ <b>{k.upper()} Breaking Dhivehi auto-posted</b> (2h, no review)\n"
                         f"📰 {item['title'][:70]}",
-                        thread_id=CONTENT_LAB_THREAD_ID)
+                        thread_id=ALERT_THREAD_ID)
                     log.info(f"⏰ Breaking Dhivehi {k} auto-posted to community")
             except Exception as e:
                 log.error(f"Breaking DV auto-post {k}: {e}")
@@ -320,7 +320,8 @@ dhivehi_pending = approval_queue
 
 # ── Core Team Config ──────────────────────────────────────────────────────────
 CORE_TEAM_CHAT_ID = "-1002829230299"
-CONTENT_LAB_THREAD_ID = 9061  # "Content Lab" topic — Dhivehi approvals + manual card creation
+CONTENT_LAB_THREAD_ID = 9061   # approvals, queue confirmations — Uly's workspace
+ALERT_THREAD_ID       = 10169  # bot suggestions, developing stories, briefs, proactive insights
 
 CORE_TEAM_MEMBERS = {
     "manchii": {"name": "Manchii", "full": "Abdul Muhsin", "role": "Founder & MD", "notes": "Big ideas, entrepreneur, boss, loves to push boundaries"},
@@ -1113,10 +1114,7 @@ def _detect_event_type(title):
     return None
 
 def _notify_developing_story(story_id, title, source_count, source_list):
-    """
-    Proactively ping Content Lab when a story is confirmed by multiple sources.
-    This is the bot acting like an editor: 'this is becoming today's lead story'.
-    """
+    """Proactively alert the team when a story is confirmed by multiple sources."""
     try:
         msg = (
             f"🔥 <b>Developing Story Alert</b>\n\n"
@@ -1126,8 +1124,8 @@ def _notify_developing_story(story_id, title, source_count, source_list):
             f"It's likely becoming a lead story today.\n\n"
             f"📚 Full timeline: <code>/story {story_id}</code>"
         )
-        send_text(CORE_TEAM_CHAT_ID, msg, thread_id=CONTENT_LAB_THREAD_ID)
-        log.info(f"🔥 Proactive alert sent: Story #{story_id} ({source_count} sources)")
+        send_text(CORE_TEAM_CHAT_ID, msg, thread_id=ALERT_THREAD_ID)
+        log.info(f"🔥 Developing story alert → Alert thread: Story #{story_id}")
     except Exception as e:
         log.debug(f"Notify developing story: {e}")
 
@@ -2417,10 +2415,14 @@ def _calc_eta_seconds():
     return max(0, SOCIAL_GAP_SECONDS - elapsed)
 
 def _social_queue_worker():
-    """Background thread — drains the social queue one post every 10 minutes."""
+    """
+    Background thread — drains one post every 10 minutes.
+    Each item posts to Telegram community + FB + IG + X in sequence.
+    BREAKING news bypasses this queue entirely and posts immediately.
+    """
     global _last_social_post_time
     while True:
-        time.sleep(15)  # check every 15 seconds for better precision
+        time.sleep(15)
         try:
             with _social_queue_lock:
                 if not _social_queue:
@@ -2428,25 +2430,38 @@ def _social_queue_worker():
                 now = utcnow()
                 if (_last_social_post_time and
                         (now - _last_social_post_time).total_seconds() < SOCIAL_GAP_SECONDS):
-                    continue  # not yet — keep waiting
+                    continue
                 item = _social_queue.pop(0)
 
-            # Post it — results come back per platform
             _last_social_post_time = utcnow()
             remaining = len(_social_queue)
-            log.info(f"[SOCIAL] Draining queue → FB+IG+X ({remaining} remaining)")
-
-            results = _post_to_social_now(io.BytesIO(item["img_bytes"]), item["caption"])
-
-            # Send per-platform confirmation to Content Lab
+            key_label  = item.get("key_label", "Post")
             notify_cid = item.get("notify_chat_id")
             notify_tid = item.get("notify_thread_id")
-            key_label  = item.get("key_label", "Post")
-            if notify_cid and results:
-                tg_icon = "✅" if item.get("tg_ok") else "⏭️"
-                fb_icon = "✅" if results.get("Facebook") else "❌"
+            log.info(f"[QUEUE] Posting {key_label} (Telegram + FB+IG+X) — {remaining} remaining")
+
+            # 1. Post to Telegram community
+            tg_ok = False
+            if item.get("post_telegram", True):
+                try:
+                    buf = io.BytesIO(item["img_bytes"])
+                    tg_ok = bool(send_to_telegram(buf, item["caption"]))
+                    log.info(f"[QUEUE] Telegram: {'✅' if tg_ok else '❌'}")
+                except Exception as e:
+                    log.error(f"[QUEUE] Telegram: {e}")
+            else:
+                tg_ok = item.get("tg_ok", False)  # already posted separately
+
+            # 2. Post to FB + IG + X
+            results = _post_to_social_now(
+                io.BytesIO(item["img_bytes"]), item["caption"])
+
+            # 3. Send per-platform confirmation to Content Lab
+            if notify_cid:
+                tg_icon = "✅" if tg_ok else "❌"
+                fb_icon = "✅" if results.get("Facebook")  else "❌"
                 ig_icon = "✅" if results.get("Instagram") else "❌"
-                x_icon  = "✅" if results.get("Twitter") else "❌"
+                x_icon  = "✅" if results.get("Twitter")   else "❌"
                 send_text(notify_cid,
                     f"📤 <b>{key_label}</b> posted\n"
                     f"Telegram {tg_icon} · FB {fb_icon} · IG {ig_icon} · X {x_icon}",
@@ -2454,26 +2469,28 @@ def _social_queue_worker():
             try: persist_state()
             except Exception: pass
         except Exception as e:
-            log.error(f"[SOCIAL] Queue worker: {e}")
+            log.error(f"[QUEUE] Worker error: {e}")
 
 def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=None,
-                     key_label="Post", tg_ok=True):
+                     key_label="Post", tg_ok=True, post_telegram=False):
     """
-    Add a card to the 10-minute social queue.
-    Stores notify info so the worker sends a per-platform confirmation after posting.
+    Add a card to the 10-minute publish queue.
+    post_telegram=True  → queue will post to Telegram community too (standard flow)
+    post_telegram=False → Telegram was already posted separately (breaking news)
     """
     img_bytes = img_buf.getvalue() if hasattr(img_buf, "getvalue") else img_buf
     with _social_queue_lock:
         _social_queue.append({
-            "img_bytes":         img_bytes,
-            "caption":           caption,
-            "queued_at":         utcnow(),
-            "notify_chat_id":    notify_chat_id,
-            "notify_thread_id":  notify_thread_id,
-            "key_label":         key_label,
-            "tg_ok":             tg_ok,
+            "img_bytes":        img_bytes,
+            "caption":          caption,
+            "queued_at":        utcnow(),
+            "notify_chat_id":   notify_chat_id,
+            "notify_thread_id": notify_thread_id,
+            "key_label":        key_label,
+            "tg_ok":            tg_ok,
+            "post_telegram":    post_telegram,
         })
-        queue_pos = len(_social_queue)  # position in queue (1 = next up)
+        queue_pos = len(_social_queue)
 
     # Calculate real ETA
     eta_secs = _calc_eta_seconds() + (queue_pos - 1) * SOCIAL_GAP_SECONDS
@@ -2656,14 +2673,18 @@ def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_
         else:
             log.info("🔴 Breaking posted!")
 
-    # Social — run synchronously when report_to is set so we can report results
+    # Social posting
     if allow_social:
         social_buf = io.BytesIO(card_bytes)
-        if report_to:
-            # Synchronous — so we can tell the team what happened per platform
+        if is_breaking_flag:
+            # BREAKING — blast to all platforms immediately, no queue
+            log.info("🔴 Breaking — posting to FB+IG+X immediately (no queue)")
+            social_results = post_to_social(social_buf, caption) or {}
+        elif report_to:
+            # Synchronous for manual posts so we can report results
             social_results = post_to_social(social_buf, caption) or {}
         else:
-            # Route through 10-minute queue — no flooding
+            # Regular news — 10-minute queue
             queue_for_social(social_buf, caption)
 
     # Poll
@@ -2814,13 +2835,13 @@ def post_article(article, seen, social_only=False, allow_social=True):
                 approval_queue[key]["_hold_reason"] = hold_reason
                 _send_approval_card(key, approval_queue[key])
                 db_mark_status(article["id"], "queued")
-                # Alert core team this needs a fast decision
+                # Alert goes to Alert thread (not Content Lab — keeps approvals clean)
                 send_text(CORE_TEAM_CHAT_ID,
                     f"⚠️ <b>BREAKING held for review</b>\n{hold_reason}\n\n"
                     f"<b>{article['title'][:90]}</b>\n"
                     f"Source: {article.get('source','?')} · Confidence: {confidence}%\n\n"
                     f"Approve with <code>/approved {key}</code> if verified.",
-                    thread_id=CONTENT_LAB_THREAD_ID)
+                    thread_id=ALERT_THREAD_ID)
             except Exception as e:
                 log.error(f"Breaking hold queue: {e}")
             return False
@@ -4965,7 +4986,7 @@ Keep it tight, smart, and in English. Max 280 words. Write like a real editor ta
                    f"{brief}\n\n"
                    f"━━━━━━━━━━━━━━\n"
                    f"<i>Auto-generated by Samuga AI. Not posted publicly — for the team only.</i>")
-        send_text(CORE_TEAM_CHAT_ID, caption, thread_id=CONTENT_LAB_THREAD_ID)
+        send_text(CORE_TEAM_CHAT_ID, caption, thread_id=ALERT_THREAD_ID)
         log.info("🧠 ✅ Samuga AI brief sent to Content Lab!")
     except Exception as e:
         log.error(f"Samuga AI brief: {e}")
@@ -5026,7 +5047,7 @@ def check_scraper_health(min_attempts=20):
             "Learning will keep using old numbers until this is fixed. Engagement "
             "data won't update.\n\n"
             "<i>Nothing else is affected — posting works normally.</i>",
-            thread_id=CONTENT_LAB_THREAD_ID)
+            thread_id=ALERT_THREAD_ID)
         _scraper_health["warned"] = True
         log.warning(f"⚠️ Scraper health poor: {fail}/{total} failed")
     _scraper_health["ok"] = 0
@@ -5189,7 +5210,7 @@ def check_meta_health(min_attempts=4):
             "Regenerate it (Graph API Explorer → me/accounts) and update "
             "<code>META_PAGE_TOKEN</code> in Railway.\n\n"
             "<i>Posting still works — only FB/IG learning data is affected.</i>",
-            thread_id=CONTENT_LAB_THREAD_ID)
+            thread_id=ALERT_THREAD_ID)
         _meta_health["warned"] = True
         log.warning(f"⚠️ Meta health poor: {fail}/{total} failed")
     _meta_health["ok"] = 0
@@ -5366,7 +5387,7 @@ def check_learning_readiness():
         "📊 <code>/learning status</code> to see the numbers\n"
         "<i>Ignore to stay observe-only. I won't ask again.</i>"
     )
-    send_text(CORE_TEAM_CHAT_ID, msg, thread_id=CONTENT_LAB_THREAD_ID)
+    send_text(CORE_TEAM_CHAT_ID, msg, thread_id=ALERT_THREAD_ID)
     kv_set("learning_prompt_sent", {"sent": True, "at": utcnow().isoformat()})
     log.info("🧠 Readiness prompt sent to Content Lab (one-time).")
 
@@ -6080,38 +6101,28 @@ def handle_updates():
                                                     f"📡 <b>ސަމުގާ މީޑިއާ</b> | @samugacommunity"
                                                 )
                                                 card.seek(0)
-                                                ok = send_to_telegram(card, full_caption)
-                                                if isinstance(ok, int) and _item.get("article_id"):
-                                                    db_set_article_message(_item["article_id"], ok)
-                                                    db_set_article_matchkey(_item["article_id"], _item["title"])
-                                                if ok:
-                                                    remember_post(_item["title"], _item["cat"], ts_now)
-                                                    db_mark_status(_item.get("article_id",""), "posted", posted=True)
-                                                    db_log_learning(
-                                                        article_id=_item.get("article_id"),
-                                                        action=("edited" if _corrected else "approved"),
-                                                        member=_fname,
-                                                        category=_item.get("cat",""),
-                                                        source=_item.get("source",""),
-                                                        theme=_item.get("_trend_theme",""),
-                                                        original_caption=_item.get("dv_text",""),
-                                                        final_caption=(_corrected or _item.get("dv_text","")),
-                                                        lang="dv")
-                                                    # Post to all platforms via 10-min queue
-                                                    # Confirmation comes from the queue worker after actually posting
-                                                    card.seek(0)
-                                                    queue_for_social(
-                                                        io.BytesIO(card.getvalue()), full_caption,
-                                                        notify_chat_id=_cid,
-                                                        notify_thread_id=_tid,
-                                                        key_label=_key.upper(),
-                                                        tg_ok=True
-                                                    )
-                                                else:
-                                                    send_text(_cid,
-                                                        f"❌ <b>{_key.upper()} — Telegram failed.</b>\n"
-                                                        f"Card gone from queue. Try creating a new one.",
-                                                        thread_id=_tid)
+                                                # Queue handles Telegram + FB + IG + X with 10-min gap
+                                                # tg_ok=False initially — queue will post Telegram too
+                                                remember_post(_item["title"], _item["cat"], ts_now)
+                                                db_mark_status(_item.get("article_id",""), "posted", posted=True)
+                                                db_log_learning(
+                                                    article_id=_item.get("article_id"),
+                                                    action=("edited" if _corrected else "approved"),
+                                                    member=_fname,
+                                                    category=_item.get("cat",""),
+                                                    source=_item.get("source",""),
+                                                    theme=_item.get("_trend_theme",""),
+                                                    original_caption=_item.get("dv_text",""),
+                                                    final_caption=(_corrected or _item.get("dv_text","")),
+                                                    lang="dv")
+                                                queue_for_social(
+                                                    io.BytesIO(card.getvalue()), full_caption,
+                                                    notify_chat_id=_cid,
+                                                    notify_thread_id=_tid,
+                                                    key_label=_key.upper(),
+                                                    tg_ok=False,
+                                                    post_telegram=True   # queue posts Telegram too
+                                                )
                                             except Exception as e:
                                                 log.error(f"DV approval processing: {e}")
                                                 send_text(_cid, f"❌ Error processing {_key}: {e}", thread_id=_tid)
@@ -6841,16 +6852,17 @@ def handle_updates():
                                         done = []
                                         # 1) Telegram community
                                         tg_buf = io.BytesIO(cbytes)
-                                        tg_ok = bool(send_to_telegram(tg_buf, cap))
-                                        tg_icon = "✅" if tg_ok else "❌"
+                                        tg_ok_now = bool(send_to_telegram(tg_buf, cap))
+                                        tg_icon = "✅" if tg_ok_now else "❌"
 
-                                        # Socials via 10-min queue — confirmation comes after posting
+                                        # Socials via 10-min queue — confirmation after posting
                                         social_buf = io.BytesIO(cbytes)
                                         queue_for_social(social_buf, cap,
                                             notify_chat_id=chat_id,
                                             notify_thread_id=thread_id,
                                             key_label="Manual post",
-                                            tg_ok=tg_ok)
+                                            tg_ok=tg_ok_now,
+                                            post_telegram=False)  # already posted above
 
                                         _pending_manual_post.clear()
                                         send_text(chat_id,
@@ -7014,6 +7026,23 @@ def handle_updates():
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import signal, atexit
+
+    def _graceful_shutdown(signum=None, frame=None):
+        """Save all state before Railway kills the process on redeploy."""
+        log.info("🛑 Shutdown signal received — saving state before exit...")
+        try:
+            persist_state()
+            log.info("✅ State saved — approval queue, social queue, counters all persisted")
+        except Exception as e:
+            log.error(f"State save on shutdown: {e}")
+
+    # Railway sends SIGTERM before killing the container on redeploy
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    signal.signal(signal.SIGINT,  _graceful_shutdown)
+    # Also register with atexit as a backup (catches normal Python exit)
+    atexit.register(_graceful_shutdown)
+
     log.info(f"🚀 Samuga AI v{SAMUGA_VERSION} starting (newsroom intelligence + story timelines + live brain)...")
     # Install Noto fonts for Thaana/Dhivehi support
     if not os.path.exists("/usr/share/fonts/truetype/noto/NotoSansThaana-Bold.ttf") and not os.path.exists("/app/NotoSansThaana-Bold.ttf"):
@@ -7074,6 +7103,9 @@ if __name__ == "__main__":
     scheduler.add_job(send_tip_cta, "cron", hour=3, minute=30)  # 8:30AM MVT
     # Tip/story CTA 8:30PM MVT = 3:30PM UTC
     scheduler.add_job(send_tip_cta, "cron", hour=15, minute=30)  # 8:30PM MVT
+
+    # Periodic state heartbeat — saves every 5 minutes so restarts lose minimal state
+    scheduler.add_job(persist_state, "interval", minutes=5, id="state_heartbeat")
 
     log.info("⏰ Scheduler started!")
     scheduler.start()
