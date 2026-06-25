@@ -472,6 +472,30 @@ def mem_delete_last(n=1):
         )
     """, (n,))
 
+# ── Public DM rate limiter ────────────────────────────────────────────────────
+DM_DAILY_LIMIT = 10  # max messages per user per day
+
+def dm_check_and_increment(user_id):
+    """
+    Returns (allowed: bool, count: int, limit: int).
+    Increments counter if allowed. Resets daily at midnight UTC.
+    Uses bot_kv for persistence — key = dm_rl:{user_id}
+    """
+    today = utcnow().strftime("%Y-%m-%d")
+    key = f"dm_rl:{user_id}"
+    record = kv_get(key, default={"date": today, "count": 0})
+
+    # Reset if new day
+    if record.get("date") != today:
+        record = {"date": today, "count": 0}
+
+    if record["count"] >= DM_DAILY_LIMIT:
+        return False, record["count"], DM_DAILY_LIMIT
+
+    record["count"] += 1
+    kv_set(key, record)
+    return True, record["count"], DM_DAILY_LIMIT
+
 def db_log_learning(article_id, action, member="", category="", source="",
                     score=0, theme="", original_caption="", final_caption="", lang="en"):
     """Record a team action so the bot can learn from approvals/rejections."""
@@ -4118,20 +4142,19 @@ SAMUGA'S VOICE:
         messages.append({"role": "user", "content": message})
 
         msg = ai.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=800,
+            model="claude-haiku-4-5-20251001",
+            max_tokens=600,
             system=system,
             messages=messages
         )
         return msg.content[0].text.strip()
 
     except Exception as e:
-        log.error(f"Core team chat (Sonnet): {e}")
-        # Fallback to Haiku if Sonnet fails
+        log.error(f"Core team chat: {e}")
         try:
             msg = ai.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=400,
+                max_tokens=300,
                 messages=[{"role": "user", "content": message}]
             )
             return msg.content[0].text.strip()
@@ -4179,30 +4202,48 @@ def handle_updates():
                             f"👋 Hey {first_name}! I'm <b>Samuga AI</b> — your Maldives news assistant!\n\n"
                             f"Ask me anything about Maldives news, politics, tourism, football or world news.\n\n"
                             f"ދިވެހިން ވެސް ވާހަކަ ދެއްކިދާނެ! 🇲🇻\n\n"
-                            f"📡 Follow <b>@samugacommunity</b> for live news updates!",reply_to=msg_id)
+                            f"📡 Follow <b>@samugacommunity</b> for live news updates!", reply_to=msg_id)
                     elif text.startswith("/search "):
-                        query=text[8:].strip()
-                        log.info(f"🔍 Search: {query}")
-                        results=tavily_search(f"{query} maldives")
-                        reply=chat_with_claude(f"Tell me about: {query}. Use this info: {results[:400]}", user_id)
-                        send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
+                        # Rate limit applies to /search too
+                        allowed, count, limit = dm_check_and_increment(user_id)
+                        if not allowed:
+                            send_text(chat_id,
+                                f"You've reached today's limit of {limit} messages 🙏\n\n"
+                                f"Come back tomorrow for more! Meanwhile follow "
+                                f"<b>@samugacommunity</b> for live Maldives news. 📡",
+                                reply_to=msg_id)
+                        else:
+                            query = text[8:].strip()
+                            log.info(f"🔍 Search: {query}")
+                            results = tavily_search(f"{query} maldives")
+                            reply = chat_with_claude(f"Tell me about: {query}. Use this info: {results[:400]}", user_id)
+                            send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
                     else:
-                        log.info(f"💬 DM {display_name}: {text[:50]}")
-                        # Route Dhivehi to Gemini
-                        if is_dhivehi(text):
-                            log.info("🇲🇻 Dhivehi detected — using Gemini")
-                            headlines = get_local_headlines()
-                            context = "\n".join(headlines[:5]) if headlines else ""
-                            history = get_conversation(user_id)
-                            reply = chat_with_gemini_dhivehi(text, context, history)
-                            if reply:
-                                add_to_conversation(user_id, "user", text)
-                                add_to_conversation(user_id, "assistant", reply)
+                        # ── Rate limit check ──────────────────────────────────
+                        allowed, count, limit = dm_check_and_increment(user_id)
+                        if not allowed:
+                            send_text(chat_id,
+                                f"You've reached today's limit of {limit} messages 🙏\n\n"
+                                f"Come back tomorrow! Follow <b>@samugacommunity</b> "
+                                f"for live Maldives news in the meantime. 📡",
+                                reply_to=msg_id)
+                            log.info(f"🚫 DM rate limit hit: {display_name} ({user_id})")
+                        else:
+                            log.info(f"💬 DM {display_name} [{count}/{limit}]: {text[:50]}")
+                            if is_dhivehi(text):
+                                log.info("🇲🇻 Dhivehi detected — using Gemini")
+                                headlines = get_local_headlines()
+                                context = "\n".join(headlines[:5]) if headlines else ""
+                                history = get_conversation(user_id)
+                                reply = chat_with_gemini_dhivehi(text, context, history)
+                                if reply:
+                                    add_to_conversation(user_id, "user", text)
+                                    add_to_conversation(user_id, "assistant", reply)
+                                else:
+                                    reply = chat_with_claude(text, user_id)
                             else:
                                 reply = chat_with_claude(text, user_id)
-                        else:
-                            reply = chat_with_claude(text, user_id)
-                        send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
+                            send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
 
                 elif chat_type in ["group","supergroup"]:
                     is_core_team = str(chat_id) == CORE_TEAM_CHAT_ID
