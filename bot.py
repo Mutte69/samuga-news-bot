@@ -2930,21 +2930,18 @@ def draw_weather_icon(draw, code, x, y, size=40):
         draw.ellipse([cx-s//2, cy-s//6, cx+s//2, cy+s//2], fill=(180,190,220,240))
 
 def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_data=None):
-    """Samuga branded weather card with logo, UV, gusts, dew point, pressure, data source.
-    island_data = list of {name, temp, code, outlook} from get_island_forecasts().
-    Card is 1080×1350 when island_data present, 1080×1080 otherwise.
-    """
-    from PIL import Image, ImageDraw, ImageFont
-    import math
+    """Samuga branded weather card v3 — 2500x2500, cinematic, sea conditions."""
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter
+    import math, io
 
-    W, H = 1080, (1350 if island_data else 1080)
-    img = Image.new("RGB", (W, H), (0,0,0))
+    W, H = 2500, (3000 if island_data else 2200)
+    img = Image.new("RGB", (W, H), (0, 0, 0))
     draw = ImageDraw.Draw(img, "RGBA")
 
-    current = weather_data.get("current", {})
-    hourly  = weather_data.get("hourly", {})
-    daily   = weather_data.get("daily", {})
-    source  = weather_data.get("_source", "")
+    current    = weather_data.get("current", {})
+    hourly_d   = weather_data.get("hourly", {})
+    daily_d    = weather_data.get("daily", {})
+    source     = weather_data.get("_source", "")
 
     temp     = round(current.get("temperature_2m", 29))
     feels    = round(current.get("apparent_temperature", 29))
@@ -2959,260 +2956,333 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
     code     = current.get("weathercode", 0)
     _, condition = weather_code_to_info(code)
 
-    temp_max = round(daily.get("temperature_2m_max", [temp])[0])
-    temp_min = round(daily.get("temperature_2m_min", [temp])[0])
-
-    sunrise_raw = daily.get("sunrise", [""])[0]
-    sunset_raw  = daily.get("sunset",  [""])[0]
+    temp_max = round(daily_d.get("temperature_2m_max", [temp])[0])
+    temp_min = round(daily_d.get("temperature_2m_min", [temp])[0])
+    sunrise_raw = daily_d.get("sunrise", [""])[0]
+    sunset_raw  = daily_d.get("sunset",  [""])[0]
     sunrise_str = sunrise_raw.split("T")[1][:5] if "T" in sunrise_raw else "06:00"
     sunset_str  = sunset_raw.split("T")[1][:5]  if "T" in sunset_raw  else "18:19"
 
-    hours  = hourly.get("time", [])
-    temps  = hourly.get("temperature_2m", [])
-    codes  = hourly.get("weathercode", [])
-    precip = hourly.get("precipitation_probability", [])
-
-    # Background gradient — weather-aware
-    if alert_mode:
-        # Alert — dark red dramatic
-        for y in range(H):
-            t=y/H; draw.line([(0,y),(W,y)], fill=(int(35+t*15),int(4+t*6),int(4+t*8),255))
-        # Red glow top-centre
-        for r in range(200,0,-1):
-            a = int(40*(1-r/200))
-            draw.ellipse([(W//2-r,30-r),(W//2+r,30+r)], fill=(180,20,20,a))
-    else:
-        # Samuga cinematic — deep navy base, midnight blue fade
-        TOP  = (8, 15, 45)
-        MID  = (12, 25, 68)
-        BOT  = (5, 10, 32)
-        for y in range(H):
-            t = y / H
-            if t < 0.5:
-                f = t * 2
-                r = int(TOP[0] + (MID[0]-TOP[0])*f)
-                g = int(TOP[1] + (MID[1]-TOP[1])*f)
-                b = int(TOP[2] + (MID[2]-TOP[2])*f)
-            else:
-                f = (t-0.5)*2
-                r = int(MID[0] + (BOT[0]-MID[0])*f)
-                g = int(MID[1] + (BOT[1]-MID[1])*f)
-                b = int(MID[2] + (BOT[2]-MID[2])*f)
-            draw.line([(0,y),(W,y)], fill=(r,g,b,255))
-
-        # Subtle SKY blue radial glow at top-centre — depth and warmth
-        from PIL import Image as _Img, ImageFilter as _IF
-        glow_layer = _Img.new("RGBA", (W,H), (0,0,0,0))
-        gd = ImageDraw.Draw(glow_layer)
-        for r in range(320,0,-1):
-            a = int(22*(1-r/320))
-            gd.ellipse([(W//2-r, 80-r),(W//2+r, 80+r)], fill=(41,171,226,a))
-        glow_layer = glow_layer.filter(_IF.GaussianBlur(30))
-        img_rgba = img.convert("RGBA")
-        img_rgba = _Img.alpha_composite(img_rgba, glow_layer)
-        img = img_rgba.convert("RGB")
-        draw = ImageDraw.Draw(img, "RGBA")
-
-        # Weather-specific accent tint — rain = slight blue shift, storm = purple tint
-        if code in [95,96,99]:
-            tint = _Img.new("RGBA", (W,H), (20,0,40,35))
-            img = _Img.alpha_composite(img.convert("RGBA"), tint).convert("RGB")
-            draw = ImageDraw.Draw(img, "RGBA")
-        elif code in [61,63,65,80,81,82,51,53,55]:
-            tint = _Img.new("RGBA", (W,H), (0,20,60,25))
-            img = _Img.alpha_composite(img.convert("RGBA"), tint).convert("RGB")
-            draw = ImageDraw.Draw(img, "RGBA")
-
-    # Gold accent bar — top (Samuga signature)
-    draw.rectangle([(0,0),(W,4)], fill=(224,180,0,255))
-    # SKY accent bar — left edge
-    draw.rectangle([(0,0),(3,H)], fill=(41,171,226,255))
-
-    # Dark vignette at very top so logo is readable
-    for y in range(100):
-        draw.line([(0,y),(W,y)], fill=(0,0,0,int(100*(1-y/100))))
-
-    def F(sz, bold=False):
-        try:
-            return ImageFont.truetype(
-                f"/usr/share/fonts/truetype/dejavu/DejaVuSans{chr(45)+'Bold' if bold else ''}.ttf", sz)
-        except:
-            return ImageFont.load_default()
-
-    font_huge  = F(160, True)
-    font_large = F(48,  True)
-    font_med   = F(34)
-    font_small = F(26,  True)
-    font_tiny  = F(21)
-    font_xs    = F(17)
-    font_xxs   = F(14)
+    hours  = hourly_d.get("time", [])
+    temps  = hourly_d.get("temperature_2m", [])
+    codes  = hourly_d.get("weathercode", [])
+    precip = hourly_d.get("precipitation_probability", [])
 
     from datetime import timezone
     mvt = datetime.now(timezone.utc) + timedelta(hours=5)
 
-    # Samuga logo — top left
+    # ── Sea condition assessment (Maldives-specific) ──────────────────────────
+    def sea_condition(wind_kmh, gust_kmh, precip_pct, wcode):
+        if wind_kmh >= 50 or gust_kmh >= 65 or wcode in [95,96,99]:
+            return "⛔", "Very Rough Sea", "Avoid all sea travel"
+        if wind_kmh >= 35 or gust_kmh >= 45:
+            return "🟠", "Rough Sea", "Caution — small craft warning"
+        if wind_kmh >= 20 or gust_kmh >= 30:
+            return "🟡", "Moderate Sea", "Speedboats with care"
+        return "🟢", "Calm Sea", "Good conditions for travel"
+
+    sea_icon, sea_label, sea_advice = sea_condition(wind, gusts, precip_p, code)
+
+    # ── Background — deep layered atmospheric ─────────────────────────────────
+    if alert_mode:
+        TOP, BOT = (45, 5, 5), (15, 2, 2)
+    elif code in [95,96,99]:
+        TOP, BOT = (18, 10, 45), (6, 4, 22)
+    elif code in [61,63,65,80,81,82,51,53,55]:
+        TOP, BOT = (8, 18, 52), (4, 8, 28)
+    elif code == 0:
+        TOP, BOT = (5, 22, 80), (3, 10, 42)
+    else:
+        TOP, BOT = (8, 18, 55), (4, 8, 32)
+
+    # Three-stop gradient: top → mid → bottom
+    MID = tuple(int((TOP[i]+BOT[i])//2 + 8) for i in range(3))
+    for y in range(H):
+        t = y / H
+        if t < 0.45:
+            f = t / 0.45
+            r = int(TOP[0] + (MID[0]-TOP[0])*f)
+            g = int(TOP[1] + (MID[1]-TOP[1])*f)
+            b = int(TOP[2] + (MID[2]-TOP[2])*f)
+        else:
+            f = (t-0.45) / 0.55
+            r = int(MID[0] + (BOT[0]-MID[0])*f)
+            g = int(MID[1] + (BOT[1]-MID[1])*f)
+            b = int(MID[2] + (BOT[2]-MID[2])*f)
+        draw.line([(0,y),(W,y)], fill=(max(0,min(255,r)), max(0,min(255,g)), max(0,min(255,b)), 255))
+
+    # Atmospheric glow layers — large soft blobs of colour for depth
+    glow = Image.new("RGBA", (W, H), (0,0,0,0))
+    gd   = ImageDraw.Draw(glow)
+
+    # Primary glow — centre-top (SKY blue)
+    for r in range(700, 0, -1):
+        a = int(28 * (1 - r/700))
+        gd.ellipse([(W//2-r, 180-r), (W//2+r, 180+r)], fill=(41,171,226,a))
+
+    # Secondary glow — lower left (deeper blue)
+    for r in range(500, 0, -1):
+        a = int(18 * (1 - r/500))
+        gd.ellipse([(200-r, H-400-r), (200+r, H-400+r)], fill=(20,60,160,a))
+
+    # Accent glow — lower right (hint of teal)
+    for r in range(400, 0, -1):
+        a = int(14 * (1 - r/400))
+        gd.ellipse([(W-300-r, H-500-r), (W-300+r, H-500+r)], fill=(20,120,140,a))
+
+    glow = glow.filter(ImageFilter.GaussianBlur(60))
+    img_rgba = img.convert("RGBA")
+    img_rgba = Image.alpha_composite(img_rgba, glow)
+
+    # Noise/grain overlay for depth (subtle)
+    import random
+    grain = Image.new("RGBA", (W, H), (0,0,0,0))
+    gpx  = grain.load()
+    for yy in range(0, H, 3):
+        for xx in range(0, W, 3):
+            v = random.randint(0, 12)
+            gpx[xx, yy] = (v, v, v+4, 6)
+    img_rgba = Image.alpha_composite(img_rgba, grain)
+
+    img  = img_rgba.convert("RGB")
+    draw = ImageDraw.Draw(img, "RGBA")
+
+    # Alert red tint overlay
+    if alert_mode:
+        overlay = Image.new("RGBA", (W,H), (80,0,0,40))
+        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        draw = ImageDraw.Draw(img, "RGBA")
+
+    # ── Fonts ─────────────────────────────────────────────────────────────────
+    def F(sz, bold=False):
+        try:
+            path = f"/usr/share/fonts/truetype/dejavu/DejaVuSans{chr(45)+'Bold' if bold else ''}.ttf"
+            return ImageFont.truetype(path, sz)
+        except:
+            return ImageFont.load_default()
+
+    f_giant  = F(420, True)   # temperature
+    f_huge   = F(110, True)   # condition
+    f_large  = F(80,  True)   # location, section headers
+    f_med    = F(64)           # H/L, details
+    f_small  = F(52,  True)   # island names, sea label
+    f_body   = F(46)           # outlook text
+    f_tiny   = F(38)           # hourly labels
+    f_xs     = F(32)           # sub-labels
+    f_xxs    = F(26)           # footer, source
+
+    # ── SAMUGA LOGO — top left ────────────────────────────────────────────────
     try:
         logo = Image.open("logo.png").convert("RGBA")
-        lh = 62; lw2 = int(logo.width * lh / logo.height)
+        lh = 120; lw2 = int(logo.width * lh / logo.height)
         logo = logo.resize((lw2, lh), Image.LANCZOS)
-        ir = img.convert("RGBA"); ir.paste(logo, (36, 24), logo)
+        ir = img.convert("RGBA"); ir.paste(logo, (70, 55), logo)
         img = ir.convert("RGB"); draw = ImageDraw.Draw(img, "RGBA")
     except Exception as e:
         log.debug(f"weather logo: {e}")
+        # Fallback text logo
+        draw.text((70, 55), "SAMUGA MEDIA", font=f_xs, fill=(255,255,255,200))
 
-    # Alert accent bars
-    if alert_mode:
-        draw.rectangle([(0,0),(W,6)], fill=(220,50,50,255))
-        draw.rectangle([(0,0),(5,H)], fill=(220,50,50,255))
-        btext = "WEATHER ALERT"
-        btw = draw.textlength(btext, font=font_small)
-        draw.text(((W-btw)//2, 36), btext, font=font_small, fill=(255,80,80,255))
-
-    # Channel tag top right
+    # Channel tag — top right
     tag = "t.me/samugacommunity"
-    ttw = draw.textlength(tag, font=font_xxs)
-    draw.text((W-ttw-36, 40), tag, font=font_xxs, fill=(255,255,255,140))
+    ttw = draw.textlength(tag, font=f_xs)
+    draw.text((W-ttw-70, 78), tag, font=f_xs, fill=(255,255,255,130))
 
-    # Location
-    loc = "Male, Maldives"
-    top_y = 100 if not alert_mode else 68
-    lcw = draw.textlength(loc, font=font_large)
-    draw.text(((W-lcw)//2, top_y), loc, font=font_large, fill=(255,255,255,230))
+    # Alert banner
+    if alert_mode:
+        btext = "⚠  WEATHER ALERT  ⚠"
+        btw = draw.textlength(btext, font=f_small)
+        draw.text(((W-btw)//2, 70), btext, font=f_small, fill=(255,80,80,255))
 
-    # Big icon
-    draw_weather_icon(draw, code, W//2, top_y+80, size=90)
+    # ── LOCATION ──────────────────────────────────────────────────────────────
+    loc = "Malé, Maldives"
+    loc_y = 220
+    lcw = draw.textlength(loc, font=f_large)
+    draw.text(((W-lcw)//2, loc_y), loc, font=f_large, fill=(255,255,255,230))
 
-    # Temperature
-    temp_str = f"{temp}\u00b0"
-    ttw2 = draw.textlength(temp_str, font=font_huge)
-    draw.text(((W-ttw2)//2, top_y+180), temp_str, font=font_huge, fill=(255,255,255,255))
+    # ── BIG WEATHER ICON — between location and temperature ───────────────────
+    icon_y = loc_y + 110
+    draw_weather_icon(draw, code, W//2, icon_y, size=180)
 
-    # Condition
-    ccw = draw.textlength(condition, font=font_large)
-    draw.text(((W-ccw)//2, top_y+356), condition, font=font_large, fill=(255,255,255,200))
+    # ── TEMPERATURE ───────────────────────────────────────────────────────────
+    temp_str = f"{temp}°"
+    ttw2 = draw.textlength(temp_str, font=f_giant)
+    temp_y = icon_y + 200
+    draw.text(((W-ttw2)//2, temp_y), temp_str, font=f_giant, fill=(255,255,255,255))
+
+    # ── CONDITION ─────────────────────────────────────────────────────────────
+    cond_y = temp_y + 440
+    ccw = draw.textlength(condition, font=f_huge)
+    draw.text(((W-ccw)//2, cond_y), condition, font=f_huge, fill=(255,255,255,200))
 
     # Alert text
     if alert_mode and alert_text:
-        atw = draw.textlength(alert_text, font=font_small)
-        if atw > W-80:
-            words2=alert_text.split(); alines=[]; cur2=""
-            for aw in words2:
-                if draw.textlength(cur2+" "+aw,font=font_small)<W-80: cur2=(cur2+" "+aw).strip()
-                else: alines.append(cur2); cur2=aw
-            if cur2: alines.append(cur2)
-            for ai,al in enumerate(alines[:2]):
-                alw=draw.textlength(al,font=font_small)
-                draw.text(((W-alw)//2, top_y+414+ai*34), al, font=font_small, fill=(255,120,120,255))
-        else:
-            draw.text(((W-atw)//2, top_y+414), alert_text, font=font_small, fill=(255,120,120,255))
+        atw = draw.textlength(alert_text, font=f_small)
+        draw.text(((W-atw)//2, cond_y+120), alert_text, font=f_small, fill=(255,120,120,255))
 
-    # H/L
-    hl_y = top_y + 414 if not alert_mode else top_y + 480
-    hl_str = f"H:{temp_max}\u00b0  L:{temp_min}\u00b0"
-    hlw = draw.textlength(hl_str, font=font_med)
-    draw.text(((W-hlw)//2, hl_y), hl_str, font=font_med, fill=(255,255,255,190))
+    # ── H / L ─────────────────────────────────────────────────────────────────
+    hl_y = cond_y + 130
+    hl_str = f"H:{temp_max}°   L:{temp_min}°"
+    hlw = draw.textlength(hl_str, font=f_med)
+    draw.text(((W-hlw)//2, hl_y), hl_str, font=f_med, fill=(255,255,255,180))
 
-    dy = hl_y + 46
-    # Row 1: feels, humidity, wind
-    row1 = f"Feels {feels}\u00b0   Humidity {humidity}%   Wind {wind} km/h"
+    # ── DETAILS — 3 rows ──────────────────────────────────────────────────────
+    dy = hl_y + 90
+    def centred(text, font, color, y):
+        w = draw.textlength(text, font=font)
+        draw.text(((W-w)//2, y), text, font=font, fill=color)
+
+    row1 = f"Feels {feels}°   Humidity {humidity}%   Wind {wind} km/h"
     if gusts and gusts > wind: row1 += f" (gusts {gusts})"
-    r1w = draw.textlength(row1, font=font_tiny)
-    draw.text(((W-r1w)//2, dy), row1, font=font_tiny, fill=(255,255,255,175))
-    dy += 30
+    centred(row1, f_med, (255,255,255,175), dy); dy += 70
 
-    # Row 2: UV, visibility, dew point, pressure
-    r2parts = []
-    if uv: r2parts.append(f"UV {uv}")
-    if vis: r2parts.append(f"Vis {vis} km")
-    if dew: r2parts.append(f"Dew {dew}\u00b0")
-    if pressure: r2parts.append(f"{pressure} hPa")
-    if r2parts:
-        row2 = "   ".join(r2parts)
-        r2w = draw.textlength(row2, font=font_tiny)
-        draw.text(((W-r2w)//2, dy), row2, font=font_tiny, fill=(255,255,255,150))
-        dy += 30
+    row2_parts = []
+    if uv:       row2_parts.append(f"UV {uv}")
+    if vis:      row2_parts.append(f"Visibility {vis} km")
+    if dew:      row2_parts.append(f"Dew {dew}°")
+    if pressure: row2_parts.append(f"Pressure {pressure} hPa")
+    if row2_parts:
+        centred("   ".join(row2_parts), f_body, (255,255,255,145), dy); dy += 60
 
-    # Row 3: sunrise/sunset + precip prob
     sun_str = f"Sunrise {sunrise_str}   Sunset {sunset_str}"
     if precip_p: sun_str += f"   Rain {precip_p}%"
-    ssw = draw.textlength(sun_str, font=font_tiny)
-    draw.text(((W-ssw)//2, dy), sun_str, font=font_tiny, fill=(255,220,100,200))
-    dy += 30
+    centred(sun_str, f_body, (255,220,100,200), dy); dy += 50
 
-    # Divider
-    div_y = dy + 8
-    draw.line([(60,div_y),(W-60,div_y)], fill=(255,255,255,50), width=1)
+    # ── THIN DIVIDER ──────────────────────────────────────────────────────────
+    div1 = dy + 20
+    draw.line([(80,div1),(W-80,div1)], fill=(255,255,255,35), width=2)
 
-    # Hourly strip
+    # ── SEA & WIND CONDITION SECTION (Maldives-specific) ─────────────────────
+    sea_y = div1 + 50
+    # Section label
+    sea_hdr = "SEA & WIND CONDITIONS"
+    shw = draw.textlength(sea_hdr, font=f_small)
+    draw.text(((W-shw)//2, sea_y), sea_hdr, font=f_small, fill=(255,220,100,220))
+    sea_y += 80
+
+    # Three columns: wind | sea state | advice
+    col_w = W // 3
+    # Wind column
+    draw.text((col_w*0 + 80, sea_y), "WIND", font=f_xs, fill=(255,255,255,120))
+    wind_val = f"{wind} km/h"
+    draw.text((col_w*0 + 80, sea_y+40), wind_val, font=f_small, fill=(255,255,255,230))
+    if gusts > wind:
+        draw.text((col_w*0 + 80, sea_y+100), f"Gusts {gusts} km/h", font=f_body, fill=(255,200,100,180))
+
+    # Sea state column — centred
+    sl_w = draw.textlength(sea_label, font=f_small)
+    draw.text(((W-sl_w)//2, sea_y+40), sea_label, font=f_small, fill=(255,255,255,230))
+    adv_w = draw.textlength(sea_advice, font=f_body)
+    draw.text(((W-adv_w)//2, sea_y+100), sea_advice, font=f_body, fill=(200,230,255,170))
+
+    # UV + Visibility column — right
+    draw.text((col_w*2 + 80, sea_y), "UV INDEX", font=f_xs, fill=(255,255,255,120))
+    uv_col = "Low" if uv<=2 else "Moderate" if uv<=5 else "High" if uv<=7 else "Very High"
+    draw.text((col_w*2 + 80, sea_y+40), f"{uv} — {uv_col}", font=f_small, fill=(255,255,255,230))
+    draw.text((col_w*2 + 80, sea_y+100), f"Vis {vis} km", font=f_body, fill=(200,230,255,170))
+
+    sea_y += 160
+    div2 = sea_y + 10
+    draw.line([(80,div2),(W-80,div2)], fill=(255,255,255,35), width=2)
+
+    # ── HOURLY STRIP — next 8 hours ───────────────────────────────────────────
+    hourly_y = div2 + 40
     now_hour = mvt.hour
-    slot_w2 = (W-120)//8
+    slot_w = (W - 160) // 8
     displayed = 0
-    y_base = div_y + 20
 
-    for i2,(h_str,ht,hc,hp) in enumerate(zip(hours,temps,codes,precip)):
-        try: h_hour = int(h_str.split("T")[1][:2])
-        except: continue
+    for h_str, ht, hc, hp in zip(hours, temps, codes, precip):
+        try:
+            h_hour = int(h_str.split("T")[1][:2])
+        except:
+            continue
         if h_hour < now_hour: continue
         if displayed >= 8: break
-        hx = 60 + displayed*slot_w2 + slot_w2//2
-        h_label = "Now" if displayed==0 else f"{h_hour:02d}:00"
-        hlw2 = draw.textlength(h_label, font=font_xs)
-        draw.text((hx-hlw2//2, y_base), h_label, font=font_xs, fill=(255,255,255,170))
-        draw_weather_icon(draw, hc, hx, y_base+40, size=26)
-        ht_str = f"{round(ht)}\u00b0"
-        htw = draw.textlength(ht_str, font=font_small)
-        draw.text((hx-htw//2, y_base+68), ht_str, font=font_small, fill=(255,255,255,255))
-        if hp and hp>0:
-            hp_str=f"{hp}%"; hpw=draw.textlength(hp_str,font=font_xs)
-            draw.text((hx-hpw//2, y_base+100), hp_str, font=font_xs, fill=(120,200,255,210))
+
+        hx = 80 + displayed * slot_w + slot_w // 2
+
+        # Hour label
+        h_label = "Now" if displayed == 0 else f"{h_hour:02d}:00"
+        hlw2 = draw.textlength(h_label, font=f_tiny)
+        draw.text((hx-hlw2//2, hourly_y), h_label, font=f_tiny, fill=(255,255,255,160))
+
+        # Icon
+        draw_weather_icon(draw, hc, hx, hourly_y+70, size=52)
+
+        # Temp
+        ht_str = f"{round(ht)}°"
+        htw = draw.textlength(ht_str, font=f_small)
+        draw.text((hx-htw//2, hourly_y+140), ht_str, font=f_small, fill=(255,255,255,255))
+
+        # Rain %
+        if hp and hp > 0:
+            hp_str = f"{hp}%"
+            hpw = draw.textlength(hp_str, font=f_tiny)
+            draw.text((hx-hpw//2, hourly_y+200), hp_str, font=f_tiny, fill=(120,200,255,200))
+
         displayed += 1
+
+    div3 = hourly_y + 260
+    draw.line([(80,div3),(W-80,div3)], fill=(255,255,255,35), width=2)
 
     # ── ISLAND WATCH STRIP ────────────────────────────────────────────────────
     if island_data:
-        iw_y = y_base + 128
-        draw.line([(40,iw_y),(W-40,iw_y)], fill=(255,255,255,40), width=1)
-        iw_y += 14
-        hdr = "WEATHER WATCH — MALDIVES"
-        hdw = draw.textlength(hdr, font=font_small)
-        draw.text(((W-hdw)//2, iw_y), hdr, font=font_small, fill=(255,220,100,230))
-        iw_y += 38
+        iw_y = div3 + 50
+
+        iw_hdr = "WEATHER WATCH — MALDIVES"
+        ihw = draw.textlength(iw_hdr, font=f_small)
+        draw.text(((W-ihw)//2, iw_y), iw_hdr, font=f_small, fill=(255,220,100,225))
+        iw_y += 90
 
         for isl in island_data:
             iname = isl["name"]
             iout  = isl["outlook"]
             itemp = isl.get("temp", 29)
-            icode = isl.get("code", 1000)
 
-            # Island name — left
-            draw.text((48, iw_y), iname, font=F(18, True), fill=(255,255,255,230))
-            # Temperature — right
-            ts2 = f"{itemp}\u00b0C"
-            tw3 = int(draw.textlength(ts2, font=F(18, True)))
-            draw.text((W-48-tw3, iw_y), ts2, font=F(18, True), fill=(160,215,255,210))
-            # Outlook — below name, dimmer
-            draw.text((48, iw_y+24), iout, font=font_xs, fill=(200,225,255,170))
-            iw_y += 58
+            # Name left, temp right
+            draw.text((90, iw_y), iname, font=f_small, fill=(255,255,255,230))
+            ts2 = f"{itemp}°C"
+            tw3 = int(draw.textlength(ts2, font=f_small))
+            draw.text((W-90-tw3, iw_y), ts2, font=f_small, fill=(160,215,255,210))
+            # Outlook below
+            draw.text((90, iw_y+58), iout, font=f_body, fill=(200,225,255,165))
 
-        draw.line([(40,iw_y),(W-40,iw_y)], fill=(255,255,255,30), width=1)
+            # Subtle row separator
+            draw.line([(90, iw_y+108),(W-90, iw_y+108)], fill=(255,255,255,18), width=1)
+            iw_y += 118
 
-    # Bottom bar
-    bar_y = H - 78
-    draw.line([(60,bar_y),(W-60,bar_y)], fill=(255,255,255,40), width=1)
-    time_str = mvt.strftime("%A, %d %B %Y  \u2022  %H:%M MVT")
-    tfw = draw.textlength(time_str, font=font_xs)
-    draw.text(((W-tfw)//2, bar_y+10), time_str, font=font_xs, fill=(255,255,255,120))
+        div4 = iw_y + 20
+        draw.line([(80,div4),(W-80,div4)], fill=(255,255,255,30), width=2)
+        bottom_start = div4
+    else:
+        bottom_start = div3
+
+    # ── BOTTOM BAR ────────────────────────────────────────────────────────────
+    bar_y = H - 160
+    # Semi-transparent dark strip
+    bar_overlay = Image.new("RGBA", (W, 160), (0,0,0,80))
+    img.paste(Image.new("RGB",(W,160),(0,0,0)), (0,bar_y),
+              Image.new("L",(W,160), 80))
+    draw = ImageDraw.Draw(img, "RGBA")
+
+    time_str = mvt.strftime("%A, %d %B %Y  •  %H:%M MVT")
+    tfw = draw.textlength(time_str, font=f_xs)
+    draw.text(((W-tfw)//2, bar_y+18), time_str, font=f_xs, fill=(255,255,255,120))
+
     brand = "Samuga Media  |  @samugacommunity"
-    bw3 = draw.textlength(brand, font=font_small)
-    draw.text(((W-bw3)//2, bar_y+34), brand, font=font_small, fill=(255,255,255,200))
+    bw3 = draw.textlength(brand, font=f_small)
+    draw.text(((W-bw3)//2, bar_y+62), brand, font=f_small, fill=(255,255,255,210))
+
     if source:
         src_txt = f"Data: {source}"
-        stw2 = draw.textlength(src_txt, font=font_xxs)
-        draw.text((W-stw2-36, bar_y+58), src_txt, font=font_xxs, fill=(255,255,255,80))
+        stw2 = draw.textlength(src_txt, font=f_xxs)
+        draw.text((W-stw2-80, bar_y+128), src_txt, font=f_xxs, fill=(255,255,255,80))
 
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="PNG")
     buf.seek(0)
     return buf
+
 
 # ── Weather Alert System ──────────────────────────────────────────────────────
 # Checks every weather fetch for dangerous conditions.
@@ -3334,31 +3404,52 @@ def send_weather_update(time_of_day="morning"):
             log.warning("🏝️ No island forecast data — card will show Malé only")
 
         card = generate_weather_card(data, island_data=islands if islands else None)
-        current = data.get("current", {})
+        current  = data.get("current", {})
+        daily_d  = data.get("daily", {})
         temp     = round(current.get("temperature_2m", 29))
+        feels    = round(current.get("apparent_temperature", 29))
+        humidity = current.get("relativehumidity_2m", 80)
         code     = current.get("weathercode", 0)
         uv       = current.get("uv_index", 0)
         wind     = round(current.get("windspeed_10m", 10))
         precip_p = current.get("precipitation_prob", 0)
         source   = data.get("_source", "")
+        temp_max = round(daily_d.get("temperature_2m_max", [temp])[0])
+        temp_min = round(daily_d.get("temperature_2m_min", [temp])[0])
+        sunrise_raw = daily_d.get("sunrise", [""])[0]
+        sunset_raw  = daily_d.get("sunset",  [""])[0]
+        sunrise_str = sunrise_raw.split("T")[1][:5] if "T" in sunrise_raw else "06:00"
+        sunset_str  = sunset_raw.split("T")[1][:5]  if "T" in sunset_raw  else "18:19"
         emoji, condition = weather_code_to_info(code)
         greeting = "\U0001f305 Good Morning Maldives!" if time_of_day == "morning" else "\U0001f319 Good Evening Maldives!"
         src_tag = f"\n<i>Data: {source}</i>" if source else ""
 
-        # Build island summary for caption
+        # Sea condition for caption
+        def _sea_label(w, g, p, c):
+            if w>=50 or g>=65 or c in [95,96,99]: return "⛔ Very Rough Sea — avoid all sea travel"
+            if w>=35 or g>=45: return "🟠 Rough Sea — small craft warning"
+            if w>=20 or g>=30: return "🟡 Moderate Sea — speedboats with care"
+            return "🟢 Calm Sea — good conditions"
+        sea_line = _sea_label(wind, round(current.get("windgust_10m",0)), precip_p, code)
+
         island_lines = ""
         if islands:
             island_lines = "\n\n🏝 <b>Weather Watch</b>\n"
             for isl in islands:
                 island_lines += f"📍 <b>{isl['name']}</b> — {isl['outlook']}\n"
 
+        src_tag = f"\n<i>📡 Data: {source}</i>" if source else ""
+
         caption = (
             f"{greeting}\n\n"
-            f"{emoji} <b>Current Weather \u2014 Mal\u00e9</b>\n"
-            f"\U0001f321\ufe0f <b>{temp}\u00b0C</b> \u2014 {condition}\n"
-            f"\U0001f4a8 Wind {wind} km/h  \u00b7  \u2614 Rain {precip_p}%  \u00b7  \u2600\ufe0f UV {uv}"
-            f"{island_lines}\n\n"
-            f"\U0001f4e1 <b>Samuga Media</b> | @samugacommunity"
+            f"{emoji} <b>{condition} — Malé, Maldives</b>\n"
+            f"🌡 <b>{temp}°C</b>  (Feels {feels}°C)  •  H:{temp_max}° L:{temp_min}°\n"
+            f"💧 Humidity {humidity}%  •  ☔ Rain {precip_p}%  •  ☀️ UV {uv}\n"
+            f"💨 Wind {wind} km/h" + (f" (gusts {round(current.get('windgust_10m',0))} km/h)" if current.get('windgust_10m',0) > wind else "") + "\n"
+            f"🌅 Sunrise {sunrise_str}  •  🌇 Sunset {sunset_str}\n\n"
+            f"{sea_line}"
+            f"{island_lines}\n"
+            f"📡 <b>Samuga Media</b> | @samugacommunity"
             f"{src_tag}"
         )
         send_photo(TELEGRAM_CHANNEL_ID, card, caption)
