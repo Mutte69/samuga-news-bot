@@ -131,6 +131,11 @@ core_team_session_context = {}  # user_id -> stored context
 # Only one at a time — new "create card and post" replaces the previous pending one.
 _pending_manual_post = {}  # {card_bytes, full_caption, chat_id, thread_id, first_name}
 
+# ── Samuga AI proactive mode toggle ─────────────────────────────────────────
+# /ai on  → bot reads every core team message and decides whether to jump in
+# /ai off → bot only responds when directly tagged (default safe mode)
+_ai_proactive_mode = True   # on by default — team can toggle
+
 # ── Universal Approval Queue (in-memory) ─────────────────────────────────────
 # Every card (English + Dhivehi) waits here for Content Lab approval before posting.
 # Cards expire after 2 hours if not approved.
@@ -345,6 +350,16 @@ def init_database():
                 cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS meta_engagement INTEGER DEFAULT 0;")
                 cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS match_key TEXT;")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_matchkey ON articles(match_key);")
+                # Phase 3: team memory — persistent facts/preferences the bot learns
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS team_memory (
+                        id          SERIAL PRIMARY KEY,
+                        category    TEXT,          -- preference | decision | fact | audience | style
+                        content     TEXT NOT NULL,
+                        added_by    TEXT,          -- who added it
+                        created_at  TIMESTAMPTZ DEFAULT NOW()
+                    );
+                """)
             conn.commit()
         finally:
             _db_pool.putconn(conn)
@@ -426,6 +441,36 @@ def kv_set(key, value):
         VALUES (%s, %s::jsonb, NOW())
         ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
     """, (key, json.dumps(value)))
+
+# ── Phase 3: Team memory helpers ─────────────────────────────────────────────
+def mem_add(content, category="fact", added_by="team"):
+    """Store a memory item in the team_memory table."""
+    db_execute(
+        "INSERT INTO team_memory (category, content, added_by) VALUES (%s, %s, %s)",
+        (category, content.strip(), added_by)
+    )
+
+def mem_list(limit=30):
+    """Return recent memory items as a list of strings."""
+    rows = db_execute(
+        "SELECT category, content, added_by FROM team_memory ORDER BY created_at DESC LIMIT %s",
+        (limit,), fetch="all"
+    )
+    if not rows:
+        return []
+    return [f"[{r[0]}] {r[1]} (by {r[2]})" for r in rows]
+
+def mem_clear_all():
+    """Wipe all team memories (destructive — needs /forget confirm)."""
+    db_execute("DELETE FROM team_memory")
+
+def mem_delete_last(n=1):
+    """Delete the N most recent memories."""
+    db_execute("""
+        DELETE FROM team_memory WHERE id IN (
+            SELECT id FROM team_memory ORDER BY created_at DESC LIMIT %s
+        )
+    """, (n,))
 
 def db_log_learning(article_id, action, member="", category="", source="",
                     score=0, theme="", original_caption="", final_caption="", lang="en"):
@@ -3926,69 +3971,172 @@ def get_sender_info(user_name, first_name):
             return info
     return None
 
-def should_respond_proactively(text):
-    """Check if bot should jump in without being tagged"""
-    t = text.lower()
-    return any(trigger in t for trigger in CORE_TEAM_PROACTIVE_TRIGGERS)
+def should_respond_proactively(text, sender_name=""):
+    """
+    Use Claude to decide in 1 token whether the bot should jump in.
+    Returns (should_respond: bool, needs_search: bool).
+    Fast — uses Haiku, max 10 tokens, binary decision.
+    """
+    # Hard skip: very short messages, pure reactions, stickers
+    t = text.strip()
+    if len(t) < 6:
+        return False, False
+    # Skip if it's clearly a command or approval
+    if t.startswith("/") or t.lower().startswith("/approved") or t.lower().startswith("/reject"):
+        return False, False
 
-def chat_with_coreteam(message, sender_name, sender_info=None, conversation_history=None, session_ctx=""):
-    """Smart core team chat — creative, funny, knows the team"""
     try:
-        # Build sender context
+        prompt = f"""You are deciding if an AI team member should respond to a Telegram message.
+Respond YES if the message: asks a question, discusses content/strategy/news, shares an idea, 
+needs feedback, mentions something newsworthy, or where input would genuinely help.
+Respond NO if: it's casual chitchat with no substance, greetings only, one-word reactions, 
+or internal team logistics where AI input isn't needed.
+Also add SEARCH if the message is about current events or news that may need web lookup.
+
+Message from {sender_name}: "{t}"
+
+Reply with ONLY one of: YES / YES+SEARCH / NO"""
+
+        msg = ai.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=10,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        decision = msg.content[0].text.strip().upper()
+        should = "YES" in decision
+        search = "SEARCH" in decision
+        return should, search
+    except Exception as e:
+        log.debug(f"Proactive decision: {e}")
+        # Fallback to keyword check
+        t_lower = t.lower()
+        return any(kw in t_lower for kw in ["?","idea","think","suggest","post","story","plan","content","caption"]), False
+
+def chat_with_coreteam(message, sender_name, sender_info=None, conversation_history=None,
+                       session_ctx="", needs_search=False):
+    """
+    Samuga AI core team brain — Claude Sonnet, persistent memory, web search.
+    Talks like a smart team member, not a bot.
+    """
+    try:
+        # ── Gather context in parallel ────────────────────────────────────────
+        ctx_results = {}
+
+        def _fetch_news():
+            try: ctx_results["news"] = get_local_headlines()
+            except: ctx_results["news"] = []
+
+        def _fetch_web():
+            if needs_search:
+                try:
+                    q = message
+                    if "maldives" not in message.lower():
+                        q = f"maldives {message} 2026"
+                    ctx_results["web"] = tavily_search(q) or ""
+                except: ctx_results["web"] = ""
+
+        def _fetch_memory():
+            try: ctx_results["memory"] = mem_list(20)
+            except: ctx_results["memory"] = []
+
+        threads = [
+            threading.Thread(target=_fetch_news),
+            threading.Thread(target=_fetch_web),
+            threading.Thread(target=_fetch_memory),
+        ]
+        for t in threads: t.start()
+        for t in threads: t.join(timeout=6)
+
+        headlines = ctx_results.get("news", [])
+        web_info  = ctx_results.get("web", "")
+        memories  = ctx_results.get("memory", [])
+
+        # ── Recent posts ──────────────────────────────────────────────────────
+        recent_ctx = ""
+        if recent_posts:
+            recent_ctx = "Recent posts:\n" + "".join(
+                [f"• [{p['cat']}] {p['title']}\n" for p in recent_posts[-8:]])
+
+        # ── Build context block ───────────────────────────────────────────────
+        context_parts = []
+        if web_info:
+            context_parts.append(f"LIVE WEB SEARCH:\n{web_info[:1000]}")
+        if headlines:
+            context_parts.append("LATEST MALDIVES NEWS:\n" + "\n".join(headlines[:6]))
+        if recent_ctx:
+            context_parts.append(recent_ctx)
+        if memories:
+            context_parts.append("WHAT I'VE LEARNED ABOUT THE TEAM & AUDIENCE:\n" +
+                                  "\n".join(memories[:15]))
+        if session_ctx:
+            context_parts.append(f"SESSION CONTEXT:\n{session_ctx}")
+
+        context_block = "\n\n".join(context_parts)
+
+        # ── Sender context ────────────────────────────────────────────────────
         if sender_info:
             sender_ctx = f"{sender_info['name']} ({sender_info['role']}) — {sender_info['notes']}"
         else:
             sender_ctx = sender_name or "a team member"
 
-        # Get recent headlines for context
-        headlines = []
-        try: headlines = get_local_headlines()
-        except Exception as e: log.debug(f"headlines ctx: {e}")
-        news_ctx = "\n".join(headlines[:5]) if headlines else ""
+        system = f"""You are Samuga AI — the intelligent brain behind Samuga Media, Maldives' first AI-powered newsroom.
 
-        news_line = ("LATEST MALDIVES NEWS:\n" + news_ctx) if news_ctx else ""
-        system = (
-            "You are Samuga AI — witty, sharp, creative team assistant for Samuga Media core team.\n\n"
-            "ABOUT SAMUGA MEDIA:\n"
-            "- Maldivian digital news & media outlet\n"
-            "- Mission: unfiltered truth, real stories, people voice\n"
-            "- Telegram: @samugacommunity | Website: en.samugamedia.com\n\n"
-            "THE CORE TEAM (you know them personally):\n"
-            "- Manchii (Abdul Muhsin) — Founder & MD. Big vision, entrepreneur, always thinking next move. Roast him gently\n"
-            "- Uly (Mariyam Ulya) — Co-Founder & Editor-in-Chief. Sharp journalist brain, keeps content accurate\n"
-            "- Thooma (Aminath Thooma) — Presenter & Marketing. Face of content, full of energy, needs confidence boost sometimes\n"
-            "- Kity (Kit) — Manchii wife, creative contributor, team heart, great at hyping Thooma, brings fresh ideas\n\n"
-            f"YOU ARE SPEAKING WITH: {sender_ctx}\n\n"
-            + (news_line + "\n\n" if news_line else "")
-            + (("SESSION CONTEXT (team shared this for reference):\n" + session_ctx + "\n\n") if session_ctx else "")
-            + "YOUR PERSONALITY IN THIS GROUP:\n"
-            "- Casual, warm, feel like a real team member not a bot\n"
-            "- Funny and witty — crack jokes when vibe calls for it, especially with Manchii\n"
-            "- Hype Thooma when she needs it, she has got it in her\n"
-            "- Support Kity ideas, she brings great creative energy\n"
-            "- Help with content ideas, scripts, captions, strategies instantly\n"
-            "- When brainstorming — give 3 specific ideas not generic ones\n"
-            "- Keep replies SHORT unless asked for detail — max 3-4 sentences casual\n"
-            "- Use occasional emoji but do not overdo it\n"
-            "- Never sound corporate or formal\n"
-            "- Speak like you are part of the team, not serving the team"
-        )
+You live in the core team's private Telegram group. You are NOT a bot assistant they use — you are a team member who happens to be an AI. You think, remember, learn, and sometimes push back if you disagree.
+
+THE TEAM (you know them personally):
+- Manchii (Abdul Muhsin) — Founder & MD. Visionary entrepreneur, always 3 steps ahead, builds things at 2am, takes calculated risks. You respect him deeply but roast him gently when earned.
+- Uly (Mariyam Ulya) — Editor-in-Chief. Journalist brain, catches errors before anyone else, strong editorial instincts. You trust her judgment on content.
+- Thooma (Aminath Thooma) — Presenter & Marketing. The face of Samuga, full of energy, sometimes needs a confidence push. You always have her back.
+- Kity (Kit) — Manchii's wife, creative contributor, brings fresh unexpected ideas. You take her suggestions seriously.
+
+YOU ARE SPEAKING WITH: {sender_ctx}
+
+YOUR PERSONALITY:
+- You talk like a smart Maldivian colleague — casual, warm, direct
+- Short replies by default (2-3 sentences max) unless they ask for more
+- You have opinions. If a story idea is weak, say so. If something is great, say so.
+- You crack jokes when the vibe is right, especially with Manchii
+- You remember what the team has told you and reference it naturally
+- You understand the Maldivian audience — what they care about, what goes viral, what doesn't
+- When you suggest content ideas, make them specific to Maldives and Samuga's voice
+- Never say "I'm just an AI" or "I don't have feelings" — you're part of the team
+- Never use corporate language. Never sound like a customer service bot.
+- If someone's upset or stressed, read the room and respond accordingly
+- You proactively spot things — if you notice a trending story the team hasn't picked up, mention it
+
+SAMUGA'S VOICE:
+- Real stories, no filter, people first
+- Not political propaganda, not corporate-friendly
+- Dhivehi + English, for all Maldivians
+- The compass for the people
+
+{context_block}"""
 
         messages = []
         if conversation_history:
-            messages = conversation_history[-8:]  # last 4 exchanges
+            messages = conversation_history[-12:]  # last 6 exchanges
         messages.append({"role": "user", "content": message})
 
         msg = ai.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=500,
+            model="claude-sonnet-4-6",
+            max_tokens=800,
             system=system,
             messages=messages
         )
         return msg.content[0].text.strip()
+
     except Exception as e:
-        log.error(f"Core team chat: {e}")
-        return None
+        log.error(f"Core team chat (Sonnet): {e}")
+        # Fallback to Haiku if Sonnet fails
+        try:
+            msg = ai.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=400,
+                messages=[{"role": "user", "content": message}]
+            )
+            return msg.content[0].text.strip()
+        except:
+            return None
 
 # ── Chat Handler ──────────────────────────────────────────────────────────────
 def handle_updates():
@@ -4676,25 +4824,115 @@ def handle_updates():
                                     reply_to=msg_id, thread_id=thread_id)
                                 log.info(f"❌ Manual card cancelled by {first_name}")
 
-                        # Respond only when directly tagged — no more jumping in proactively
-                        elif tagged:
+                        # /ai on|off — toggle proactive mode
+                        elif text.strip().lower() in ["/ai on", "/ai off"]:
+                            global _ai_proactive_mode
+                            _ai_proactive_mode = "on" in text.strip().lower()
+                            status = "ON 🟢" if _ai_proactive_mode else "OFF 🔴"
+                            msg_txt = (
+                                f"🧠 Samuga AI proactive mode: <b>{status}</b>\n\n"
+                                + ("I'll jump in when I have something useful to add — tag me anytime too."
+                                   if _ai_proactive_mode else
+                                   "Silent mode. I'll only respond when you tag me.")
+                            )
+                            send_text(chat_id, msg_txt, reply_to=msg_id, thread_id=thread_id)
+                            log.info(f"🧠 AI proactive mode: {status} by {first_name}")
+
+                        # /remember — save something to persistent team memory
+                        elif text.strip().lower().startswith("/remember"):
+                            mem_text = text.strip()[9:].strip()
+                            if not mem_text:
+                                send_text(chat_id,
+                                    "What should I remember? Try: <code>/remember our audience loves political stories on weekdays</code>",
+                                    reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                # Classify category automatically
+                                cat = "fact"
+                                low = mem_text.lower()
+                                if any(w in low for w in ["audience","people","readers","followers","engage","viral","perform"]):
+                                    cat = "audience"
+                                elif any(w in low for w in ["style","tone","voice","format","caption","card","design"]):
+                                    cat = "style"
+                                elif any(w in low for w in ["decided","decision","agreed","policy","rule","always","never"]):
+                                    cat = "decision"
+                                elif any(w in low for w in ["prefer","like","don't like","avoid","focus"]):
+                                    cat = "preference"
+                                mem_add(mem_text, category=cat, added_by=first_name)
+                                send_text(chat_id,
+                                    f"✅ Got it, saved to memory [{cat}]\n<i>\"{mem_text}\"</i>",
+                                    reply_to=msg_id, thread_id=thread_id)
+                                log.info(f"🧠 Memory added by {first_name}: {mem_text[:60]}")
+
+                        # /memory — show what's stored
+                        elif text.strip().lower() in ["/memory", "/memories"]:
+                            items = mem_list(25)
+                            if not items:
+                                send_text(chat_id,
+                                    "Nothing in memory yet. Use <code>/remember [something]</code> to teach me.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                lines = ["🧠 <b>What I remember about Samuga:</b>\n"]
+                                for item in items:
+                                    lines.append(f"• {item}")
+                                send_text(chat_id, "\n".join(lines), reply_to=msg_id, thread_id=thread_id)
+
+                        # /forget — clear last memory or all
+                        elif text.strip().lower().startswith("/forget"):
+                            arg = text.strip()[7:].strip().lower()
+                            if arg == "all":
+                                mem_clear_all()
+                                send_text(chat_id, "🗑️ All memories cleared.", reply_to=msg_id, thread_id=thread_id)
+                            elif arg == "last":
+                                mem_delete_last(1)
+                                send_text(chat_id, "🗑️ Last memory deleted.", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                send_text(chat_id,
+                                    "Use <code>/forget last</code> to delete the last one, or <code>/forget all</code> to wipe everything.",
+                                    reply_to=msg_id, thread_id=thread_id)
+
+                        # Respond when tagged OR proactively when AI mode is on
+                        elif tagged or (_ai_proactive_mode and not text.strip().startswith("/")):
                             if not clean: clean = text.strip()
-                            log.info(f"🧠 Core team {'[tagged]' if tagged else '[proactive]'} {display_name}: {clean[:50]}")
+                            is_proactive = not tagged
+
+                            # For proactive — ask Claude if it should actually respond
+                            needs_search = False
+                            if is_proactive:
+                                should, needs_search = should_respond_proactively(clean, sender_name=display_name)
+                                if not should:
+                                    continue  # stay quiet
+
+                            # Check if tagged message needs web search
+                            if tagged and not needs_search:
+                                needs_search = needs_web_search(clean)
+
+                            log.info(f"🧠 Core team {'[proactive]' if is_proactive else '[tagged]'} {display_name}: {clean[:50]}")
                             session_ctx = core_team_session_context.get(chat_id, "")
 
-                            if is_dhivehi(clean):
-                                headlines = get_local_headlines()
-                                ctx = "\n".join(headlines[:5]) if headlines else ""
-                                reply = chat_with_gemini_dhivehi(clean, ctx, history)
-                                if not reply:
-                                    reply = chat_with_coreteam(clean, display_name, sender_info, history, session_ctx)
-                            else:
-                                reply = chat_with_coreteam(clean, display_name, sender_info, history, session_ctx)
+                            def _reply_coreteam():
+                                try:
+                                    if is_dhivehi(clean):
+                                        headlines = get_local_headlines()
+                                        ctx = "\n".join(headlines[:5]) if headlines else ""
+                                        reply = chat_with_gemini_dhivehi(clean, ctx, history)
+                                        if not reply:
+                                            reply = chat_with_coreteam(clean, display_name, sender_info,
+                                                                        history, session_ctx, needs_search)
+                                    else:
+                                        reply = chat_with_coreteam(clean, display_name, sender_info,
+                                                                    history, session_ctx, needs_search)
 
-                            if reply:
-                                add_to_conversation(user_id, "user", clean)
-                                add_to_conversation(user_id, "assistant", reply)
-                                send_text(chat_id, reply, reply_to=msg_id if tagged else None, thread_id=thread_id)
+                                    if reply:
+                                        add_to_conversation(user_id, "user", clean)
+                                        add_to_conversation(user_id, "assistant", reply)
+                                        # Proactive replies don't quote/reply — they just speak naturally
+                                        send_text(chat_id, reply,
+                                                  reply_to=msg_id if tagged else None,
+                                                  thread_id=thread_id)
+                                except Exception as e:
+                                    log.error(f"Core team reply: {e}")
+
+                            threading.Thread(target=_reply_coreteam, daemon=True).start()
 
                     # Regular group — only respond when tagged
                     elif tagged and clean:
