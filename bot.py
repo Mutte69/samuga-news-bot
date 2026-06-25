@@ -6468,56 +6468,69 @@ def handle_updates():
                                               "image": _b64.b64encode(buf.getvalue()).decode()},
                                         timeout=15)
                                     if resp.status_code == 200 and resp.json().get("data",{}).get("url"):
-                                        test_url = resp.json()["data"]["url"]
-                                        lines.append(f"🖼️ <b>imgbb:</b> ✅ Working")
+                                        lines.append("🖼️ <b>imgbb:</b> ✅ Working")
                                     else:
-                                        lines.append(f"🖼️ <b>imgbb:</b> ❌ Failed (HTTP {resp.status_code})\n"
-                                                     f"   Check IMGBB_API_KEY in Railway vars")
-                                        test_url = None
+                                        lines.append(f"🖼️ <b>imgbb:</b> ❌ HTTP {resp.status_code} — check IMGBB_API_KEY")
                                 except Exception as e:
                                     lines.append(f"🖼️ <b>imgbb:</b> ❌ {str(e)[:60]}")
-                                    test_url = None
-                                # 2. Buffer token — test with real GraphQL endpoint
+
+                                # 2. Meta Graph API (FB + IG)
+                                if META_PAGE_TOKEN and META_PAGE_ID:
+                                    try:
+                                        r = requests.get(
+                                            f"https://graph.facebook.com/{META_API_VER}/{META_PAGE_ID}",
+                                            params={"fields": "name,instagram_business_account",
+                                                    "access_token": META_PAGE_TOKEN},
+                                            timeout=10)
+                                        if r.status_code == 200:
+                                            d = r.json()
+                                            pg = d.get("name","?")
+                                            ig = d.get("instagram_business_account",{}).get("id","")
+                                            lines.append(f"\n📘 <b>Facebook (Meta):</b> ✅ Page: {pg}")
+                                            if ig:
+                                                lines.append(f"📸 <b>Instagram:</b> ✅ IG account linked (id: {ig})")
+                                                if not META_IG_ID:
+                                                    lines.append(f"   ⚠️ Add META_IG_ID={ig} to Railway vars for IG posting")
+                                            else:
+                                                lines.append("📸 <b>Instagram:</b> ⚠️ No IG business account linked to this page")
+                                        else:
+                                            err = r.json().get("error",{}).get("message","unknown")
+                                            if "token" in err.lower() or "expired" in err.lower():
+                                                lines.append(f"\n📘 <b>Meta token:</b> ❌ EXPIRED — regenerate META_PAGE_TOKEN")
+                                            else:
+                                                lines.append(f"\n📘 <b>Meta (FB/IG):</b> ❌ {err[:80]}")
+                                    except Exception as e:
+                                        lines.append(f"\n📘 <b>Meta:</b> ❌ {str(e)[:60]}")
+                                else:
+                                    lines.append("\n📘 <b>Meta (FB/IG):</b> ❌ META_PAGE_TOKEN or META_PAGE_ID not set in Railway")
+
+                                # 3. Buffer (X/Twitter only — text posts)
                                 if not BUFFER_TOKEN:
-                                    lines.append("\n📡 <b>Buffer:</b> ❌ BUFFER_ACCESS_TOKEN not set")
+                                    lines.append("\n🐦 <b>X/Twitter (Buffer):</b> ❌ BUFFER_ACCESS_TOKEN not set")
                                 else:
                                     try:
-                                        # Use the same GraphQL query the bot actually uses
                                         r = requests.post(
                                             "https://api.buffer.com",
-                                            json={"query": "{ viewer { id name } }"},
+                                            json={"query": "{ account { id name } }"},
                                             headers={"Authorization": f"Bearer {BUFFER_TOKEN}",
                                                      "Content-Type": "application/json"},
                                             timeout=10)
                                         if r.status_code == 200:
                                             data = r.json()
                                             if "errors" in data:
-                                                err = data["errors"][0].get("message","unknown")
-                                                if "401" in str(err) or "auth" in str(err).lower() or "token" in str(err).lower():
-                                                    lines.append(f"\n📡 <b>Buffer token:</b> ❌ EXPIRED/INVALID\n"
-                                                                 f"   buffer.com → Settings → Apps → regenerate token\n"
-                                                                 f"   Update BUFFER_ACCESS_TOKEN in Railway")
-                                                else:
-                                                    lines.append(f"\n📡 <b>Buffer token:</b> ⚠️ GraphQL error: {err[:80]}")
+                                                lines.append(f"\n🐦 <b>X/Twitter (Buffer):</b> ❌ {data['errors'][0].get('message','?')[:60]}")
                                             else:
-                                                name = data.get("data",{}).get("viewer",{}).get("name","?")
-                                                lines.append(f"\n📡 <b>Buffer token:</b> ✅ Valid (account: {name})")
-                                        elif r.status_code == 401:
-                                            lines.append(f"\n📡 <b>Buffer token:</b> ❌ EXPIRED\n"
-                                                         f"   buffer.com → Settings → Apps → regenerate token\n"
-                                                         f"   Update BUFFER_ACCESS_TOKEN in Railway")
+                                                name = data.get("data",{}).get("account",{}).get("name","?")
+                                                lines.append(f"\n🐦 <b>X/Twitter (Buffer):</b> ✅ Valid — account: {name}")
+                                                lines.append(f"   <i>Note: Buffer posts text only (no image) — working as expected</i>")
                                         else:
-                                            lines.append(f"\n📡 <b>Buffer token:</b> ⚠️ HTTP {r.status_code}: {r.text[:100]}")
+                                            lines.append(f"\n🐦 <b>X/Twitter (Buffer):</b> ⚠️ HTTP {r.status_code}")
                                     except Exception as e:
-                                        lines.append(f"\n📡 <b>Buffer:</b> ❌ {str(e)[:80]}")
-                                # 3. Channel IDs
-                                lines.append("\n📋 <b>Channel IDs configured:</b>")
-                                lines.append(f"  FB: {'✅' if BUFFER_FB_ID else '❌ not set'}")
-                                lines.append(f"  IG: {'✅' if BUFFER_IG_ID else '❌ not set'}")
-                                lines.append(f"  X:  {'✅' if BUFFER_TW_ID else '❌ not set'}")
-                                # 4. Last actual Buffer API response
-                                lines.append(f"\n🔎 <b>Last Buffer API response:</b>")
-                                lines.append(f"<code>{_last_buffer_error.get('response','None yet')[:200]}</code>")
+                                        lines.append(f"\n🐦 <b>X/Twitter:</b> ❌ {str(e)[:60]}")
+
+                                # 4. Last Buffer response
+                                last = _last_buffer_error.get("response","No posts attempted yet")
+                                lines.append(f"\n🔎 <b>Last Buffer response:</b>\n<code>{last[:150]}</code>")
                                 send_text(_cid, "\n".join(lines), thread_id=_tid)
                             threading.Thread(target=_buffercheck, daemon=True).start()
 
