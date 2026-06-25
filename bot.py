@@ -5505,6 +5505,51 @@ def handle_updates():
                             else:
                                 send_text(chat_id, f"Key <code>{key}</code> not found — maybe already posted or rejected.", reply_to=msg_id, thread_id=thread_id)
 
+                        # /diag — diagnose feeds, Gemini (Dhivehi), and queue health
+                        elif text.strip().lower() in ["/diag", "/health", "/diagnose"]:
+                            send_text(chat_id, "🔍 Running diagnostics... ⏳", reply_to=msg_id, thread_id=thread_id)
+                            def _run_diag(_cid=chat_id, _tid=thread_id):
+                                try:
+                                    lines = ["🔍 <b>Samuga AI Diagnostics</b>\n"]
+                                    # 1. Gemini (Dhivehi) test
+                                    if GEMINI_API_KEY:
+                                        test_dv = make_dhivehi_caption("The government announced a new policy today.", "Test news")
+                                        if test_dv and any("ހ" <= c <= "޿" for c in test_dv):
+                                            lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ✅ Working")
+                                        elif test_dv:
+                                            lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ⚠️ Responded but no Thaana script")
+                                        else:
+                                            lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ❌ No response (check key/quota)")
+                                    else:
+                                        lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ❌ GEMINI_API_KEY not set")
+                                    # 2. Dhivehi feed check
+                                    dv_feeds = [f for f in LOCAL_FEEDS if f.get("lang")=="dv"]
+                                    lines.append(f"\n📡 <b>Dhivehi feeds ({len(dv_feeds)}):</b>")
+                                    for f in dv_feeds:
+                                        try:
+                                            parsed = feedparser.parse(f["url"])
+                                            n = len(parsed.entries)
+                                            domain = f["url"].split("/")[2]
+                                            if n > 0:
+                                                lines.append(f"  ✅ {domain}: {n} items")
+                                            else:
+                                                lines.append(f"  ⚠️ {domain}: 0 items (empty/blocked)")
+                                        except Exception as fe:
+                                            lines.append(f"  ❌ {f['url'].split('/')[2]}: {str(fe)[:30]}")
+                                    # 3. Queue state
+                                    dv_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="dv")
+                                    en_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="en")
+                                    lines.append(f"\n📋 <b>Approval queue:</b> {dv_queued} Dhivehi, {en_queued} English waiting")
+                                    # 4. Recent Dhivehi posts from DB
+                                    if DB_ENABLED:
+                                        dv_posted = db_execute("SELECT COUNT(*) FROM articles WHERE lang='dv' AND status='posted' AND posted_at > NOW() - INTERVAL '7 days'", fetch="one")
+                                        lines.append(f"📚 <b>Dhivehi posted (7d):</b> {dv_posted[0] if dv_posted else 0}")
+                                    send_text(_cid, "\n".join(lines), thread_id=_tid)
+                                except Exception as e:
+                                    log.error(f"/diag: {e}")
+                                    send_text(_cid, f"❌ Diag error: {e}", thread_id=_tid)
+                            threading.Thread(target=_run_diag, daemon=True).start()
+
                         # /stats — newsroom archive overview (DB-powered)
                         elif text.strip().lower() in ["/stats", "/archive"]:
                             if not DB_ENABLED:
