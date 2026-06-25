@@ -2596,11 +2596,21 @@ def _post_to_social_now(img_buf, caption):
         # ── 1. FACEBOOK — Meta Graph API with image ───────────────────────────
         if META_PAGE_TOKEN and META_PAGE_ID:
             try:
+                # FIX: the card is PNG but was being sent as image/jpeg, which Meta
+                # can reject. Convert to a real JPEG so the upload always matches.
+                try:
+                    _pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                    _jbuf = io.BytesIO()
+                    _pil.save(_jbuf, format="JPEG", quality=92)
+                    fb_img_bytes = _jbuf.getvalue()
+                except Exception as _conv_e:
+                    log.warning(f"[SOCIAL] Facebook: JPEG convert failed, using raw bytes: {_conv_e}")
+                    fb_img_bytes = img_bytes
                 photo_resp = requests.post(
                     f"https://graph.facebook.com/{META_API_VER}/{META_PAGE_ID}/photos",
                     data={"caption": post_text[:2000], "access_token": META_PAGE_TOKEN,
                           "published": "true"},
-                    files={"source": ("card.jpg", img_bytes, "image/jpeg")},
+                    files={"source": ("card.jpg", fb_img_bytes, "image/jpeg")},
                     timeout=30
                 )
                 if photo_resp.status_code == 200 and photo_resp.json().get("id"):
@@ -2619,9 +2629,11 @@ def _post_to_social_now(img_buf, caption):
             log.warning("[SOCIAL] Facebook: skipped (no META_PAGE_TOKEN or META_PAGE_ID)")
 
         # ── 2. INSTAGRAM — Meta Graph API (2-step: upload container → publish) ─
-        if META_PAGE_TOKEN and META_IG_ID:
+        # FIX: auto-resolve the IG id from the linked FB page if META_IG_ID is blank,
+        # so IG posting works without manually setting META_IG_ID in Railway.
+        ig_id = _resolve_ig_id()
+        if META_PAGE_TOKEN and ig_id:
             try:
-                ig_id = META_IG_ID
                 image_url = upload_to_imgbb(io.BytesIO(img_bytes))
                 if image_url:
                     container_r = requests.post(
@@ -2653,7 +2665,8 @@ def _post_to_social_now(img_buf, caption):
                 log.error(f"[SOCIAL] Instagram: ❌ {e}")
                 _last_buffer_error["ig_error"] = str(e)[:100]
         else:
-            log.warning("[SOCIAL] Instagram: skipped (no META_IG_ID)")
+            log.warning("[SOCIAL] Instagram: skipped (no IG business account — set META_IG_ID "
+                        "or link an IG Professional account to the FB page)")
 
         # ── 3. X (Twitter) — Buffer GraphQL, text only ───────────────────────
         # Buffer beta doesn't support image upload via API yet
@@ -2706,6 +2719,14 @@ mutation CreatePost($input: CreatePostInput!) {
     return results
 
 def post_to_social(img_buf, caption):
+    # FIX: breaking news used to push FB + IG through Buffer, which can't upload
+    # images and silently fails. Route everything through _post_to_social_now,
+    # which uses the Meta Graph API for FB/IG (with images) and Buffer for X.
+    return _post_to_social_now(img_buf, caption)
+
+
+def _post_to_social_buffer_legacy(img_buf, caption):
+    """Legacy Buffer-only path (kept for reference, no longer used)."""
     if not BUFFER_TOKEN:
         log.warning("Social: no BUFFER_TOKEN, skipping")
         return
