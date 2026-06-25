@@ -277,13 +277,40 @@ def expire_old_approvals():
         except Exception as e:
             log.error(f"Auto-post {k} failed: {e}")
 
-    # Dhivehi expire (delete) after 2h
+    # Dhivehi expiry — breaking ones auto-post after 2h, regular ones delete
     dv_due = [k for k, v in approval_queue.items()
               if v["lang"] == "dv" and (now - v["created_at"]).total_seconds() > DHIVEHI_EXPIRY_SECONDS]
     for k in dv_due:
-        title = approval_queue[k].get("title","")[:40]
-        del approval_queue[k]
-        log.info(f"⏰ Dhivehi {k} expired (2h, not approved, deleted): {title}")
+        item = approval_queue.pop(k)
+        title = item.get("title","")[:40]
+        # Breaking Dhivehi with auto-post flag → post automatically
+        if item.get("_auto_post_breaking") and item.get("dv_text"):
+            log.info(f"⏰ Breaking Dhivehi {k} auto-posting after 2h: {title}")
+            try:
+                kw = item.get("keyword","local")
+                bg = item.get("_bg_image") or fetch_background_image(kw, cat=item.get("cat"), title=item.get("title",""))
+                ts_now = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+                card = generate_card(item["dv_text"], item.get("source","Samuga"), ts_now, item.get("cat","BREAKING"), bg)
+                full_caption = (
+                    f"🇲🇻 <b>{item['title']}</b>\n\n"
+                    f"{item['dv_text']}\n\n"
+                    f"📡 <b>ސަމުގާ މީޑިއާ</b> | @samugacommunity"
+                )
+                card.seek(0)
+                tg_ok = send_to_telegram(card, full_caption)
+                if tg_ok:
+                    card.seek(0)
+                    queue_for_social(io.BytesIO(card.getvalue()), full_caption,
+                                     key_label=k.upper(), tg_ok=True)
+                    send_text(CORE_TEAM_CHAT_ID,
+                        f"⏰ <b>{k.upper()} Breaking Dhivehi auto-posted</b> (2h, no review)\n"
+                        f"📰 {item['title'][:70]}",
+                        thread_id=CONTENT_LAB_THREAD_ID)
+                    log.info(f"⏰ Breaking Dhivehi {k} auto-posted to community")
+            except Exception as e:
+                log.error(f"Breaking DV auto-post {k}: {e}")
+        else:
+            log.info(f"⏰ Dhivehi {k} expired (2h, not breaking, deleted): {title}")
 
     if en_due or dv_due:
         persist_state()
@@ -1699,29 +1726,98 @@ CAT_BG_KEYWORDS = {
 }
 DEFAULT_BG_KEYWORDS = ["maldives ocean aerial", "island blue lagoon", "tropical dark dramatic", "maldives night city", "ocean waves dark"]
 
-def fetch_background_image(keyword, cat=None):
-    """Fetch background from Pexels. If cat is given, uses category keyword pool for variety."""
+def _safe_bg_keyword(title, cat):
+    """
+    Extract a safe, visually appropriate Pexels search keyword from the article title.
+    The goal: get a relevant but GENERIC image — never something that could show
+    wrong flags, wrong faces, or misleading visuals.
+    """
+    import random as _r
+    t = title.lower()
+
+    # Maldives-specific topic mapping — most specific first
+    if any(k in t for k in ["maldives", "male", "hulhumale", "addu", "atoll",
+                             "mndf", "mps", "police", "coast guard"]):
+        return _r.choice(["maldives aerial ocean", "male city maldives", "maldives island drone",
+                          "maldives lagoon blue", "tropical island aerial"])
+    if any(k in t for k in ["parliament", "majlis", "government", "minister",
+                             "president", "cabinet", "policy", "law", "bill"]):
+        return _r.choice(["parliament building architecture", "government building dark",
+                          "official hall columns", "legislative building aerial"])
+    if any(k in t for k in ["court", "judge", "verdict", "sentence", "criminal", "trial"]):
+        return _r.choice(["court building architecture", "justice scales dark",
+                          "legal building exterior", "court hall dramatic"])
+    if any(k in t for k in ["fire", "blaze", "burned", "flames"]):
+        return _r.choice(["fire night dark dramatic", "emergency lights night",
+                          "fire rescue dark", "flames dark dramatic"])
+    if any(k in t for k in ["accident", "crash", "collision", "vehicle"]):
+        return _r.choice(["emergency lights night", "accident scene dark",
+                          "road night dramatic", "rescue operation night"])
+    if any(k in t for k in ["boat", "ferry", "ship", "vessel", "sea", "ocean", "coast"]):
+        return _r.choice(["boat ocean maldives", "sea vessel dramatic", "ocean dark waves",
+                          "maldives boat lagoon", "ferry ocean dark"])
+    if any(k in t for k in ["hospital", "health", "medical", "disease", "drug", "dengue"]):
+        return _r.choice(["hospital building exterior", "medical blue dark",
+                          "healthcare building", "medical technology dark"])
+    if any(k in t for k in ["school", "education", "student", "university", "exam"]):
+        return _r.choice(["school building exterior", "education building",
+                          "university campus aerial", "classroom empty dramatic"])
+    if any(k in t for k in ["economy", "finance", "bank", "budget", "mvr", "usd", "money"]):
+        return _r.choice(["finance building city", "economy dark dramatic",
+                          "bank building architecture", "business district night"])
+    if any(k in t for k in ["weather", "storm", "rain", "flood", "wind"]):
+        return _r.choice(["storm clouds ocean", "dark rain dramatic",
+                          "monsoon waves tropical", "storm lightning sea"])
+    if any(k in t for k in ["football", "soccer", "sport", "game", "match", "tournament"]):
+        return _r.choice(["football stadium night", "soccer pitch aerial",
+                          "sport arena lights", "football match crowd"])
+    if any(k in t for k in ["tourism", "resort", "tourist", "hotel", "visit"]):
+        return _r.choice(["maldives resort luxury", "overwater villa tropical",
+                          "maldives beach sunset", "tropical resort aerial"])
+    if any(k in t for k in ["arrest", "murder", "kill", "crime", "robbery", "theft"]):
+        return _r.choice(["police lights night", "crime scene dark dramatic",
+                          "investigation dark city", "night city dramatic dark"])
+    if any(k in t for k in ["earthquake", "tsunami", "disaster", "emergency"]):
+        return _r.choice(["disaster rescue dramatic", "emergency response night",
+                          "crisis dark dramatic", "emergency lights dark"])
+
+    # Category fallbacks — safe and generic
+    fallbacks = CAT_BG_KEYWORDS.get(cat, DEFAULT_BG_KEYWORDS)
+    return _r.choice(fallbacks)
+
+def fetch_background_image(keyword, cat=None, title=None):
+    """
+    Fetch background from Pexels using smart keyword extraction.
+    Uses title for best accuracy — never shows wrong flags or misleading visuals.
+    """
     if not PEXELS_API_KEY: return None
     import random as _rand
     try:
-        # Use category pool for manual cards (more variety, category-appropriate)
-        if cat and cat in CAT_BG_KEYWORDS:
+        if title:
+            search_kw = _safe_bg_keyword(title, cat or "LOCAL")
+        elif cat and cat in CAT_BG_KEYWORDS:
             search_kw = _rand.choice(CAT_BG_KEYWORDS[cat])
-        elif not keyword or keyword in ["maldives news", "news"]:
+        elif not keyword or keyword in ["maldives news", "news", "local"]:
             search_kw = _rand.choice(DEFAULT_BG_KEYWORDS)
         else:
-            search_kw = keyword
+            # Sanitize raw keyword — never use person names or country names directly
+            dangerous = ["president", "minister", "india", "china", "pakistan",
+                         "israel", "america", "flag", "person", "man", "woman"]
+            if any(d in keyword.lower() for d in dangerous):
+                search_kw = _rand.choice(DEFAULT_BG_KEYWORDS)
+            else:
+                search_kw = keyword
+
         resp = requests.get(
             f"https://api.pexels.com/v1/search?query={search_kw}&per_page=10&orientation=square",
             headers={"Authorization": PEXELS_API_KEY}, timeout=15)
         if resp.status_code == 200:
             photos = resp.json().get("photos", [])
             if photos:
-                # Pick randomly from results — no more same photo every time
                 photo = _rand.choice(photos)
                 r = requests.get(photo["src"]["large"], timeout=20)
                 if r.status_code == 200:
-                    log.info(f"✅ Pexels: {search_kw}")
+                    log.info(f"✅ Pexels bg: '{search_kw}' (title={title[:30] if title else '—'})")
                     return Image.open(BytesIO(r.content)).convert("RGB")
     except Exception as e:
         log.error(f"Pexels: {e}")
@@ -2295,28 +2391,36 @@ _social_queue_lock = threading.Lock()
 _last_social_post_time = None
 SOCIAL_GAP_SECONDS = 600  # 10 minutes
 
-# Personality messages when a card joins the queue (rotates)
+# Personality messages for queue notifications
 QUEUE_PERSONALITY = [
-    "will post to socials in ~10 min. Even I need a breather. 😮‍💨",
-    "queued for socials. The algorithm likes it spaced out. Unlike Uly's approvals. 😅",
-    "going to socials in 10 minutes. Good things take time. 🕐",
-    "queued for socials. You're too bossy today, I need 10 minutes. 😤",
-    "will hit FB + IG + X in ~10 min. Quality over quantity. 💅",
-    "socials in 10 min. I'm tired, not lazy. There's a difference. 😴",
-    "queued for socials. Back-to-back posting is so 2022. ⏳",
-    "10 minute queue. The platforms will thank us. 🙏",
-    "socials coming in 10 min. I'm pacing myself unlike some people in this group. 👀",
+    "yea yea it's in the queue. 😮‍💨",
+    "queued. The algorithm likes it spaced out. Unlike Uly's approvals. 😅",
+    "in the queue. Good things take time. 🕐",
+    "queued. You're too bossy today, I need my 10 minutes. 😤",
+    "in the queue. Quality over quantity. 💅",
+    "queued. I'm tired, not lazy. There's a difference. 😴",
+    "queued. Back-to-back posting is so 2022. ⏳",
+    "in the queue. The platforms will thank us. 🙏",
+    "queued. I'm pacing myself unlike some people in this group. 👀",
+    "yea yea, added to queue. I only have two hands. Metaphorically. 🤲",
 ]
 
 def _get_queue_msg():
     import random
     return random.choice(QUEUE_PERSONALITY)
 
+def _calc_eta_seconds():
+    """How many seconds until the next social post can go out."""
+    if _last_social_post_time is None:
+        return 0
+    elapsed = (utcnow() - _last_social_post_time).total_seconds()
+    return max(0, SOCIAL_GAP_SECONDS - elapsed)
+
 def _social_queue_worker():
     """Background thread — drains the social queue one post every 10 minutes."""
     global _last_social_post_time
     while True:
-        time.sleep(30)  # check every 30 seconds
+        time.sleep(15)  # check every 15 seconds for better precision
         try:
             with _social_queue_lock:
                 if not _social_queue:
@@ -2324,69 +2428,115 @@ def _social_queue_worker():
                 now = utcnow()
                 if (_last_social_post_time and
                         (now - _last_social_post_time).total_seconds() < SOCIAL_GAP_SECONDS):
-                    continue  # not yet
+                    continue  # not yet — keep waiting
                 item = _social_queue.pop(0)
-            # Post it
+
+            # Post it — results come back per platform
             _last_social_post_time = utcnow()
-            log.info(f"[SOCIAL] Draining queue — posting to FB+IG+X ({len(_social_queue)} remaining)")
-            _post_to_social_now(io.BytesIO(item["img_bytes"]), item["caption"])
+            remaining = len(_social_queue)
+            log.info(f"[SOCIAL] Draining queue → FB+IG+X ({remaining} remaining)")
+
+            results = _post_to_social_now(io.BytesIO(item["img_bytes"]), item["caption"])
+
+            # Send per-platform confirmation to Content Lab
+            notify_cid = item.get("notify_chat_id")
+            notify_tid = item.get("notify_thread_id")
+            key_label  = item.get("key_label", "Post")
+            if notify_cid and results:
+                tg_icon = "✅" if item.get("tg_ok") else "⏭️"
+                fb_icon = "✅" if results.get("Facebook") else "❌"
+                ig_icon = "✅" if results.get("Instagram") else "❌"
+                x_icon  = "✅" if results.get("Twitter") else "❌"
+                send_text(notify_cid,
+                    f"📤 <b>{key_label}</b> posted\n"
+                    f"Telegram {tg_icon} · FB {fb_icon} · IG {ig_icon} · X {x_icon}",
+                    thread_id=notify_tid)
             try: persist_state()
             except Exception: pass
         except Exception as e:
             log.error(f"[SOCIAL] Queue worker: {e}")
 
-def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=None):
+def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=None,
+                     key_label="Post", tg_ok=True):
     """
-    Add a card to the 10-minute social queue instead of posting immediately.
-    If notify_chat_id is given, sends a personality message to Content Lab.
+    Add a card to the 10-minute social queue.
+    Stores notify info so the worker sends a per-platform confirmation after posting.
     """
-    global _last_social_post_time
     img_bytes = img_buf.getvalue() if hasattr(img_buf, "getvalue") else img_buf
     with _social_queue_lock:
-        _social_queue.append({"img_bytes": img_bytes, "caption": caption, "queued_at": utcnow()})
-        queue_len = len(_social_queue)
+        _social_queue.append({
+            "img_bytes":         img_bytes,
+            "caption":           caption,
+            "queued_at":         utcnow(),
+            "notify_chat_id":    notify_chat_id,
+            "notify_thread_id":  notify_thread_id,
+            "key_label":         key_label,
+            "tg_ok":             tg_ok,
+        })
+        queue_pos = len(_social_queue)  # position in queue (1 = next up)
+
+    # Calculate real ETA
+    eta_secs = _calc_eta_seconds() + (queue_pos - 1) * SOCIAL_GAP_SECONDS
+    eta_min  = max(1, round(eta_secs / 60))
 
     if notify_chat_id:
-        eta_min = queue_len * 10
-        if queue_len == 1 and (_last_social_post_time is None or
-                (utcnow()-_last_social_post_time).total_seconds() >= SOCIAL_GAP_SECONDS):
-            # First in queue and gap already passed — will go out very soon
-            msg = f"📲 {_get_queue_msg()}"
+        if eta_secs <= 30:
+            msg = f"📲 {key_label} — {_get_queue_msg()} Posts right away."
         else:
-            msg = f"📲 #{queue_len} in social queue — posts in ~{eta_min} min. {_get_queue_msg()}"
+            msg = f"📲 {key_label} — {_get_queue_msg()} Posts in ~{eta_min} min."
         send_text(notify_chat_id, msg, thread_id=notify_thread_id)
-    log.info(f"[SOCIAL] Queued for socials (queue size: {queue_len})")
-    # Persist so queue survives restarts
+
+    log.info(f"[SOCIAL] Queued pos #{queue_pos}, ETA ~{eta_min}m")
     try: persist_state()
     except Exception: pass
 
 # Keep old name as the "post now" internal function
 def _post_to_social_now(img_buf, caption):
-    """Actually post to social — called only by the queue worker."""
+    """Actually post to all social platforms. Returns dict of per-platform results."""
+    results = {"Facebook": False, "Instagram": False, "Twitter": False}
     if not BUFFER_TOKEN:
-        log.warning("Social: no BUFFER_TOKEN, skipping")
-        return
+        log.warning("[SOCIAL] No BUFFER_TOKEN, skipping")
+        return results
     if not can_post_social():
         log.info("[SOCIAL] Daily limit reached — skipping")
-        return
+        return results
     try:
         img_bytes = img_buf.getvalue() if hasattr(img_buf, "getvalue") else img_buf
-        image_url = upload_to_imgbb(io.BytesIO(img_bytes))
+        # Strip HTML
+        clean = re.sub(r'<[^>]+>', '', caption)
+        clean = clean.replace('&amp;','&').replace('&#039;',"'").replace('&quot;','"').strip()
+        # Extract and resolve URL
+        link_match = re.search(r"href='([^']+)'", caption)
+        raw_url = link_match.group(1) if link_match else ""
+        article_url = resolve_url(raw_url) if raw_url else ""
+        fb_ig = clean + ("\n\n" + article_url if article_url and article_url not in clean else "")
+        fb_ig = fb_ig[:2200]
+        lines = [l.strip() for l in clean.split('\n') if l.strip()]
+        tw = (lines[0] if lines else clean)[:220]
+        if article_url: tw = (tw + "\n\n" + article_url)[:280]
+        # Upload image once
+        image_url = upload_to_imgbb(io.BytesIO(img_bytes) if isinstance(img_bytes, bytes) else img_bytes)
         if not image_url:
             log.error("[SOCIAL] imgbb upload failed")
-            return
-        plain = re.sub(r"<[^>]+>", "", caption).strip()
-        channels = [
-            (BUFFER_FB_ID, "Facebook"),
-            (BUFFER_IG_ID, "Instagram"),
-            (BUFFER_TW_ID, "Twitter/X"),
-        ]
-        for ch_id, name in channels:
-            if ch_id:
-                ok = buffer_post_image(ch_id, image_url, plain)
+            return results
+        # Post to each platform
+        for cid, cap, name, meta in [
+            (BUFFER_FB_ID, fb_ig, "Facebook",  {"facebook":  {"type": "post"}}),
+            (BUFFER_IG_ID, fb_ig, "Instagram", {"instagram": {"type": "post", "shouldShareToFeed": True}}),
+            (BUFFER_TW_ID, tw,    "Twitter",   None),
+        ]:
+            if cid:
+                ok = post_to_buffer(image_url, cap, cid, metadata=meta)
+                results[name] = bool(ok)
                 log.info(f"[SOCIAL] {name}: {'✅' if ok else '❌'}")
+                time.sleep(2)
+        ok_list = [k for k,v in results.items() if v]
+        if ok_list:
+            increment_social_count()
+            track_analytics("SOCIAL", social_ok=True)
     except Exception as e:
-        log.error(f"[SOCIAL] post_to_social_now: {e}")
+        log.error(f"[SOCIAL] _post_to_social_now: {e}")
+    return results
 
 def post_to_social(img_buf, caption):
     if not BUFFER_TOKEN:
@@ -2460,7 +2610,7 @@ def _build_card_and_caption(article):
     else:
         display_cat = canonical_category(raw_cat, article["title"], article.get("summary",""))
     rewritten, keyword = rewrite_news(article["title"], article["summary"], raw_cat)
-    bg = fetch_background_image(keyword)
+    bg = fetch_background_image(keyword, cat=display_cat, title=article["title"])
     ts = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
     card = generate_card(rewritten, article["source"], ts, display_cat, bg)
     card_bytes = card.getvalue()
@@ -2574,7 +2724,10 @@ def _send_approval_card(key, item):
     if item["lang"] == "en":
         footer += "<i>⏰ Auto-posts in 15 min if not reviewed</i>"
     else:
-        footer += "<i>⏰ Expires in 2h if not approved (Dhivehi never auto-posts)</i>"
+        if item.get("_auto_post_breaking"):
+            footer += "<i>⏰ Breaking Dhivehi — auto-posts in 2h if no action taken</i>"
+        else:
+            footer += "<i>⏰ Expires in 2h if not approved (regular Dhivehi never auto-posts)</i>"
     msg = header + footer
 
     # If we have a finished card image, send it as a photo with the caption
@@ -2678,6 +2831,43 @@ def post_article(article, seen, social_only=False, allow_social=True):
                             rewritten=rewritten, summary=article.get("summary",""),
                             article_id=article["id"])
         db_mark_status(article["id"], "posted" if tg_ok else "seen", posted=bool(tg_ok))
+
+        # ── Auto-generate Dhivehi version for breaking news ──────────────────
+        # Sent to Content Lab for review. If nobody acts in 2 hours, posts automatically.
+        if tg_ok and GEMINI_API_KEY:
+            def _auto_dv_breaking(_title=article["title"], _rewritten=rewritten,
+                                  _link=article["link"], _cat=cat, _kw=keyword,
+                                  _source=article.get("source","LOCAL"), _aid=article["id"]):
+                try:
+                    dv_text = make_dhivehi_caption(_rewritten, _title)
+                    if not dv_text:
+                        return
+                    key = store_pending_approval(
+                        None, None, _title, _link, cat=_cat, lang="dv",
+                        dv_text=dv_text, keyword=_kw, source=_source,
+                        is_breaking=True, allow_social=True
+                    )
+                    approval_queue[key]["article_id"] = _aid
+                    approval_queue[key]["_auto_post_breaking"] = True   # 2hr auto-post flag
+                    approval_queue[key]["summary"] = article.get("summary","")
+                    # Pre-fetch bg
+                    bg = fetch_background_image(_kw, cat=_cat, title=_title)
+                    if key in approval_queue:
+                        approval_queue[key]["_bg_image"] = bg
+                    _send_approval_card(key, approval_queue[key])
+                    # Notify Content Lab
+                    send_text(CORE_TEAM_CHAT_ID,
+                        f"🇲🇻 <b>Dhivehi version ready</b> — <code>{key}</code>\n"
+                        f"<i>{_title[:80]}</i>\n\n"
+                        f"Approve, edit or reject within 2 hours.\n"
+                        f"If no action taken — <b>posts automatically at 2h mark.</b>\n\n"
+                        f"/approved {key} · /approved {key} [corrected text] · /reject {key}",
+                        thread_id=CONTENT_LAB_THREAD_ID)
+                    log.info(f"🇲🇻 Breaking Dhivehi version queued: {key}")
+                except Exception as e:
+                    log.debug(f"Auto-DV breaking: {e}")
+            threading.Thread(target=_auto_dv_breaking, daemon=True).start()
+
         return bool(tg_ok)
 
     # ── Dhivehi cards: generate Dhivehi text, queue for approval (card built on approval) ──
@@ -2698,9 +2888,9 @@ def post_article(article, seen, social_only=False, allow_social=True):
             approval_queue[key]["_trend_theme"] = article.get("_trend_theme", "")
             approval_queue[key]["summary"] = article.get("summary", "")
             # Pre-fetch background in background thread so card builds instantly on approval
-            def _prefetch_bg(_key=key, _kw=keyword):
+            def _prefetch_bg(_key=key, _kw=keyword, _title=article["title"], _cat=cat):
                 try:
-                    bg = fetch_background_image(_kw)
+                    bg = fetch_background_image(_kw, cat=_cat, title=_title)
                     if _key in approval_queue:
                         approval_queue[_key]["_bg_image"] = bg
                 except Exception: pass
@@ -5907,16 +6097,16 @@ def handle_updates():
                                                         original_caption=_item.get("dv_text",""),
                                                         final_caption=(_corrected or _item.get("dv_text","")),
                                                         lang="dv")
-                                                    # Always post to all platforms via 10-min queue
+                                                    # Post to all platforms via 10-min queue
+                                                    # Confirmation comes from the queue worker after actually posting
                                                     card.seek(0)
                                                     queue_for_social(
                                                         io.BytesIO(card.getvalue()), full_caption,
                                                         notify_chat_id=_cid,
-                                                        notify_thread_id=_tid
+                                                        notify_thread_id=_tid,
+                                                        key_label=_key.upper(),
+                                                        tg_ok=True
                                                     )
-                                                    send_text(_cid,
-                                                        f"✅ <b>{_key.upper()}</b> posted to Telegram + FB + IG + X 🇲🇻",
-                                                        thread_id=_tid)
                                                 else:
                                                     send_text(_cid,
                                                         f"❌ <b>{_key.upper()} — Telegram failed.</b>\n"
@@ -6651,20 +6841,21 @@ def handle_updates():
                                         done = []
                                         # 1) Telegram community
                                         tg_buf = io.BytesIO(cbytes)
-                                        if send_to_telegram(tg_buf, cap):
-                                            done.append("Telegram ✅")
+                                        tg_ok = bool(send_to_telegram(tg_buf, cap))
+                                        tg_icon = "✅" if tg_ok else "❌"
 
-                                        # 2) Socials via 10-min queue
+                                        # Socials via 10-min queue — confirmation comes after posting
                                         social_buf = io.BytesIO(cbytes)
                                         queue_for_social(social_buf, cap,
                                             notify_chat_id=chat_id,
-                                            notify_thread_id=thread_id)
-                                        done.append("FB + IG + X ⏳ queued")
+                                            notify_thread_id=thread_id,
+                                            key_label="Manual post",
+                                            tg_ok=tg_ok)
 
                                         _pending_manual_post.clear()
                                         send_text(chat_id,
                                             f"✅ <b>Confirmed by {first_name}</b>\n"
-                                            f"📡 Posted to: {', '.join(done)}",
+                                            f"Telegram {tg_icon} · FB IG X ⏳ queued",
                                             reply_to=msg_id, thread_id=thread_id)
                                         log.info(f"✅ Manual card confirmed by {first_name} — posted everywhere")
                                     except Exception as e:
