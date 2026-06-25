@@ -2635,17 +2635,17 @@ def get_prayer_times():
         mvt_now = datetime.now(timezone.utc) + _td(hours=5)
         date_str = mvt_now.strftime("%d-%m-%Y")
 
-        # Exact Malé coordinates (Islamic Centre area) + timezone.
-        # Maldives officially uses a fixed 90-min Isha interval, Shafi'i Asr.
-        # method=99 (custom): Fajr 19.5°, Maghrib default, Isha = 90 mins after Maghrib.
-        # tune offsets nudge to match Maldives Islamic Ministry published times.
+        # Exact Malé coordinates + Maldives Islamic Ministry calculation.
+        # Maldives uses: Fajr 19.5°, Isha 78 min after Maghrib, Shafi'i Asr.
+        # tune offsets fine-tune to match the official Maldives prayer schedule exactly.
+        # tune order: Imsak,Fajr,Sunrise,Dhuhr,Asr,Sunset,Maghrib,Isha,Midnight
         MALE_LAT, MALE_LON = 4.1755, 73.5093
         url = (f"https://api.aladhan.com/v1/timings/{date_str}"
                f"?latitude={MALE_LAT}&longitude={MALE_LON}"
-               f"&method=99&methodSettings=19.5,null,90%20min"
+               f"&method=99&methodSettings=19.5,null,78%20min"
                f"&school=0"
                f"&timezonestring=Indian/Maldives"
-               f"&tune=0,2,2,3,3,2,2,2,0")
+               f"&tune=0,0,0,1,-3,0,-1,0,0")
         resp = requests.get(url, timeout=10)
         if resp.status_code != 200:
             log.warning(f"Prayer times API: HTTP {resp.status_code} — trying fallback")
@@ -3122,41 +3122,50 @@ def weather_code_to_info(code):
     return "🌡️", "Unknown"
 
 def draw_weather_icon(draw, code, x, y, size=40):
-    """Draw vector weather icon instead of emoji (fixes font rendering issues)"""
+    """Draw vector weather icon — scales cleanly at any size (line widths proportional)."""
+    import math
     cx, cy = x, y
     s = size
-    if code == 0:  # Sun
-        draw.ellipse([cx-s//3, cy-s//3, cx+s//3, cy+s//3], fill=(255,220,50,255))
-        for angle in range(0, 360, 45):
-            import math
-            rad = math.radians(angle)
-            x1 = cx + int((s//3+4)*math.cos(rad))
-            y1 = cy + int((s//3+4)*math.sin(rad))
-            x2 = cx + int((s//2+2)*math.cos(rad))
-            y2 = cy + int((s//2+2)*math.sin(rad))
-            draw.line([x1,y1,x2,y2], fill=(255,220,50,220), width=2)
-    elif code in [1,2]:  # Part cloud
-        draw.ellipse([cx-s//3, cy-s//3, cx+s//3, cy+s//3], fill=(255,220,50,200))
-        draw.ellipse([cx-s//2, cy, cx+s//2, cy+s//2], fill=(220,230,255,240))
-        draw.ellipse([cx-s//4, cy-s//6, cx+s//4+6, cy+s//3+4], fill=(220,230,255,240))
-    elif code == 3:  # Cloud
-        draw.ellipse([cx-s//2, cy-s//6, cx+s//2, cy+s//2], fill=(200,210,240,240))
-        draw.ellipse([cx-s//4, cy-s//3, cx+s//4+4, cy+s//4], fill=(200,210,240,240))
-    elif code in [51,53,55,61,63,65,80,81,82]:  # Rain
-        draw.ellipse([cx-s//2, cy-s//4, cx+s//2, cy+s//3], fill=(160,180,220,240))
-        draw.ellipse([cx-s//4, cy-s//2, cx+s//4+4, cy+s//6], fill=(160,180,220,240))
-        for rx in [-s//3, 0, s//3]:
-            draw.line([cx+rx, cy+s//3, cx+rx-4, cy+s//2+4], fill=(100,160,255,220), width=2)
-    elif code in [95,96,99]:  # Thunder
-        draw.ellipse([cx-s//2, cy-s//4, cx+s//2, cy+s//3], fill=(80,80,100,240))
-        draw.ellipse([cx-s//4, cy-s//2, cx+s//4+4, cy+s//6], fill=(80,80,100,240))
-        pts = [cx+4,cy+s//4, cx-4,cy+s//4, cx,cy+s//2, cx-8,cy+s//2, cx+12,cy+s*3//4]
-        draw.line(pts, fill=(255,220,0,255), width=3)
-    else:  # Default cloud
-        draw.ellipse([cx-s//2, cy-s//6, cx+s//2, cy+s//2], fill=(180,190,220,240))
+    lw = max(2, s // 18)   # proportional line width
 
-def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_data=None, prayer_data=None):
-    """Samuga branded weather card v3 — 2500x3000, cinematic, sea conditions, prayer times, Hijri."""
+    if code == 0:  # Sun
+        draw.ellipse([cx-s//3, cy-s//3, cx+s//3, cy+s//3], fill=(255,210,40,255))
+        for angle in range(0, 360, 30):
+            rad = math.radians(angle)
+            x1 = cx + int((s//3+s//12)*math.cos(rad))
+            y1 = cy + int((s//3+s//12)*math.sin(rad))
+            x2 = cx + int((s//2+s//10)*math.cos(rad))
+            y2 = cy + int((s//2+s//10)*math.sin(rad))
+            draw.line([x1,y1,x2,y2], fill=(255,210,40,230), width=lw)
+    elif code in [1,2]:  # Partly cloudy — sun behind cloud
+        draw.ellipse([cx-s//6, cy-s//2, cx+s//2, cy+s//8], fill=(255,210,40,235))
+        draw.ellipse([cx-s//2, cy-s//8, cx+s//6, cy+s//2], fill=(225,235,250,255))
+        draw.ellipse([cx-s//8, cy-s//5, cx+s//2, cy+s//3], fill=(225,235,250,255))
+        draw.ellipse([cx-s//2, cy, cx+s//4, cy+s//2], fill=(225,235,250,255))
+    elif code == 3:  # Cloud
+        draw.ellipse([cx-s//2, cy-s//8, cx+s//2, cy+s//2], fill=(210,220,245,255))
+        draw.ellipse([cx-s//3, cy-s//3, cx+s//6, cy+s//4], fill=(210,220,245,255))
+        draw.ellipse([cx-s//12, cy-s//4, cx+s//2, cy+s//3], fill=(210,220,245,255))
+    elif code in [51,53,55,61,63,65,80,81,82]:  # Rain
+        draw.ellipse([cx-s//2, cy-s//5, cx+s//2, cy+s//3], fill=(175,190,225,255))
+        draw.ellipse([cx-s//3, cy-s//3, cx+s//6, cy+s//5], fill=(175,190,225,255))
+        draw.ellipse([cx-s//12, cy-s//4, cx+s//2, cy+s//4], fill=(175,190,225,255))
+        for rx in [-s//3, 0, s//3]:
+            draw.line([cx+rx, cy+s//3, cx+rx-s//12, cy+s//2+s//8],
+                      fill=(90,160,255,235), width=lw)
+    elif code in [95,96,99]:  # Thunderstorm
+        draw.ellipse([cx-s//2, cy-s//5, cx+s//2, cy+s//3], fill=(90,90,115,255))
+        draw.ellipse([cx-s//3, cy-s//3, cx+s//6, cy+s//5], fill=(90,90,115,255))
+        draw.ellipse([cx-s//12, cy-s//4, cx+s//2, cy+s//4], fill=(90,90,115,255))
+        bolt = [cx+s//12, cy+s//4, cx-s//12, cy+s//4, cx, cy+s//2,
+                cx-s//6, cy+s//2, cx+s//5, cy+s*3//4]
+        draw.line(bolt, fill=(255,215,0,255), width=lw+1)
+    else:  # Default cloud
+        draw.ellipse([cx-s//2, cy-s//8, cx+s//2, cy+s//2], fill=(190,200,230,255))
+        draw.ellipse([cx-s//3, cy-s//3, cx+s//6, cy+s//4], fill=(190,200,230,255))
+
+def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_data=None, prayer_data=None, alert_level=None):
+    """Samuga branded weather card v3 — 2500x3000, cinematic, sea conditions, prayer times, Hijri, MMS alerts."""
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
     import math, io
 
@@ -3314,8 +3323,18 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
     ttw = draw.textlength(tag, font=f_xs)
     draw.text((W-ttw-70, 78), tag, font=f_xs, fill=(255,255,255,130))
 
-    # Alert banner
-    if alert_mode:
+    # MMS Alert banner — coloured by level
+    if alert_mode and alert_level:
+        level_cfg = MMS_ALERT_LEVELS.get(alert_level, MMS_ALERT_LEVELS["white"])
+        acolor = level_cfg["color"]
+        # Full-width coloured banner strip
+        draw.rectangle([(0, 0), (W, 130)], fill=(acolor[0], acolor[1], acolor[2], 230))
+        btext = f"{level_cfg['emoji']}  {level_cfg['label']}  —  {level_cfg['headline'].upper()}"
+        btw = draw.textlength(btext, font=f_small)
+        # Dark text on light banners, white on dark
+        txt_color = (20,20,20,255) if alert_level in ["white","yellow"] else (255,255,255,255)
+        draw.text(((W-btw)//2, 38), btext, font=f_small, fill=txt_color)
+    elif alert_mode:
         btext = "⚠  WEATHER ALERT  ⚠"
         btw = draw.textlength(btext, font=f_small)
         draw.text(((W-btw)//2, 70), btext, font=f_small, fill=(255,80,80,255))
@@ -3327,8 +3346,8 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
     draw.text(((W-lcw)//2, loc_y), loc, font=f_large, fill=(255,255,255,230))
 
     # ── WEATHER ICON — dead centre between location and temperature ────────────
-    icon_y = loc_y + 165
-    draw_weather_icon(draw, code, W//2, icon_y, size=140)
+    icon_y = loc_y + 175
+    draw_weather_icon(draw, code, W//2, icon_y, size=175)
 
     # ── TEMPERATURE ───────────────────────────────────────────────────────────
     temp_str = f"{temp}°"
@@ -3435,16 +3454,34 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
     ccw = draw.textlength(condition, font=f_huge)
     draw.text(((W-ccw)//2, cond_y), condition, font=f_huge, fill=(255,255,255,200))
 
-    # Alert text
-    if alert_mode and alert_text:
-        atw = draw.textlength(alert_text, font=f_small)
-        draw.text(((W-atw)//2, cond_y+120), alert_text, font=f_small, fill=(255,120,120,255))
-
     # ── H / L ─────────────────────────────────────────────────────────────────
     hl_y = cond_y + 130
     hl_str = f"H:{temp_max}°   L:{temp_min}°"
     hlw = draw.textlength(hl_str, font=f_med)
     draw.text(((W-hlw)//2, hl_y), hl_str, font=f_med, fill=(255,255,255,180))
+
+    # Alert text — wrapped, below H/L (full detail is also in the caption)
+    if alert_mode and alert_text:
+        acol = (255,140,140,255)
+        if alert_level in MMS_ALERT_LEVELS:
+            c = MMS_ALERT_LEVELS[alert_level]["color"]
+            acol = (min(255,c[0]+40), min(255,c[1]+40), min(255,c[2]+40), 255)
+        # Wrap alert text
+        words = alert_text.split()
+        lines = []; cur = ""
+        for w in words:
+            test = (cur + " " + w).strip()
+            if draw.textlength(test, font=f_body) <= W - 200:
+                cur = test
+            else:
+                lines.append(cur); cur = w
+        if cur: lines.append(cur)
+        ay = hl_y + 80
+        for ln in lines[:3]:
+            lw_a = draw.textlength(ln, font=f_body)
+            draw.text(((W-lw_a)//2, ay), ln, font=f_body, fill=acol)
+            ay += 56
+        hl_y = ay - 80  # push details down below the alert text
 
     # ── DETAILS — 3 rows ──────────────────────────────────────────────────────
     dy = hl_y + 90
@@ -3528,7 +3565,7 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
         draw.text((hx-hlw2//2, hourly_y), h_label, font=f_tiny, fill=(255,255,255,160))
 
         # Icon
-        draw_weather_icon(draw, hc, hx, hourly_y+70, size=52)
+        draw_weather_icon(draw, hc, hx, hourly_y+75, size=78)
 
         # Temp
         ht_str = f"{round(ht)}°"
@@ -3610,10 +3647,34 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
 # Max 2 alerts per day (MVT). Never spams.
 weather_alerts_today = {"date": None, "count": 0}
 
-ALERT_THRESHOLDS = {
-    "heavy_rain":    {"precip_prob": 85, "rain_codes": [65,82,95,96,99]},
-    "strong_wind":   {"wind_kmh": 40, "gust_kmh": 55},
-    "thunderstorm":  {"codes": [95,96,99]},
+# ── Maldives Meteorological Service alert levels ─────────────────────────────
+# White (informational) → Yellow (advisory) → Orange (warning) → Red (emergency)
+# Wind/gust thresholds based on official MMS criteria (mph converted to km/h).
+MMS_ALERT_LEVELS = {
+    "white": {
+        "label": "WHITE ALERT", "tier": 1,
+        "color": (230, 230, 235), "emoji": "⚪",
+        "headline": "Weather Advisory",
+        "wind_kmh": 30, "gust_kmh": 55,    # ~19 mph wind / ~34 mph gust
+    },
+    "yellow": {
+        "label": "YELLOW ALERT", "tier": 2,
+        "color": (245, 200, 40), "emoji": "🟡",
+        "headline": "Weather Warning",
+        "wind_kmh": 40, "gust_kmh": 64,    # ~25 mph wind / 40 mph gust
+    },
+    "orange": {
+        "label": "ORANGE ALERT", "tier": 3,
+        "color": (245, 140, 20), "emoji": "🟠",
+        "headline": "Severe Weather Warning",
+        "wind_kmh": 55, "gust_kmh": 80,    # ~34 mph wind / 50 mph gust
+    },
+    "red": {
+        "label": "RED ALERT", "tier": 4,
+        "color": (220, 40, 40), "emoji": "🔴",
+        "headline": "EMERGENCY — Severe Weather",
+        "wind_kmh": 75, "gust_kmh": 100,   # ~47 mph wind / 62 mph gust
+    },
 }
 
 def can_send_weather_alert():
@@ -3633,8 +3694,9 @@ def increment_alert_count():
 
 def detect_weather_alert(weather_data):
     """
-    Check if current conditions warrant an alert.
-    Returns (should_alert, alert_type, alert_text) or (False, None, None).
+    Assess conditions against Maldives Met Service alert levels.
+    Returns (should_alert, level_key, alert_text) or (False, None, None).
+    Only fires White/Yellow/Orange/Red — nothing for calm weather.
     """
     current = weather_data.get("current", {})
     code    = current.get("weathercode", 0)
@@ -3642,69 +3704,120 @@ def detect_weather_alert(weather_data):
     gusts   = current.get("windgust_10m", 0)
     precip  = current.get("precipitation_prob", 0)
 
-    # Thunderstorm — highest priority
-    if code in ALERT_THRESHOLDS["thunderstorm"]["codes"]:
-        return (True, "thunderstorm",
-                f"Thunderstorm conditions over Malé — stay safe and stay indoors.")
+    is_storm = code in [95, 96, 99]
+    is_heavy_rain = code in [65, 82] and precip >= 80
 
-    # Heavy rain
-    if (code in ALERT_THRESHOLDS["heavy_rain"]["rain_codes"] and
-            precip >= ALERT_THRESHOLDS["heavy_rain"]["precip_prob"]):
-        return (True, "heavy_rain",
-                f"Heavy rain expected — {int(precip)}% precipitation probability. "
-                "Expect poor visibility and flooding risk.")
+    # Determine the highest level the conditions meet (check Red first)
+    level = None
+    for key in ["red", "orange", "yellow", "white"]:
+        cfg = MMS_ALERT_LEVELS[key]
+        if wind >= cfg["wind_kmh"] or gusts >= cfg["gust_kmh"]:
+            level = key
+            break
 
-    # Rough sea / strong wind
-    if (wind >= ALERT_THRESHOLDS["strong_wind"]["wind_kmh"] or
-            gusts >= ALERT_THRESHOLDS["strong_wind"]["gust_kmh"]):
-        w_str = f"Wind {int(wind)} km/h" + (f", gusts {int(gusts)} km/h" if gusts > wind else "")
-        return (True, "strong_wind",
-                f"Rough sea conditions — {w_str}. "
-                "Caution advised for sea travel and water activities.")
+    # Thunderstorms bump the level up at least to Yellow
+    if is_storm:
+        if level is None or MMS_ALERT_LEVELS[level]["tier"] < 2:
+            level = "yellow"
 
-    return (False, None, None)
+    # Heavy rain alone triggers at least White
+    if is_heavy_rain and level is None:
+        level = "white"
 
-def send_weather_alert(weather_data, alert_type, alert_text):
-    """Send a weather alert card to community + core team. Max 2/day."""
-    if not can_send_weather_alert():
-        log.info("⚠️ Weather alert limit (2/day) reached — skipping")
+    if level is None:
+        return (False, None, None)
+
+    # Build the alert description
+    cfg = MMS_ALERT_LEVELS[level]
+    parts = []
+    if is_storm:
+        parts.append("thunderstorms")
+    if is_heavy_rain or (code in [61,63,65,80,81,82]):
+        parts.append("heavy rain")
+    if wind >= 30 or gusts >= 50:
+        parts.append("strong winds")
+    # Sea state
+    if wind >= 55 or gusts >= 80:
+        sea = "very rough seas"
+    elif wind >= 35 or gusts >= 55:
+        sea = "rough seas"
+    else:
+        sea = "moderate seas"
+    parts.append(sea)
+
+    desc = ", ".join(parts).capitalize()
+    w_str = f"Wind {int(wind)} km/h"
+    if gusts > wind:
+        w_str += f", gusts {int(gusts)} km/h"
+
+    alert_text = f"{desc} expected over Malé. {w_str}."
+
+    # Advice by level
+    advice = {
+        "white":  "Stay informed and take normal precautions.",
+        "yellow": "Caution advised. Avoid unnecessary sea travel.",
+        "orange": "Avoid sea travel. Secure loose objects. Stay indoors if possible.",
+        "red":    "DANGER. Do not travel by sea. Stay indoors and follow official guidance.",
+    }
+    alert_text += " " + advice[level]
+
+    return (True, level, alert_text)
+
+def send_weather_alert(weather_data, level_key, alert_text):
+    """
+    Send a Maldives Met-style alert card.
+    Red alerts post immediately and bypass the daily limit.
+    Others respect the 2/day cap.
+    """
+    cfg = MMS_ALERT_LEVELS.get(level_key, MMS_ALERT_LEVELS["white"])
+    is_red = level_key == "red"
+
+    # Red bypasses the daily limit (emergency), others respect it
+    if not is_red and not can_send_weather_alert():
+        log.info(f"⚠️ Weather alert limit (2/day) reached — skipping {level_key}")
         return
+
     try:
-        card = generate_weather_card(weather_data, alert_mode=True, alert_text=alert_text)
+        card = generate_weather_card(weather_data, alert_mode=True,
+                                     alert_text=alert_text, alert_level=level_key)
         current = weather_data.get("current", {})
         code = current.get("weathercode", 0)
         emoji, condition = weather_code_to_info(code)
 
-        alert_icons = {
-            "thunderstorm": "⛈️",
-            "heavy_rain":   "🌧️",
-            "strong_wind":  "💨",
-        }
-        icon = alert_icons.get(alert_type, "⚠️")
-
         caption = (
-            f"⚠️ <b>WEATHER ALERT — Malé, Maldives</b>\n\n"
-            f"{icon} {alert_text}\n\n"
+            f"{cfg['emoji']} <b>{cfg['label']} — Malé, Maldives</b>\n"
+            f"<b>{cfg['headline']}</b>\n\n"
+            f"{alert_text}\n\n"
             f"🌡️ Current: {round(current.get('temperature_2m',29))}°C — {condition}\n\n"
-            f"📡 <b>Samuga Media</b> | @samugacommunity"
+            f"📡 <b>Samuga Media</b> | @samugacommunity\n"
+            f"<i>Source: Conditions via weather data — follow @MetMaldives for official warnings</i>"
         )
 
-        # Community channel
+        # Post to community
         card.seek(0)
         send_photo(TELEGRAM_CHANNEL_ID, card, caption)
 
+        # Red/Orange also go to social immediately
+        if level_key in ["red", "orange"]:
+            try:
+                card.seek(0)
+                threading.Thread(target=post_to_social,
+                                 args=(io.BytesIO(card.getvalue()), caption), daemon=True).start()
+            except Exception as e:
+                log.error(f"Alert social post: {e}")
+
         # Core team notification
-        card.seek(0)
         team_note = (
-            f"⚠️ <b>Weather alert sent to community</b>\n"
-            f"Type: {alert_type}\n"
+            f"{cfg['emoji']} <b>{cfg['label']} sent to community</b>\n"
             f"{alert_text}\n"
-            f"Alerts today: {weather_alerts_today['count']+1}/2"
+            f"Alerts today: {weather_alerts_today['count']+(0 if is_red else 1)}/2"
+            + ("  (RED — bypassed limit)" if is_red else "")
         )
         send_text(CORE_TEAM_CHAT_ID, team_note)
 
-        increment_alert_count()
-        log.info(f"⚠️ Weather alert sent: {alert_type}")
+        if not is_red:
+            increment_alert_count()
+        log.info(f"{cfg['emoji']} Weather alert sent: {level_key.upper()}")
     except Exception as e:
         log.error(f"Weather alert send: {e}")
 
@@ -3751,7 +3864,12 @@ def send_weather_update(time_of_day="morning"):
         sunrise_str = sunrise_raw.split("T")[1][:5] if "T" in sunrise_raw else "06:00"
         sunset_str  = sunset_raw.split("T")[1][:5]  if "T" in sunset_raw  else "18:19"
         emoji, condition = weather_code_to_info(code)
-        greeting = "\U0001f305 Good Morning Maldives!" if time_of_day == "morning" else "\U0001f319 Good Evening Maldives!"
+        if time_of_day == "morning":
+            greeting = "\U0001f305 Good Morning Maldives!"
+        elif time_of_day == "afternoon":
+            greeting = "\u2600\ufe0f Good Afternoon Maldives!"
+        else:
+            greeting = "\U0001f319 Good Evening Maldives!"
         src_tag = f"\n<i>Data: {source}</i>" if source else ""
 
         # Sea condition for caption
@@ -3782,8 +3900,18 @@ def send_weather_update(time_of_day="morning"):
             f"📡 <b>Samuga Media</b> | @samugacommunity"
             f"{src_tag}"
         )
+        # Post to Telegram community
         send_photo(TELEGRAM_CHANNEL_ID, card, caption)
-        log.info(f"\u2705 Weather card sent ({time_of_day}) via {source}")
+        log.info(f"\u2705 Weather card sent to Telegram ({time_of_day}) via {source}")
+
+        # Post to social media (FB + IG + X) in background
+        try:
+            card.seek(0)
+            social_buf = io.BytesIO(card.getvalue())
+            threading.Thread(target=post_to_social, args=(social_buf, caption), daemon=True).start()
+            log.info(f"\U0001f4f1 Weather card queued for FB + IG + X ({time_of_day})")
+        except Exception as e:
+            log.error(f"Weather social post: {e}")
 
         # Alert check after every regular card
         should_alert, alert_type, alert_text = detect_weather_alert(data)
@@ -5587,10 +5715,13 @@ if __name__ == "__main__":
     scheduler.add_job(backfill_tg_views, "cron", day_of_week="tue", hour=22, minute=0)
     # Phase 2.5: mid-week Meta (FB+IG) engagement refresh — Tue 10PM UTC too
     scheduler.add_job(fetch_meta_insights, "cron", day_of_week="tue", hour=22, minute=15)
-    # Weather update 8AM MVT = 3AM UTC
+    # Weather cards — 3x daily to ALL platforms (Telegram + FB + IG + X)
+    # 8:00 AM MVT = 3:00 UTC
     scheduler.add_job(lambda: send_weather_update("morning"), "cron", hour=3, minute=0)
-    # Weather update 8PM MVT = 3PM UTC
-    scheduler.add_job(lambda: send_weather_update("evening"), "cron", hour=15, minute=0)
+    # 2:00 PM MVT = 9:00 UTC
+    scheduler.add_job(lambda: send_weather_update("afternoon"), "cron", hour=9, minute=0)
+    # 10:30 PM MVT = 17:30 UTC
+    scheduler.add_job(lambda: send_weather_update("evening"), "cron", hour=17, minute=30)
     # Tip/story CTA 8:30AM MVT = 3:30AM UTC
     scheduler.add_job(send_tip_cta, "cron", hour=3, minute=30)  # 8:30AM MVT
     # Tip/story CTA 8:30PM MVT = 3:30PM UTC
