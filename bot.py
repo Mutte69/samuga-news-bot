@@ -1,12 +1,43 @@
+"""
+═══════════════════════════════════════════════════════════════════════════════
+  SAMUGA AI  —  Maldivian AI-Powered Newsroom Bot
+  Version: 7.0  |  github.com/samuga-news-bot  |  Railway + PostgreSQL
+═══════════════════════════════════════════════════════════════════════════════
+
+  WHAT THIS FILE CONTAINS (search these tags to jump to a section):
+
+    [CONFIG]      Environment vars, feeds, constants          (top of file)
+    [DATABASE]    PostgreSQL: articles, stories, memory, kv
+    [MODELS]      Article dataclass + helpers
+    [FETCHERS]    RSS, Google News, MvCrisis scraping
+    [SCORING]     Article scoring, dedup, clustering, reliability
+    [STORIES]     Story Intelligence — timeline threads
+    [AI]          Claude rewrite, Gemini Dhivehi, core-team brain
+    [CARDS]       Pillow card generation (news + weather)
+    [WEATHER]     Tomorrow.io, prayer times, Hijri, MMS alerts
+    [PUBLISHING]  Telegram, Buffer, Meta Graph API
+    [COMMANDS]    All /command handlers
+    [SCHEDULER]   Cron jobs (news loop, weather, briefs)
+
+  DEPLOYMENT:  push bot.py to GitHub → Railway auto-deploys
+  COST:        ~$25/month (Claude Haiku + Railway + Buffer)
+═══════════════════════════════════════════════════════════════════════════════
+"""
+
 import os, io, threading, time, logging, hashlib, json, feedparser, requests, anthropic, re
+from dataclasses import dataclass
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
 from io import BytesIO
 
+# ── Structured logging: tags make Railway logs readable ──────────────────────
+# Usage: log.info("[FETCH] pulled 12 articles")  →  easy to filter in Railway
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
+
+SAMUGA_VERSION = "7.0"
 
 # ── Timezone-aware UTC helper (replaces deprecated utcnow()) ─────────
 from datetime import timezone as _tz
@@ -14,7 +45,13 @@ def utcnow():
     """Naive UTC datetime — same value as the old utcnow() but not deprecated."""
     return datetime.now(_tz.utc).replace(tzinfo=None)
 
-# ── Config ────────────────────────────────────────────────────────────────────
+def mvt_now():
+    """Current Maldives time (UTC+5) as naive datetime."""
+    return utcnow() + timedelta(hours=5)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# [CONFIG] — Environment variables & API keys
+# ═══════════════════════════════════════════════════════════════════════════
 TELEGRAM_BOT_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "@samugacommunity")
 ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
@@ -27,16 +64,52 @@ BUFFER_TOKEN        = os.environ.get("BUFFER_ACCESS_TOKEN", "")
 BUFFER_FB_ID        = os.environ.get("BUFFER_FACEBOOK_ID", "")
 BUFFER_IG_ID        = os.environ.get("BUFFER_INSTAGRAM_ID", "")
 BUFFER_TW_ID        = os.environ.get("BUFFER_TWITTER_ID", "")
-# Meta Graph API (Phase 2.5) — reads FB + IG engagement off your own page
+# Meta Graph API — reads FB + IG engagement off your own page
 META_PAGE_TOKEN     = os.environ.get("META_PAGE_TOKEN", "")
 META_PAGE_ID        = os.environ.get("META_PAGE_ID", "")
 META_APP_SECRET     = os.environ.get("META_APP_SECRET", "")
 META_IG_ID          = os.environ.get("META_IG_ID", "")  # optional; auto-resolved if blank
 META_API_VER        = os.environ.get("META_API_VER", "v21.0")
+TOMORROW_API_KEY    = os.environ.get("TOMORROW_API_KEY", "")  # weather data
 
 ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# ── RSS Feeds ─────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# [MODELS] — Article shape (documentation + optional helper)
+# ═══════════════════════════════════════════════════════════════════════════
+# Articles flow through the pipeline as plain dicts for flexibility. This
+# dataclass documents the canonical shape so future-you (and any new dev) can
+# see at a glance what fields an article carries. Use Article.from_dict() if you
+# ever want type safety, but the dict form remains the working currency.
+@dataclass
+class Article:
+    id: str                       # unique hash of the article
+    title: str                    # headline
+    summary: str = ""             # body/excerpt
+    link: str = ""                # source URL
+    source: str = ""              # outlet name (Mihaaru, Sun, etc)
+    cat: str = "LOCAL"            # BREAKING | LOCAL | POLITICAL | SPORTS | LIFESTYLE | WORLD
+    lang: str = "en"              # en | dv
+    # ── runtime fields added during processing ──
+    score: int = 0                # newsroom priority score
+    reliability: int = 0          # source trust score
+    is_breaking: bool = False
+    cluster_size: int = 1         # how many sources reporting this (_cluster_size)
+    story_id: int = None          # attached Story Intelligence thread (_story_id)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Article":
+        return cls(
+            id=d.get("id",""), title=d.get("title",""), summary=d.get("summary",""),
+            link=d.get("link",""), source=d.get("source",""), cat=d.get("cat","LOCAL"),
+            lang=d.get("lang","en"), score=d.get("score",0),
+            reliability=d.get("reliability",0), is_breaking=d.get("is_breaking",False),
+            cluster_size=d.get("_cluster_size",1), story_id=d.get("_story_id"),
+        )
+
+# ═══════════════════════════════════════════════════════════════════════════
+# [FETCHERS] — RSS Feeds
+# ═══════════════════════════════════════════════════════════════════════════
 # ── RSS Feeds (v4 Strategy) ───────────────────────────────────────────────────
 # LOCAL (70%) — Maldivian sources, priority order
 LOCAL_FEEDS = [
@@ -282,7 +355,6 @@ def init_database():
         log.info("🗄️ No DATABASE_URL — running in JSON-only mode")
         return
     try:
-        import psycopg2
         from psycopg2 import pool as _pgpool
         # Railway sometimes gives postgres:// — psycopg2 wants postgresql://
         url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -1273,11 +1345,6 @@ _pending_article = None  # holds the best unseen article between scans
 # ── Social post daily counter (MVT based) ─────────────────────────────────────
 social_post_counts = {"date": None, "count": 0}
 
-def mvt_now():
-    """Current time in Maldives Time (UTC+5)"""
-    from datetime import timezone
-    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=5)
-
 def is_day_social():
     """6AM to 10PM MVT = day mode for socials"""
     h = mvt_now().hour
@@ -1879,7 +1946,7 @@ Return ONLY the Dhivehi text, nothing else."""
         resp = requests.post(url, json={"contents":[{"parts":[{"text":prompt}]}]}, timeout=15)
         if resp.status_code == 200:
             dv_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            log.info(f"✅ Gemini Dhivehi caption done")
+            log.info("✅ Gemini Dhivehi caption done")
             return dv_text
     except Exception as e:
         log.error(f"Gemini Dhivehi caption: {e}")
@@ -2200,7 +2267,7 @@ def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_
         # Show retry tip if anything failed
         has_failure = not tg_ok or any(v is False for v in social_results.values())
         if has_failure:
-            msg += f"\n\n💡 <i>Telegram failed? The article may have expired. Create a manual card instead.</i>"
+            msg += "\n\n💡 <i>Telegram failed? The article may have expired. Create a manual card instead.</i>"
         send_text(rchat, msg, thread_id=rthread)
 
     return tg_ok, social_results
@@ -2937,7 +3004,7 @@ def generate_outlook(hourly_slots, mvt_now):
     e.g. "Heavy showers after 4 PM", "Sunny all day", "Thunderstorms tonight"
     Uses Tomorrow.io native weatherCode (not WMO).
     """
-    from datetime import datetime, timezone, timedelta as _td
+    from datetime import datetime, timedelta as _td
 
     SEVERITY = {
         8000:5, 8001:5, 8002:5,           # thunderstorm
@@ -3064,13 +3131,13 @@ def get_weather_data():
                     daily_wmo.append(_tomorrow_code_to_wmo(v.get("weatherCodeMax", 1000)))
                     sr = v.get("sunriseTime", ""); ss = v.get("sunsetTime", "")
                     if sr:
-                        from datetime import datetime as _dt, timezone as _tz, timedelta as _td2
+                        from datetime import datetime as _dt, timedelta as _td2
                         try:
                             sr_utc = _dt.fromisoformat(sr.replace("Z","+00:00"))
                             sunrise_str = (sr_utc + _td2(hours=5)).strftime("%H:%M")
                         except: sunrise_str = sr[11:16]
                     if ss:
-                        from datetime import datetime as _dt, timezone as _tz, timedelta as _td2
+                        from datetime import datetime as _dt, timedelta as _td2
                         try:
                             ss_utc = _dt.fromisoformat(ss.replace("Z","+00:00"))
                             sunset_str = (ss_utc + _td2(hours=5)).strftime("%H:%M")
@@ -3384,7 +3451,7 @@ def draw_weather_icon(draw, code, x, y, size=40):
 def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_data=None, prayer_data=None, alert_level=None):
     """Samuga branded weather card v3 — 2500x3000, cinematic, sea conditions, prayer times, Hijri, MMS alerts."""
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
-    import math, io
+    import io
 
     W, H = 2500, (3050 if island_data else 2300)
     img = Image.new("RGB", (W, H), (0, 0, 0))
@@ -4080,7 +4147,7 @@ def send_weather_update(time_of_day="morning"):
         log.info("🕌 Fetching prayer times...")
         prayer_info = get_prayer_times()
         if prayer_info:
-            log.info(f"🕌 Prayer times fetched")
+            log.info("🕌 Prayer times fetched")
         else:
             log.warning("🕌 Prayer times unavailable")
 
@@ -4766,7 +4833,7 @@ def chat_with_gemini_dhivehi(user_message, context="", conversation_history=None
         web_context = ""
         try:
             if needs_web_search(user_message) or not context:
-                web_context = tavily_search(f"maldives news today 2026")
+                web_context = tavily_search("maldives news today 2026")
                 if web_context:
                     log.info("🌐 Dhivehi path: web search done")
         except Exception as e:
@@ -4855,7 +4922,7 @@ def answer_story_query(message):
         src = f" ({u['source']})" if u["source"] else ""
         lines.append(f"🔹 <b>{tstr}</b>{src} — {u['headline'][:90]}")
     if len(matches) > 1:
-        lines.append(f"\n<i>Also tracking: " +
+        lines.append("\n<i>Also tracking: " +
                      ", ".join(f"#{m['id']}" for m in matches[1:]) + " — use /story [id]</i>")
     return "\n".join(lines)
 
@@ -5504,7 +5571,7 @@ def handle_updates():
                                 if not timeline:
                                     send_text(chat_id, f"No story found with ID #{arg}.", reply_to=msg_id, thread_id=thread_id)
                                 else:
-                                    from datetime import timezone, timedelta as _td
+                                    from datetime import timedelta as _td
                                     lines = [f"📚 <b>Story #{timeline['id']} — {timeline['status'].upper()}</b>\n"]
                                     lines.append(f"<b>{timeline['title']}</b>")
                                     lines.append(f"<i>{timeline['update_count']} updates · {timeline['category'] or 'news'}</i>\n")
