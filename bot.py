@@ -2909,7 +2909,20 @@ def run_job(social_only=False, breaking_only=False):
     if breaking_only:
         return
 
-    # ── 2. Regular news: ONLY post if 90-min Telegram window is open ──────
+    # ── 2a. Dhivehi articles — process regardless of throttle ──────────────
+    # Dhivehi articles always go to the approval queue (never auto-post),
+    # so the 90-min Telegram throttle doesn't apply to them.
+    dv_articles = [a for a in regular_articles if a.get("lang") == "dv"]
+    dv_queued = 0
+    for a in dv_articles[:3]:  # max 3 Dhivehi per run to avoid flooding queue
+        if not is_duplicate_story(a["title"]):
+            log.info(f"🇲🇻 DV queue: {a['title'][:55]}")
+            post_article(a, seen, social_only=False, allow_social=False)
+            dv_queued += 1
+    if dv_queued:
+        log.info(f"🇲🇻 {dv_queued} Dhivehi article(s) queued for approval")
+
+    # ── 2b. Regular news: ONLY post if 90-min Telegram window is open ──────
     if not can_post_regular():
         secs_left = int(5400 - (utcnow() - last_regular_post_time).total_seconds())
         log.info(f"⏳ Telegram throttled — {secs_left//60}m left. No social posting either. Waiting.")
