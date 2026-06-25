@@ -6275,9 +6275,12 @@ if __name__ == "__main__":
             log.warning(f"Noto font install failed: {e}")
     else:
         log.info("✅ Thaana fonts available")
-    log.info("📅 6AM-10PM: every 15min | Night: breaking only | v4 strategy")
-    log.info("🌅 7AM Brief | 🌙 12AM Summary | 🌤️ 8AM/8PM Weather | 📊 Friday Digest")
-    log.info("💬 Smart chat with history, Tavily search, Dhivehi support")
+    log.info("📅 News: 6AM-10PM every 15min | Night: breaking only")
+    log.info("🌤️ Weather: 8AM, 2PM, 10:30PM → all platforms | MMS alerts auto")
+    log.info("🌅 7AM Brief | 🌙 12AM Summary | 📊 Friday Digest | 🕌 Prayer times + Hijri")
+    log.info("📚 Story Intelligence: timeline threads active")
+    log.info("🧠 Core team brain: live newsroom awareness + persistent memory")
+    log.info("💬 Smart chat: history, web search, Dhivehi support, story queries")
 
     init_database()  # connect to Postgres (falls back to JSON if unavailable)
     restore_state()  # bring back dedup memory, daily counters, pending cards, analytics
