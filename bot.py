@@ -254,28 +254,26 @@ def expire_old_approvals():
     """
     now = utcnow()
 
-    # English auto-post after 15 min
+    # English auto-post after 15 min — goes through queue (Telegram + social)
     en_due = [k for k, v in approval_queue.items()
               if v["lang"] == "en" and (now - v["created_at"]).total_seconds() > ENGLISH_AUTOPOST_SECONDS]
     for k in en_due:
         item = approval_queue.pop(k)
         title = item.get("title","")[:50]
-        log.info(f"⏰ English {k} not approved in 15min — auto-posting: {title}")
+        log.info(f"⏰ English {k} auto-queuing (no approval in 15min): {title}")
         try:
-            ok = _publish_now(
-                item["card_bytes"], item["caption"], item["cat"],
-                item["title"], item["link"],
-                is_breaking_flag=item.get("is_breaking", False),
-                allow_social=item.get("allow_social", True),
-                rewritten=item.get("rewritten",""),
-                summary=item.get("summary","")
+            buf = io.BytesIO(item["card_bytes"])
+            queue_for_social(
+                buf, item["caption"],
+                key_label=f"{k.upper()} (auto)",
+                tg_ok=False,
+                post_telegram=True  # queue posts Telegram too
             )
-            if ok:
-                send_text(CORE_TEAM_CHAT_ID,
-                          f"⏰ <b>{k.upper()} Auto-posted</b> (no approval in 15min):\n📰 {item['title'][:80]}",
-                          thread_id=ALERT_THREAD_ID)
+            send_text(CORE_TEAM_CHAT_ID,
+                      f"⏰ <b>{k.upper()}</b> queued for posting (no approval in 15min)\n📰 {item['title'][:80]}",
+                      thread_id=ALERT_THREAD_ID)
         except Exception as e:
-            log.error(f"Auto-post {k} failed: {e}")
+            log.error(f"Auto-post queue {k} failed: {e}")
 
     # Dhivehi expiry — breaking ones auto-post after 2h, regular ones delete
     dv_due = [k for k, v in approval_queue.items()
@@ -2456,16 +2454,18 @@ def _social_queue_worker():
             results = _post_to_social_now(
                 io.BytesIO(item["img_bytes"]), item["caption"])
 
-            # 3. Send per-platform confirmation to Content Lab
+            # 3. Send per-platform confirmation
+            tg_icon = "✅" if tg_ok else "❌"
+            fb_icon = "✅" if results.get("Facebook")  else "❌"
+            ig_icon = "✅" if results.get("Instagram") else "❌"
+            x_icon  = "✅" if results.get("Twitter")   else "❌"
+            conf_msg = (f"📤 <b>{key_label}</b> posted\n"
+                        f"Telegram {tg_icon} · FB {fb_icon} · IG {ig_icon} · X {x_icon}")
             if notify_cid:
-                tg_icon = "✅" if tg_ok else "❌"
-                fb_icon = "✅" if results.get("Facebook")  else "❌"
-                ig_icon = "✅" if results.get("Instagram") else "❌"
-                x_icon  = "✅" if results.get("Twitter")   else "❌"
-                send_text(notify_cid,
-                    f"📤 <b>{key_label}</b> posted\n"
-                    f"Telegram {tg_icon} · FB {fb_icon} · IG {ig_icon} · X {x_icon}",
-                    thread_id=notify_tid)
+                send_text(notify_cid, conf_msg, thread_id=notify_tid)
+            else:
+                # Auto-post — send to Content Lab so team knows what went out
+                send_text(CORE_TEAM_CHAT_ID, conf_msg, thread_id=CONTENT_LAB_THREAD_ID)
             try: persist_state()
             except Exception: pass
         except Exception as e:
@@ -2673,19 +2673,18 @@ def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_
         else:
             log.info("🔴 Breaking posted!")
 
-    # Social posting
+    # Social posting — ONLY breaking bypasses the queue
     if allow_social:
         social_buf = io.BytesIO(card_bytes)
         if is_breaking_flag:
-            # BREAKING — blast to all platforms immediately, no queue
+            # BREAKING — blast everywhere immediately, no queue
             log.info("🔴 Breaking — posting to FB+IG+X immediately (no queue)")
             social_results = post_to_social(social_buf, caption) or {}
-        elif report_to:
-            # Synchronous for manual posts so we can report results
-            social_results = post_to_social(social_buf, caption) or {}
         else:
-            # Regular news — 10-minute queue
-            queue_for_social(social_buf, caption)
+            # Regular — queue handles it. DO NOT call post_to_social here.
+            # The caller (approval handler or auto-expiry) is responsible for queuing.
+            # _publish_now only handles Telegram for non-breaking.
+            pass
 
     # Poll
     if tg_ok and should_create_poll(title, summary, cat):
