@@ -3793,31 +3793,31 @@ def send_weather_alert(weather_data, level_key, alert_text):
             f"<i>Source: Conditions via weather data — follow @MetMaldives for official warnings</i>"
         )
 
-        # Post to community
+        # Post to community (Telegram) immediately
         card.seek(0)
         send_photo(TELEGRAM_CHANNEL_ID, card, caption)
 
-        # Red/Orange also go to social immediately
-        if level_key in ["red", "orange"]:
-            try:
-                card.seek(0)
-                threading.Thread(target=post_to_social,
-                                 args=(io.BytesIO(card.getvalue()), caption), daemon=True).start()
-            except Exception as e:
-                log.error(f"Alert social post: {e}")
+        # ALL alert levels (White and up) post immediately to FB + IG + X
+        try:
+            card.seek(0)
+            threading.Thread(target=post_to_social,
+                             args=(io.BytesIO(card.getvalue()), caption), daemon=True).start()
+            log.info(f"📲 {cfg['label']} queued for FB + IG + X")
+        except Exception as e:
+            log.error(f"Alert social post: {e}")
 
         # Core team notification
         team_note = (
-            f"{cfg['emoji']} <b>{cfg['label']} sent to community</b>\n"
+            f"{cfg['emoji']} <b>{cfg['label']} posted to ALL platforms</b>\n"
             f"{alert_text}\n"
             f"Alerts today: {weather_alerts_today['count']+(0 if is_red else 1)}/2"
-            + ("  (RED — bypassed limit)" if is_red else "")
+            + ("  (RED — bypassed daily limit)" if is_red else "")
         )
         send_text(CORE_TEAM_CHAT_ID, team_note)
 
         if not is_red:
             increment_alert_count()
-        log.info(f"{cfg['emoji']} Weather alert sent: {level_key.upper()}")
+        log.info(f"{cfg['emoji']} Weather alert sent to all platforms: {level_key.upper()}")
     except Exception as e:
         log.error(f"Weather alert send: {e}")
 
@@ -5261,6 +5261,86 @@ def handle_updates():
                                     log.error(f"/weather preview: {e}")
                                     send_text(_chat_id, f"❌ Error: {e}", thread_id=_thread_id)
                             threading.Thread(target=_send_weather_preview, daemon=True).start()
+
+                        # /alert [white|yellow|orange|red] — preview an alert card in Content Lab
+                        elif text.strip().lower().startswith("/alert"):
+                            arg = text.strip().lower().replace("/alert", "").strip()
+                            valid_levels = ["white", "yellow", "orange", "red"]
+
+                            if arg == "status" or arg == "":
+                                # Show current real conditions + whether an alert would fire
+                                send_text(chat_id, "🔍 Checking current conditions... ⏳",
+                                          reply_to=msg_id, thread_id=thread_id)
+                                def _alert_status(_cid=chat_id, _tid=thread_id):
+                                    try:
+                                        data = get_weather_data()
+                                        if not data:
+                                            send_text(_cid, "❌ Weather data unavailable.", thread_id=_tid); return
+                                        should, lvl, txt = detect_weather_alert(data)
+                                        cur = data.get("current", {})
+                                        w = round(cur.get("windspeed_10m",0))
+                                        g = round(cur.get("windgust_10m",0))
+                                        if should:
+                                            cfg = MMS_ALERT_LEVELS[lvl]
+                                            msg = (f"{cfg['emoji']} <b>{cfg['label']} would fire right now</b>\n\n"
+                                                   f"{txt}\n\n"
+                                                   f"Wind {w} km/h, gusts {g} km/h\n"
+                                                   f"Alerts used today: {weather_alerts_today['count']}/2\n\n"
+                                                   f"Use <code>/alert {lvl}</code> to preview the card.")
+                                        else:
+                                            msg = (f"🟢 <b>No alert conditions right now</b>\n\n"
+                                                   f"Wind {w} km/h, gusts {g} km/h — all calm.\n"
+                                                   f"Alerts used today: {weather_alerts_today['count']}/2\n\n"
+                                                   f"Preview any level: <code>/alert white|yellow|orange|red</code>")
+                                        send_text(_cid, msg, thread_id=_tid)
+                                    except Exception as e:
+                                        log.error(f"/alert status: {e}")
+                                        send_text(_cid, f"❌ Error: {e}", thread_id=_tid)
+                                threading.Thread(target=_alert_status, daemon=True).start()
+
+                            elif arg in valid_levels:
+                                send_text(chat_id, f"⚠️ Building {arg.upper()} alert preview... ⏳",
+                                          reply_to=msg_id, thread_id=thread_id)
+                                def _alert_preview(_lvl=arg, _cid=chat_id, _tid=thread_id):
+                                    try:
+                                        data = get_weather_data()
+                                        if not data:
+                                            send_text(_cid, "❌ Weather data unavailable.", thread_id=_tid); return
+                                        islands = get_island_forecasts()
+                                        prayer_info = get_prayer_times()
+                                        cfg = MMS_ALERT_LEVELS[_lvl]
+                                        # Build a representative alert_text for this level
+                                        sample_text = {
+                                            "white":  "Strong winds and rough seas expected over Malé. Wind 32 km/h, gusts 56 km/h. Stay informed and take normal precautions.",
+                                            "yellow": "Thunderstorms, strong winds and rough seas expected over Malé. Wind 42 km/h, gusts 66 km/h. Caution advised. Avoid unnecessary sea travel.",
+                                            "orange": "Severe winds and very rough seas expected over Malé. Wind 58 km/h, gusts 82 km/h. Avoid sea travel. Secure loose objects. Stay indoors if possible.",
+                                            "red":    "DANGEROUS storm conditions over Malé. Wind 78 km/h, gusts 105 km/h. DANGER. Do not travel by sea. Stay indoors and follow official guidance.",
+                                        }[_lvl]
+                                        card = generate_weather_card(data, alert_mode=True,
+                                                                     alert_text=sample_text, alert_level=_lvl,
+                                                                     island_data=islands if islands else None,
+                                                                     prayer_data=prayer_info)
+                                        caption = (
+                                            f"{cfg['emoji']} <b>{cfg['label']} PREVIEW — {cfg['headline']}</b>\n\n"
+                                            f"{sample_text}\n\n"
+                                            f"<i>⚠️ This is a PREVIEW only — not posted to community.\n"
+                                            f"Real alerts fire automatically when conditions are met.</i>"
+                                        )
+                                        send_photo(_cid, card, caption, thread_id=_tid)
+                                        log.info(f"⚠️ Alert preview ({_lvl}) sent to core team")
+                                    except Exception as e:
+                                        log.error(f"/alert preview: {e}")
+                                        send_text(_cid, f"❌ Error: {e}", thread_id=_tid)
+                                threading.Thread(target=_alert_preview, daemon=True).start()
+                            else:
+                                send_text(chat_id,
+                                    "Usage:\n"
+                                    "<code>/alert status</code> — check if an alert would fire now\n"
+                                    "<code>/alert white</code> — preview White (informational)\n"
+                                    "<code>/alert yellow</code> — preview Yellow (advisory)\n"
+                                    "<code>/alert orange</code> — preview Orange (warning)\n"
+                                    "<code>/alert red</code> — preview Red (emergency)",
+                                    reply_to=msg_id, thread_id=thread_id)
 
                         # /brief — generate the AI nightly editorial brief on demand
                         elif text.strip().lower() in ["/brief", "/journalist", "/editor"]:
