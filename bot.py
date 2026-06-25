@@ -360,6 +360,37 @@ def init_database():
                         created_at  TIMESTAMPTZ DEFAULT NOW()
                     );
                 """)
+                # Phase 4: STORY INTELLIGENCE — ongoing story threads ("Story #248")
+                # A story groups many article updates about the same real-world event.
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS stories (
+                        id            SERIAL PRIMARY KEY,
+                        title         TEXT NOT NULL,      -- canonical headline of the story
+                        slug          TEXT,               -- cluster signature for matching
+                        category      TEXT,
+                        status        TEXT DEFAULT 'active',  -- active | developing | closed
+                        place         TEXT,               -- detected location
+                        event_type    TEXT,               -- fire/accident/death/etc
+                        update_count  INTEGER DEFAULT 0,
+                        first_seen    TIMESTAMPTZ DEFAULT NOW(),
+                        last_update   TIMESTAMPTZ DEFAULT NOW()
+                    );
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS story_updates (
+                        id          SERIAL PRIMARY KEY,
+                        story_id    INTEGER REFERENCES stories(id),
+                        article_id  TEXT,
+                        headline    TEXT NOT NULL,
+                        summary     TEXT,
+                        source      TEXT,
+                        link        TEXT,
+                        created_at  TIMESTAMPTZ DEFAULT NOW()
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_stories_status ON stories(status);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_stories_slug   ON stories(slug);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_stupd_story    ON story_updates(story_id);")
             conn.commit()
         finally:
             _db_pool.putconn(conn)
@@ -918,6 +949,177 @@ def register_in_cluster(title, source):
     story_clusters[matched_key]["sources"].add(source or "Unknown")
     srcs = sorted(story_clusters[matched_key]["sources"])
     return (len(srcs), srcs)
+
+# ── Phase 4: STORY INTELLIGENCE ──────────────────────────────────────────────
+# Groups article updates into ongoing story threads. Each real-world event
+# (a ferry sinking, a fire, an election) becomes ONE story with many updates.
+
+def _detect_place(title):
+    """Detect a Maldivian place name in a headline."""
+    t = title.lower()
+    for p in _CLUSTER_PLACES:
+        if p in t:
+            return p.title()
+    return None
+
+def _detect_event_type(title):
+    """Detect the event type (fire, accident, death, etc)."""
+    t = title.lower()
+    for ev, kws in _CLUSTER_EVENTS.items():
+        if any(k in t for k in kws):
+            return ev
+    return None
+
+def find_or_create_story(title, category, article_id, summary, source, link):
+    """
+    Find an existing active story this article belongs to, or create a new one.
+    Returns (story_id, is_new, update_number) or (None, False, 0) if DB off.
+
+    Matching: an article joins an existing story if it shares the same place +
+    event type, OR has high title similarity to the story's canonical title,
+    AND the story is still active (last update within 72 hours).
+    """
+    if not DB_ENABLED:
+        return (None, False, 0)
+
+    try:
+        place = _detect_place(title)
+        event = _detect_event_type(title)
+        slug  = _cluster_key(title)
+
+        # Look at active stories from the last 72 hours
+        candidates = db_execute("""
+            SELECT id, title, place, event_type, update_count
+            FROM stories
+            WHERE status IN ('active','developing')
+              AND last_update > NOW() - INTERVAL '72 hours'
+            ORDER BY last_update DESC
+            LIMIT 40
+        """, fetch="all") or []
+
+        matched_id = None
+        best_score = 0
+        for sid, stitle, splace, sevent, ucount in candidates:
+            score = 0
+            # Strong match: same place + same event type
+            if place and event and splace == place and sevent == event:
+                score = 100
+            # Same place + good title similarity (event may drift: sinking→rescue→investigation)
+            elif place and splace == place and _cluster_similarity(title, stitle) >= 0.30:
+                score = 70
+            # Title similarity match (no place needed)
+            elif _cluster_similarity(title, stitle) >= 0.60:
+                score = 60
+            # Same place, shared significant keyword
+            elif place and splace == place:
+                shared = set(_dup_keywords(title)) & set(_dup_keywords(stitle))
+                if len(shared) >= 2:
+                    score = 55
+            if score > best_score:
+                best_score = score
+                matched_id = sid
+        if best_score < 50:
+            matched_id = None
+
+        if matched_id:
+            # Add this as an update to the existing story
+            db_execute("""
+                INSERT INTO story_updates (story_id, article_id, headline, summary, source, link)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (matched_id, article_id, title, summary, source, link))
+            db_execute("""
+                UPDATE stories
+                SET update_count = update_count + 1,
+                    last_update = NOW(),
+                    status = CASE WHEN update_count + 1 >= 3 THEN 'developing' ELSE status END
+                WHERE id = %s
+            """, (matched_id,))
+            cnt = db_execute("SELECT update_count FROM stories WHERE id=%s",
+                             (matched_id,), fetch="one")
+            update_num = cnt[0] if cnt else 1
+            log.info(f"📚 Story #{matched_id} updated (update #{update_num}): {title[:50]}")
+            return (matched_id, False, update_num)
+        else:
+            # Create a new story
+            new_id = db_execute("""
+                INSERT INTO stories (title, slug, category, place, event_type, update_count)
+                VALUES (%s, %s, %s, %s, %s, 1)
+                RETURNING id
+            """, (title, slug, category, place, event), fetch="one")
+            story_id = new_id[0] if new_id else None
+            if story_id:
+                db_execute("""
+                    INSERT INTO story_updates (story_id, article_id, headline, summary, source, link)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (story_id, article_id, title, summary, source, link))
+                log.info(f"📚 New Story #{story_id} created: {title[:50]}")
+            return (story_id, True, 1)
+
+    except Exception as e:
+        log.error(f"Story intelligence: {e}")
+        return (None, False, 0)
+
+def get_story_timeline(story_id):
+    """Return the full timeline of a story as a list of update dicts."""
+    if not DB_ENABLED:
+        return None
+    story = db_execute("""
+        SELECT id, title, category, status, place, event_type, update_count, first_seen, last_update
+        FROM stories WHERE id=%s
+    """, (story_id,), fetch="one")
+    if not story:
+        return None
+    updates = db_execute("""
+        SELECT headline, summary, source, created_at
+        FROM story_updates WHERE story_id=%s ORDER BY created_at ASC
+    """, (story_id,), fetch="all") or []
+    return {
+        "id": story[0], "title": story[1], "category": story[2], "status": story[3],
+        "place": story[4], "event_type": story[5], "update_count": story[6],
+        "first_seen": story[7], "last_update": story[8],
+        "updates": [{"headline": u[0], "summary": u[1], "source": u[2], "time": u[3]} for u in updates]
+    }
+
+def search_stories(query, limit=5):
+    """Find stories matching a free-text query (by title keywords)."""
+    if not DB_ENABLED:
+        return []
+    # Pull recent stories and rank by keyword overlap
+    rows = db_execute("""
+        SELECT id, title, status, update_count, last_update, place, event_type
+        FROM stories
+        ORDER BY last_update DESC LIMIT 100
+    """, fetch="all") or []
+    q_words = set(_dup_keywords(query))
+    scored = []
+    for sid, title, status, ucount, last_up, place, event in rows:
+        t_words = set(_dup_keywords(title))
+        overlap = len(q_words & t_words)
+        # Boost if place or event type mentioned in query
+        ql = query.lower()
+        if place and place.lower() in ql: overlap += 2
+        if event and event in ql: overlap += 2
+        if overlap > 0:
+            scored.append((overlap, sid, title, status, ucount, last_up))
+    scored.sort(reverse=True)
+    return [{"id": s[1], "title": s[2], "status": s[3],
+             "update_count": s[4], "last_update": s[5]} for s in scored[:limit]]
+
+def get_active_stories(limit=10):
+    """List currently developing/active stories."""
+    if not DB_ENABLED:
+        return []
+    rows = db_execute("""
+        SELECT id, title, status, update_count, last_update, place, event_type
+        FROM stories
+        WHERE status IN ('active','developing')
+          AND last_update > NOW() - INTERVAL '72 hours'
+          AND update_count >= 2
+        ORDER BY update_count DESC, last_update DESC
+        LIMIT %s
+    """, (limit,), fetch="all") or []
+    return [{"id": r[0], "title": r[1], "status": r[2], "update_count": r[3],
+             "last_update": r[4], "place": r[5], "event_type": r[6]} for r in rows]
 
 # ── Source Reliability Scoring ────────────────────────────────────────────────
 # Higher = more trusted. Used as a tie-breaker and a scoring boost so a direct
@@ -2072,6 +2274,21 @@ def post_article(article, seen, social_only=False, allow_social=True):
     # Stash cluster info on the article so the card can show "X sources reporting"
     article["_cluster_size"] = cluster_size
     article["_cluster_sources"] = cluster_sources
+
+    # ── STORY INTELLIGENCE — attach this article to a story thread ──
+    try:
+        story_id, is_new_story, update_num = find_or_create_story(
+            article["title"], cat, article["id"],
+            article.get("summary", ""), article.get("source", ""), article.get("link", "")
+        )
+        article["_story_id"] = story_id
+        article["_story_update_num"] = update_num
+        article["_story_is_new"] = is_new_story
+        # If this is an update to an existing developing story, notify core team
+        if story_id and not is_new_story and update_num >= 2:
+            log.info(f"📚 This is update #{update_num} to Story #{story_id}")
+    except Exception as e:
+        log.debug(f"Story attach: {e}")
 
     # ── English BREAKING: publish instantly, no approval ──
     if breaking and not is_dv:
@@ -4605,6 +4822,43 @@ def chat_with_gemini_dhivehi(user_message, context="", conversation_history=None
         log.error(f"Gemini Dhivehi chat error: {e}")
     return None
 
+def answer_story_query(message):
+    """
+    If the message is asking about a past event ('what happened with the ferry'),
+    search stories and return a formatted timeline answer. Returns None if no match.
+    """
+    if not DB_ENABLED:
+        return None
+    ml = message.lower()
+    # Triggers that suggest someone is asking about an ongoing/past event
+    triggers = ["what happened", "what's happening", "whats happening", "update on",
+                "latest on", "any news on", "any update", "tell me about the",
+                "what about the", "story of", "develop", "kobaa", "vaahaka"]
+    if not any(t in ml for t in triggers):
+        return None
+
+    matches = search_stories(message, limit=3)
+    if not matches:
+        return None
+
+    best = matches[0]
+    timeline = get_story_timeline(best["id"])
+    if not timeline or timeline["update_count"] < 2:
+        return None
+
+    from datetime import timedelta as _td
+    lines = [f"📚 <b>{timeline['title']}</b>",
+             f"<i>Story #{timeline['id']} · {timeline['update_count']} updates · {timeline['status']}</i>\n"]
+    for u in timeline["updates"]:
+        t = u["time"]
+        tstr = (t + _td(hours=5)).strftime("%d %b %H:%M") if t else ""
+        src = f" ({u['source']})" if u["source"] else ""
+        lines.append(f"🔹 <b>{tstr}</b>{src} — {u['headline'][:90]}")
+    if len(matches) > 1:
+        lines.append(f"\n<i>Also tracking: " +
+                     ", ".join(f"#{m['id']}" for m in matches[1:]) + " — use /story [id]</i>")
+    return "\n".join(lines)
+
 def chat_with_claude(user_message, user_id=None):
     try:
         # Run headlines + web search in parallel to cut latency
@@ -4926,7 +5180,11 @@ def handle_updates():
                             log.info(f"🚫 DM rate limit hit: {display_name} ({user_id})")
                         else:
                             log.info(f"💬 DM {display_name} [{count}/{limit}]: {text[:50]}")
-                            if is_dhivehi(text):
+                            # Check for story-timeline questions first
+                            story_answer = answer_story_query(text)
+                            if story_answer:
+                                send_text(chat_id, story_answer, reply_to=msg_id, thread_id=thread_id)
+                            elif is_dhivehi(text):
                                 log.info("🇲🇻 Dhivehi detected — using Gemini")
                                 headlines = get_local_headlines()
                                 context = "\n".join(headlines[:5]) if headlines else ""
@@ -4937,9 +5195,10 @@ def handle_updates():
                                     add_to_conversation(user_id, "assistant", reply)
                                 else:
                                     reply = chat_with_claude(text, user_id)
+                                    send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
                             else:
                                 reply = chat_with_claude(text, user_id)
-                            send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
+                                send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
 
                 elif chat_type in ["group","supergroup"]:
                     is_core_team = str(chat_id) == CORE_TEAM_CHAT_ID
@@ -5106,6 +5365,52 @@ def handle_updates():
                                 except Exception as e:
                                     log.error(f"/stats: {e}")
                                     send_text(chat_id, f"❌ Stats error: {e}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /stories — list active developing story threads
+                        elif text.strip().lower() in ["/stories", "/developing"]:
+                            if not DB_ENABLED:
+                                send_text(chat_id, "🗄️ Database not connected — story tracking unavailable.", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                stories = get_active_stories(10)
+                                if not stories:
+                                    send_text(chat_id, "📚 No active developing stories right now. Stories appear here once an event gets 2+ updates.", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    lines = ["📚 <b>Developing Stories — Last 72h</b>\n"]
+                                    for s in stories:
+                                        status_emoji = "🔴" if s["status"]=="developing" else "🟡"
+                                        lines.append(f"{status_emoji} <b>Story #{s['id']}</b> ({s['update_count']} updates)\n   {s['title'][:70]}")
+                                    lines.append("\n<i>Use /story [number] to see the full timeline.</i>")
+                                    send_text(chat_id, "\n".join(lines), reply_to=msg_id, thread_id=thread_id)
+
+                        # /story <id> — show the full timeline of a story
+                        elif text.strip().lower().startswith("/story"):
+                            arg = text.strip()[6:].strip()
+                            if not DB_ENABLED:
+                                send_text(chat_id, "🗄️ Database not connected — story tracking unavailable.", reply_to=msg_id, thread_id=thread_id)
+                            elif not arg.isdigit():
+                                send_text(chat_id, "Use <code>/story [number]</code> — e.g. <code>/story 248</code>. See /stories for the list.", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                timeline = get_story_timeline(int(arg))
+                                if not timeline:
+                                    send_text(chat_id, f"No story found with ID #{arg}.", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    from datetime import timezone, timedelta as _td
+                                    lines = [f"📚 <b>Story #{timeline['id']} — {timeline['status'].upper()}</b>\n"]
+                                    lines.append(f"<b>{timeline['title']}</b>")
+                                    lines.append(f"<i>{timeline['update_count']} updates · {timeline['category'] or 'news'}</i>\n")
+                                    lines.append("<b>Timeline:</b>")
+                                    for u in timeline["updates"]:
+                                        t = u["time"]
+                                        if t:
+                                            mvt = (t + _td(hours=5)) if t.tzinfo else t
+                                            tstr = mvt.strftime("%d %b %H:%M")
+                                        else:
+                                            tstr = ""
+                                        src = f" ({u['source']})" if u["source"] else ""
+                                        lines.append(f"🔹 <b>{tstr}</b>{src}\n   {u['headline'][:90]}")
+                                    out = "\n".join(lines)
+                                    if len(out) > 4000: out = out[:3990] + "\n…"
+                                    send_text(chat_id, out, reply_to=msg_id, thread_id=thread_id)
 
                         # /trends — what Maldives is talking about right now
                         elif text.strip().lower() in ["/trends", "/trending"]:
@@ -5730,6 +6035,13 @@ def handle_updates():
 
                             def _reply_coreteam():
                                 try:
+                                    # First check if this is a story-timeline question
+                                    story_answer = answer_story_query(clean)
+                                    if story_answer:
+                                        send_text(chat_id, story_answer,
+                                                  reply_to=msg_id if tagged else None, thread_id=thread_id)
+                                        return
+
                                     if is_dhivehi(clean):
                                         headlines = get_local_headlines()
                                         ctx = "\n".join(headlines[:5]) if headlines else ""
