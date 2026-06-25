@@ -2596,7 +2596,6 @@ def _post_to_social_now(img_buf, caption):
         # ── 1. FACEBOOK — Meta Graph API with image ───────────────────────────
         if META_PAGE_TOKEN and META_PAGE_ID:
             try:
-                # Upload photo to FB page
                 photo_resp = requests.post(
                     f"https://graph.facebook.com/{META_API_VER}/{META_PAGE_ID}/photos",
                     data={"caption": post_text[:2000], "access_token": META_PAGE_TOKEN,
@@ -2608,10 +2607,14 @@ def _post_to_social_now(img_buf, caption):
                     results["Facebook"] = True
                     log.info(f"[SOCIAL] Facebook: ✅ id={photo_resp.json().get('id')}")
                 else:
-                    err = photo_resp.json().get("error",{}).get("message", photo_resp.text[:100])
-                    log.error(f"[SOCIAL] Facebook: ❌ {err}")
+                    err = photo_resp.json().get("error",{})
+                    err_msg = err.get("message", photo_resp.text[:150])
+                    err_code = err.get("code","?")
+                    log.error(f"[SOCIAL] Facebook: ❌ code={err_code} {err_msg}")
+                    _last_buffer_error["fb_error"] = f"code={err_code}: {err_msg}"
             except Exception as e:
                 log.error(f"[SOCIAL] Facebook: ❌ {e}")
+                _last_buffer_error["fb_error"] = str(e)[:100]
         else:
             log.warning("[SOCIAL] Facebook: skipped (no META_PAGE_TOKEN or META_PAGE_ID)")
 
@@ -2619,44 +2622,36 @@ def _post_to_social_now(img_buf, caption):
         if META_PAGE_TOKEN and META_IG_ID:
             try:
                 ig_id = META_IG_ID
-                if not ig_id:
-                    # Auto-resolve IG account linked to the page
-                    page_r = requests.get(
-                        f"https://graph.facebook.com/{META_API_VER}/{META_PAGE_ID}",
-                        params={"fields": "instagram_business_account", "access_token": META_PAGE_TOKEN},
-                        timeout=10)
-                    ig_id = page_r.json().get("instagram_business_account", {}).get("id", "")
-
-                if ig_id:
-                    # Step 1: upload image to get container ID
-                    # IG requires a public URL — use imgbb
-                    image_url = upload_to_imgbb(io.BytesIO(img_bytes))
-                    if image_url:
-                        container_r = requests.post(
-                            f"https://graph.facebook.com/{META_API_VER}/{ig_id}/media",
-                            data={"image_url": image_url, "caption": post_text[:2200],
-                                  "access_token": META_PAGE_TOKEN},
+                image_url = upload_to_imgbb(io.BytesIO(img_bytes))
+                if image_url:
+                    container_r = requests.post(
+                        f"https://graph.facebook.com/{META_API_VER}/{ig_id}/media",
+                        data={"image_url": image_url, "caption": post_text[:2200],
+                              "access_token": META_PAGE_TOKEN},
+                        timeout=20)
+                    container_data = container_r.json()
+                    container_id = container_data.get("id")
+                    if container_id:
+                        pub_r = requests.post(
+                            f"https://graph.facebook.com/{META_API_VER}/{ig_id}/media_publish",
+                            data={"creation_id": container_id, "access_token": META_PAGE_TOKEN},
                             timeout=20)
-                        container_id = container_r.json().get("id")
-                        if container_id:
-                            # Step 2: publish the container
-                            pub_r = requests.post(
-                                f"https://graph.facebook.com/{META_API_VER}/{ig_id}/media_publish",
-                                data={"creation_id": container_id, "access_token": META_PAGE_TOKEN},
-                                timeout=20)
-                            if pub_r.json().get("id"):
-                                results["Instagram"] = True
-                                log.info(f"[SOCIAL] Instagram: ✅")
-                            else:
-                                log.error(f"[SOCIAL] Instagram publish: {pub_r.json()}")
+                        if pub_r.json().get("id"):
+                            results["Instagram"] = True
+                            log.info("[SOCIAL] Instagram: ✅")
                         else:
-                            log.error(f"[SOCIAL] Instagram container: {container_r.json()}")
+                            err = pub_r.json().get("error",{})
+                            log.error(f"[SOCIAL] Instagram publish: code={err.get('code','?')} {err.get('message',pub_r.text[:100])}")
+                            _last_buffer_error["ig_error"] = f"publish: {err.get('message','?')[:100]}"
                     else:
-                        log.error("[SOCIAL] Instagram: imgbb upload failed")
+                        err = container_data.get("error",{})
+                        log.error(f"[SOCIAL] Instagram container: code={err.get('code','?')} {err.get('message',str(container_data)[:100])}")
+                        _last_buffer_error["ig_error"] = f"container: {err.get('message','?')[:100]}"
                 else:
-                    log.warning("[SOCIAL] Instagram: no IG account ID found")
+                    log.error("[SOCIAL] Instagram: imgbb upload failed")
             except Exception as e:
                 log.error(f"[SOCIAL] Instagram: ❌ {e}")
+                _last_buffer_error["ig_error"] = str(e)[:100]
         else:
             log.warning("[SOCIAL] Instagram: skipped (no META_IG_ID)")
 
@@ -6528,9 +6523,13 @@ def handle_updates():
                                     except Exception as e:
                                         lines.append(f"\n🐦 <b>X/Twitter:</b> ❌ {str(e)[:60]}")
 
-                                # 4. Last Buffer response
-                                last = _last_buffer_error.get("response","No posts attempted yet")
-                                lines.append(f"\n🔎 <b>Last Buffer response:</b>\n<code>{last[:150]}</code>")
+                                # 4. Last errors
+                                lines.append(f"\n🔎 <b>Last Buffer (X) response:</b>")
+                                lines.append(f"<code>{_last_buffer_error.get('response','No posts yet')[:150]}</code>")
+                                if _last_buffer_error.get("fb_error"):
+                                    lines.append(f"\n❌ <b>Last FB error:</b> <code>{_last_buffer_error['fb_error'][:150]}</code>")
+                                if _last_buffer_error.get("ig_error"):
+                                    lines.append(f"\n❌ <b>Last IG error:</b> <code>{_last_buffer_error['ig_error'][:150]}</code>")
                                 send_text(_cid, "\n".join(lines), thread_id=_tid)
                             threading.Thread(target=_buffercheck, daemon=True).start()
 
