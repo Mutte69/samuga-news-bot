@@ -6129,18 +6129,34 @@ def handle_updates():
                                         threading.Thread(target=_process_dv, daemon=True).start()
                                         ok = True  # optimistic — thread handles actual result
                                     else:
-                                        # English — publish + report per platform back to Content Lab
-                                        tg_ok, social_res = _publish_now(
-                                            item["card_bytes"], item["caption"], item["cat"],
-                                            item["title"], item["link"],
-                                            is_breaking_flag=item.get("is_breaking", False),
-                                            allow_social=item.get("allow_social", True),
-                                            rewritten=item.get("rewritten",""),
-                                            summary=item.get("summary",""),
-                                            report_to=(chat_id, thread_id),
-                                            article_id=item.get("article_id")
-                                        )
-                                        ok = tg_ok
+                                        # English — queue for Telegram + social (10-min gap)
+                                        # EXCEPT breaking which fires immediately
+                                        is_breaking_card = item.get("is_breaking", False)
+                                        if is_breaking_card:
+                                            # Breaking bypasses queue — fires to all platforms now
+                                            tg_ok, social_res = _publish_now(
+                                                item["card_bytes"], item["caption"], item["cat"],
+                                                item["title"], item["link"],
+                                                is_breaking_flag=True,
+                                                allow_social=item.get("allow_social", True),
+                                                rewritten=item.get("rewritten",""),
+                                                summary=item.get("summary",""),
+                                                report_to=(chat_id, thread_id),
+                                                article_id=item.get("article_id")
+                                            )
+                                            ok = tg_ok
+                                        else:
+                                            # Regular — joins queue with 10-min gap
+                                            buf = io.BytesIO(item["card_bytes"])
+                                            queue_for_social(
+                                                buf, item["caption"],
+                                                notify_chat_id=chat_id,
+                                                notify_thread_id=thread_id,
+                                                key_label=key.upper(),
+                                                tg_ok=False,
+                                                post_telegram=True
+                                            )
+                                            ok = True
 
                                     # DV cards handled entirely in background thread above
                                     if item.get("lang") == "dv":
