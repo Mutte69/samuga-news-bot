@@ -1412,22 +1412,19 @@ def fetch_mvcrisis():
         for raw in texts[:15]:
             text = _re.sub(r"<[^>]+>", "", raw).strip()
             text = text.replace("&amp;","&").replace("&#39;","'").replace("&quot;",'"')
-            if len(text) < 25: continue  # too short to be real news
-            # Skip ads/promos
+            if len(text) < 25: continue
             if _looks_like_ad(text):
                 skipped_ads += 1
                 continue
             art_id = "mvc_" + hashlib.md5(text[:60].encode()).hexdigest()[:8]
             lang = "dv" if any("ހ" <= ch <= "޿" for ch in text) else "en"
-            # Don't force DISASTER — let is_breaking() + category logic decide.
-            # MvCrisis posts default to LOCAL; only become BREAKING if keywords match.
             articles.append({
                 "id": art_id,
                 "title": text[:150],
                 "summary": text,
                 "link": "https://t.me/mvcrisis",
                 "source": "MvCrisis",
-                "cat": "LOCAL",   # was DISASTER — fixed: not everything is an emergency
+                "cat": "LOCAL",
                 "lang": lang,
                 "published": utcnow()
             })
@@ -1436,6 +1433,78 @@ def fetch_mvcrisis():
     except Exception as e:
         log.error(f"MvCrisis fetch: {e}")
         return []
+
+# ── Dhivehi Telegram channel scrapers ────────────────────────────────────────
+# Maldivian news sites block RSS with 403. Their Telegram channels are public
+# and scrapeable — same technique as MvCrisis. Each returns native Dhivehi text.
+
+DV_TELEGRAM_CHANNELS = [
+    {"handle": "mihaaru",      "source": "Mihaaru",  "reliability": 95},
+    {"handle": "avas_news",    "source": "Avas",     "reliability": 88},
+    {"handle": "vnewsmv",      "source": "VNews",    "reliability": 82},
+    {"handle": "raajjemv",     "source": "Raajje",   "reliability": 85},
+    {"handle": "thepress_mv",  "source": "ThePress", "reliability": 80},
+]
+
+def fetch_dv_telegram(handle, source, reliability=80):
+    """
+    Scrape a public Telegram channel for Dhivehi news.
+    Returns articles with lang='dv' where Thaana script is detected,
+    or lang='en' for mixed-language posts.
+    """
+    try:
+        url = f"https://t.me/s/{handle}"
+        resp = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code != 200:
+            log.debug(f"[FETCH] {source} Telegram: HTTP {resp.status_code}")
+            return []
+        import re as _re
+        texts = _re.findall(
+            r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
+            resp.text, _re.DOTALL)
+        articles = []
+        for raw in texts[:12]:
+            text = _re.sub(r"<[^>]+>", "", raw).strip()
+            text = (text.replace("&amp;","&").replace("&#39;","'")
+                    .replace("&quot;",'"').replace("&lt;","<").replace("&gt;",">"))
+            if len(text) < 20: continue
+            if _looks_like_ad(text): continue
+            # Detect language from Thaana script presence
+            dv_chars = sum(1 for ch in text if "ހ" <= ch <= "޿")
+            lang = "dv" if dv_chars > 5 else "en"
+            art_id = f"tg_{handle}_" + hashlib.md5(text[:60].encode()).hexdigest()[:8]
+            articles.append({
+                "id":          art_id,
+                "title":       text[:150],
+                "summary":     text,
+                "link":        f"https://t.me/{handle}",
+                "source":      source,
+                "cat":         "LOCAL",
+                "lang":        lang,
+                "reliability": reliability,
+                "published":   utcnow()
+            })
+        log.info(f"[FETCH] {source} Telegram: {len(articles)} items")
+        return articles
+    except Exception as e:
+        log.error(f"[FETCH] {source} Telegram: {e}")
+        return []
+
+def fetch_all_dv_channels():
+    """Fetch all Dhivehi Telegram channels in parallel threads."""
+    results = []
+    lock = threading.Lock()
+
+    def _fetch(ch):
+        arts = fetch_dv_telegram(ch["handle"], ch["source"], ch["reliability"])
+        with lock:
+            results.extend(arts)
+
+    threads = [threading.Thread(target=_fetch, args=(ch,), daemon=True)
+               for ch in DV_TELEGRAM_CHANNELS]
+    for t in threads: t.start()
+    for t in threads: t.join(timeout=15)
+    return results
 
 def _feed_source_name(url):
     """Map a feed URL to a clean source name for reliability scoring + display."""
@@ -1453,12 +1522,20 @@ def _feed_source_name(url):
     if "oneonline" in u:       return "One Online"
     if "maldivesvoice" in u:   return "Maldives Voice"
     if "visitmaldives" in u:   return "Visit Maldives"
+    if "vnewsmv" in u:         return "VNews"
+    if "raajjemv" in u:        return "Raajje"
+    if "thepress_mv" in u:     return "ThePress"
     return ""
 
 def fetch_news():
     articles, seen_titles = [], set()
     # MvCrisis first — #1 Maldives breaking news source
     for a in fetch_mvcrisis():
+        if a["title"] not in seen_titles:
+            seen_titles.add(a["title"])
+            articles.append(a)
+    # Dhivehi Telegram channels — native Dhivehi content from Mihaaru, Avas, VNews etc
+    for a in fetch_all_dv_channels():
         if a["title"] not in seen_titles:
             seen_titles.add(a["title"])
             articles.append(a)
@@ -2407,6 +2484,30 @@ def post_article(article, seen, social_only=False, allow_social=True):
         approval_queue[key]["_trend_theme"] = article.get("_trend_theme", "")
         _send_approval_card(key, approval_queue[key])
         db_mark_status(article["id"], "queued")
+
+        # ── Auto-generate Dhivehi version in background ──────────────────────
+        # Every English article also gets a Dhivehi card queued for approval.
+        # Runs in a thread so it doesn't delay the English card.
+        if GEMINI_API_KEY:
+            def _auto_dv(_rewritten=rewritten, _title=article["title"],
+                         _link=article["link"], _cat=cat, _keyword=keyword,
+                         _source=article.get("source","LOCAL")):
+                try:
+                    dv_text = make_dhivehi_caption(_rewritten, _title)
+                    if not dv_text:
+                        log.debug(f"[AI] Auto-Dhivehi: Gemini returned nothing for {_title[:40]}")
+                        return
+                    dv_key = store_pending_approval(
+                        None, None, _title, _link, cat=_cat, lang="dv",
+                        dv_text=dv_text, keyword=_keyword, source=_source,
+                        is_breaking=breaking, allow_social=allow_social
+                    )
+                    _send_approval_card(dv_key, approval_queue[dv_key])
+                    log.info(f"[AI] Auto-Dhivehi queued: {_title[:50]}")
+                except Exception as e:
+                    log.debug(f"[AI] Auto-Dhivehi: {e}")
+            threading.Thread(target=_auto_dv, daemon=True).start()
+
         return True
     except Exception as e:
         log.error(f"English approval queue: {e}")
@@ -5522,25 +5623,32 @@ def handle_updates():
                                             lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ❌ No response (check key/quota)")
                                     else:
                                         lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ❌ GEMINI_API_KEY not set")
-                                    # 2. Dhivehi feed check
+                                    # 2. Dhivehi feed check (RSS — expected to fail, kept for reference)
                                     dv_feeds = [f for f in LOCAL_FEEDS if f.get("lang")=="dv"]
-                                    lines.append(f"\n📡 <b>Dhivehi feeds ({len(dv_feeds)}):</b>")
+                                    lines.append(f"\n📡 <b>Dhivehi RSS feeds ({len(dv_feeds)}) — now replaced by Telegram:</b>")
                                     for f in dv_feeds:
                                         try:
                                             parsed = feedparser.parse(f["url"])
                                             n = len(parsed.entries)
                                             domain = f["url"].split("/")[2]
-                                            if n > 0:
-                                                lines.append(f"  ✅ {domain}: {n} items")
-                                            else:
-                                                lines.append(f"  ⚠️ {domain}: 0 items (empty/blocked)")
+                                            status = f"✅ {n} items" if n > 0 else "❌ 0 items (blocked/down)"
+                                            lines.append(f"  {status} — {domain}")
                                         except Exception as fe:
-                                            lines.append(f"  ❌ {f['url'].split('/')[2]}: {str(fe)[:30]}")
-                                    # 3. Queue state
+                                            lines.append(f"  ❌ {f['url'].split('/')[2]}: error")
+                                    # 3. Telegram Dhivehi channels
+                                    lines.append(f"\n📲 <b>Dhivehi Telegram channels:</b>")
+                                    for ch in DV_TELEGRAM_CHANNELS:
+                                        try:
+                                            arts = fetch_dv_telegram(ch["handle"], ch["source"])
+                                            dv_count = sum(1 for a in arts if a["lang"]=="dv")
+                                            lines.append(f"  ✅ {ch['source']}: {len(arts)} items ({dv_count} Dhivehi)")
+                                        except Exception as ce:
+                                            lines.append(f"  ❌ {ch['source']}: {str(ce)[:30]}")
+                                    # 4. Queue state
                                     dv_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="dv")
                                     en_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="en")
                                     lines.append(f"\n📋 <b>Approval queue:</b> {dv_queued} Dhivehi, {en_queued} English waiting")
-                                    # 4. Recent Dhivehi posts from DB
+                                    # 5. Recent Dhivehi posts from DB
                                     if DB_ENABLED:
                                         dv_posted = db_execute("SELECT COUNT(*) FROM articles WHERE lang='dv' AND status='posted' AND posted_at > NOW() - INTERVAL '7 days'", fetch="one")
                                         lines.append(f"📚 <b>Dhivehi posted (7d):</b> {dv_posted[0] if dv_posted else 0}")
