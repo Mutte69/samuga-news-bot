@@ -796,6 +796,15 @@ _poll_offset = [0]  # Telegram update offset — persisted so bot never misses m
 def persist_state():
     """Snapshot all volatile state to disk. Called after any meaningful change."""
     try:
+        # Serialize social queue (no image bytes — too large; just caption + queued_at)
+        sq_serialized = []
+        with _social_queue_lock:
+            for item in _social_queue:
+                sq_serialized.append({
+                    "img_bytes_b64": __import__("base64").b64encode(item["img_bytes"]).decode(),
+                    "caption": item["caption"],
+                    "queued_at": item["queued_at"].isoformat(),
+                })
         state = {
             "recent_story_titles": [(t, ts.isoformat()) for (t, ts) in recent_story_titles],
             "recent_posts": recent_posts[-50:],
@@ -806,9 +815,11 @@ def persist_state():
             "social_post_counts": _serialize_social_counts(),
             "polls_today": polls_today,
             "last_regular_post_time": last_regular_post_time.isoformat() if last_regular_post_time else None,
+            "last_social_post_time": _last_social_post_time.isoformat() if _last_social_post_time else None,
             "approval_counter": _approval_counter[0],
             "approval_queue": _serialize_approval_queue(),
             "poll_offset": _poll_offset[0],
+            "social_queue": sq_serialized,
         }
         _save_state(state)
     except Exception as e:
@@ -873,6 +884,26 @@ def restore_state():
 
         _approval_counter[0] = state.get("approval_counter", 0)
         _poll_offset[0] = state.get("poll_offset", 0)
+
+        # Restore social queue (posts that were waiting when bot restarted)
+        global _last_social_post_time
+        lspt = state.get("last_social_post_time")
+        if lspt:
+            try: _last_social_post_time = datetime.fromisoformat(lspt)
+            except Exception: pass
+        sq = state.get("social_queue", [])
+        if sq:
+            import base64 as _b64
+            with _social_queue_lock:
+                for item in sq:
+                    try:
+                        _social_queue.append({
+                            "img_bytes": _b64.b64decode(item["img_bytes_b64"]),
+                            "caption": item["caption"],
+                            "queued_at": datetime.fromisoformat(item["queued_at"]),
+                        })
+                    except Exception: pass
+            log.info(f"📲 Social queue restored: {len(_social_queue)} post(s) waiting")
 
         # Restore approval queue (with card images)
         for k, item in state.get("approval_queue", {}).items():
@@ -2299,6 +2330,8 @@ def _social_queue_worker():
             _last_social_post_time = utcnow()
             log.info(f"[SOCIAL] Draining queue — posting to FB+IG+X ({len(_social_queue)} remaining)")
             _post_to_social_now(io.BytesIO(item["img_bytes"]), item["caption"])
+            try: persist_state()
+            except Exception: pass
         except Exception as e:
             log.error(f"[SOCIAL] Queue worker: {e}")
 
@@ -2323,6 +2356,9 @@ def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=Non
             msg = f"📲 #{queue_len} in social queue — posts in ~{eta_min} min. {_get_queue_msg()}"
         send_text(notify_chat_id, msg, thread_id=notify_thread_id)
     log.info(f"[SOCIAL] Queued for socials (queue size: {queue_len})")
+    # Persist so queue survives restarts
+    try: persist_state()
+    except Exception: pass
 
 # Keep old name as the "post now" internal function
 def _post_to_social_now(img_buf, caption):
