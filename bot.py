@@ -2256,6 +2256,102 @@ mutation CreatePost($input: CreatePostInput!) {
         log.error(f"Buffer exception [{channel_id[:8]}]: {e}")
     return False
 
+# ── Social posting queue — 10 minute gap between posts ───────────────────────
+# Prevents flooding FB/IG/X when multiple cards are approved at once.
+# Each item: {"img_bytes": bytes, "caption": str, "queued_at": datetime}
+_social_queue = []
+_social_queue_lock = threading.Lock()
+_last_social_post_time = None
+SOCIAL_GAP_SECONDS = 600  # 10 minutes
+
+# Personality messages when a card joins the queue (rotates)
+QUEUE_PERSONALITY = [
+    "will post to socials in ~10 min. Even I need a breather. 😮‍💨",
+    "queued for socials. The algorithm likes it spaced out. Unlike Uly's approvals. 😅",
+    "going to socials in 10 minutes. Good things take time. 🕐",
+    "queued for socials. You're too bossy today, I need 10 minutes. 😤",
+    "will hit FB + IG + X in ~10 min. Quality over quantity. 💅",
+    "socials in 10 min. I'm tired, not lazy. There's a difference. 😴",
+    "queued for socials. Back-to-back posting is so 2022. ⏳",
+    "10 minute queue. The platforms will thank us. 🙏",
+    "socials coming in 10 min. I'm pacing myself unlike some people in this group. 👀",
+]
+
+def _get_queue_msg():
+    import random
+    return random.choice(QUEUE_PERSONALITY)
+
+def _social_queue_worker():
+    """Background thread — drains the social queue one post every 10 minutes."""
+    global _last_social_post_time
+    while True:
+        time.sleep(30)  # check every 30 seconds
+        try:
+            with _social_queue_lock:
+                if not _social_queue:
+                    continue
+                now = utcnow()
+                if (_last_social_post_time and
+                        (now - _last_social_post_time).total_seconds() < SOCIAL_GAP_SECONDS):
+                    continue  # not yet
+                item = _social_queue.pop(0)
+            # Post it
+            _last_social_post_time = utcnow()
+            log.info(f"[SOCIAL] Draining queue — posting to FB+IG+X ({len(_social_queue)} remaining)")
+            _post_to_social_now(io.BytesIO(item["img_bytes"]), item["caption"])
+        except Exception as e:
+            log.error(f"[SOCIAL] Queue worker: {e}")
+
+def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=None):
+    """
+    Add a card to the 10-minute social queue instead of posting immediately.
+    If notify_chat_id is given, sends a personality message to Content Lab.
+    """
+    global _last_social_post_time
+    img_bytes = img_buf.getvalue() if hasattr(img_buf, "getvalue") else img_buf
+    with _social_queue_lock:
+        _social_queue.append({"img_bytes": img_bytes, "caption": caption, "queued_at": utcnow()})
+        queue_len = len(_social_queue)
+
+    if notify_chat_id:
+        eta_min = queue_len * 10
+        if queue_len == 1 and (_last_social_post_time is None or
+                (utcnow()-_last_social_post_time).total_seconds() >= SOCIAL_GAP_SECONDS):
+            # First in queue and gap already passed — will go out very soon
+            msg = f"📲 {_get_queue_msg()}"
+        else:
+            msg = f"📲 #{queue_len} in social queue — posts in ~{eta_min} min. {_get_queue_msg()}"
+        send_text(notify_chat_id, msg, thread_id=notify_thread_id)
+    log.info(f"[SOCIAL] Queued for socials (queue size: {queue_len})")
+
+# Keep old name as the "post now" internal function
+def _post_to_social_now(img_buf, caption):
+    """Actually post to social — called only by the queue worker."""
+    if not BUFFER_TOKEN:
+        log.warning("Social: no BUFFER_TOKEN, skipping")
+        return
+    if not can_post_social():
+        log.info("[SOCIAL] Daily limit reached — skipping")
+        return
+    try:
+        img_bytes = img_buf.getvalue() if hasattr(img_buf, "getvalue") else img_buf
+        image_url = upload_to_imgbb(io.BytesIO(img_bytes))
+        if not image_url:
+            log.error("[SOCIAL] imgbb upload failed")
+            return
+        plain = re.sub(r"<[^>]+>", "", caption).strip()
+        channels = [
+            (BUFFER_FB_ID, "Facebook"),
+            (BUFFER_IG_ID, "Instagram"),
+            (BUFFER_TW_ID, "Twitter/X"),
+        ]
+        for ch_id, name in channels:
+            if ch_id:
+                ok = buffer_post_image(ch_id, image_url, plain)
+                log.info(f"[SOCIAL] {name}: {'✅' if ok else '❌'}")
+    except Exception as e:
+        log.error(f"[SOCIAL] post_to_social_now: {e}")
+
 def post_to_social(img_buf, caption):
     if not BUFFER_TOKEN:
         log.warning("Social: no BUFFER_TOKEN, skipping")
@@ -2381,8 +2477,8 @@ def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_
             # Synchronous — so we can tell the team what happened per platform
             social_results = post_to_social(social_buf, caption) or {}
         else:
-            # Background thread for automated posts (don't block)
-            threading.Thread(target=post_to_social, args=(social_buf, caption), daemon=True).start()
+            # Route through 10-minute queue — no flooding
+            queue_for_social(social_buf, caption)
 
     # Poll
     if tg_ok and should_create_poll(title, summary, cat):
@@ -4435,11 +4531,10 @@ def send_weather_alert(weather_data, level_key, alert_text):
         card.seek(0)
         send_photo(TELEGRAM_CHANNEL_ID, card, caption)
 
-        # ALL alert levels (White and up) post immediately to FB + IG + X
+        # ALL alert levels post immediately to FB + IG + X via queue
         try:
             card.seek(0)
-            threading.Thread(target=post_to_social,
-                             args=(io.BytesIO(card.getvalue()), caption), daemon=True).start()
+            queue_for_social(io.BytesIO(card.getvalue()), caption)
             log.info(f"📲 {cfg['label']} queued for FB + IG + X")
         except Exception as e:
             log.error(f"Alert social post: {e}")
@@ -4545,9 +4640,8 @@ def send_weather_update(time_of_day="morning"):
         # Post to social media (FB + IG + X) in background
         try:
             card.seek(0)
-            social_buf = io.BytesIO(card.getvalue())
-            threading.Thread(target=post_to_social, args=(social_buf, caption), daemon=True).start()
-            log.info(f"\U0001f4f1 Weather card queued for FB + IG + X ({time_of_day})")
+            queue_for_social(io.BytesIO(card.getvalue()), caption)
+            log.info(f"📲 Weather card queued for FB + IG + X ({time_of_day})")
         except Exception as e:
             log.error(f"Weather social post: {e}")
 
@@ -5777,10 +5871,13 @@ def handle_updates():
                                                         original_caption=_item.get("dv_text",""),
                                                         final_caption=(_corrected or _item.get("dv_text","")),
                                                         lang="dv")
-                                                    # Always post to all platforms (Telegram + FB + IG + X)
+                                                    # Always post to all platforms via 10-min queue
                                                     card.seek(0)
-                                                    threading.Thread(target=post_to_social,
-                                                        args=(io.BytesIO(card.getvalue()), full_caption), daemon=True).start()
+                                                    queue_for_social(
+                                                        io.BytesIO(card.getvalue()), full_caption,
+                                                        notify_chat_id=_cid,
+                                                        notify_thread_id=_tid
+                                                    )
                                                     send_text(_cid,
                                                         f"✅ <b>{_key.upper()}</b> posted to Telegram + FB + IG + X 🇲🇻",
                                                         thread_id=_tid)
@@ -6521,14 +6618,12 @@ def handle_updates():
                                         if send_to_telegram(tg_buf, cap):
                                             done.append("Telegram ✅")
 
-                                        # 2) Socials (FB + IG + Twitter) in background
+                                        # 2) Socials via 10-min queue
                                         social_buf = io.BytesIO(cbytes)
-                                        threading.Thread(
-                                            target=post_to_social,
-                                            args=(social_buf, cap),
-                                            daemon=True
-                                        ).start()
-                                        done.append("FB + IG + X ✅")
+                                        queue_for_social(social_buf, cap,
+                                            notify_chat_id=chat_id,
+                                            notify_thread_id=thread_id)
+                                        done.append("FB + IG + X ⏳ queued")
 
                                         _pending_manual_post.clear()
                                         send_text(chat_id,
@@ -6709,6 +6804,10 @@ if __name__ == "__main__":
     log.info("📚 Story Intelligence: timeline threads active")
     log.info("🧠 Core team brain: live newsroom awareness + persistent memory")
     log.info("💬 Smart chat: history, web search, Dhivehi support, story queries")
+
+    # Start social queue worker — drains one post every 10 minutes
+    threading.Thread(target=_social_queue_worker, daemon=True).start()
+    log.info("📲 Social queue worker started (10-min gap between posts)")
 
     init_database()  # connect to Postgres (falls back to JSON if unavailable)
     restore_state()  # bring back dedup memory, daily counters, pending cards, analytics
