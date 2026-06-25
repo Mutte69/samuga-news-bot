@@ -2552,6 +2552,87 @@ ISLAND_LOCATIONS = [
     {"name": "Dhidhdhoo",      "lat": 6.8833,   "lon": 73.1167},
 ]
 
+# ── Hijri special days — built-in for offline fallback ───────────────────────
+HIJRI_SPECIAL_DAYS = {
+    (1,  1):  ("Islamic New Year",        "The beginning of the Hijri year"),
+    (1, 10):  ("Day of Ashura",           "A day of fasting and reflection"),
+    (3, 12):  ("Mawlid al-Nabi",          "Birth of the Prophet ﷺ"),
+    (7, 27):  ("Isra and Mi'raj",         "The Night Journey of the Prophet ﷺ"),
+    (8, 15):  ("Shab-e-Barat",            "Night of forgiveness and blessings"),
+    (9,  1):  ("First Day of Ramadan",    "The blessed month of fasting begins"),
+    (9, 27):  ("Laylat al-Qadr",          "The Night of Power — better than 1000 months"),
+    (10, 1):  ("Eid al-Fitr",             "The festival of breaking the fast"),
+    (12, 9):  ("Day of Arafah",           "The greatest day — the day of Hajj"),
+    (12,10):  ("Eid al-Adha",             "The festival of sacrifice"),
+    (12,18):  ("Eid al-Ghadir",           "A blessed day of remembrance"),
+}
+
+def get_prayer_times():
+    """
+    Fetch today's prayer times + Hijri date for Malé, Maldives.
+    Uses AlAdhan API — completely free, no key needed.
+    Returns dict or None on failure.
+    """
+    try:
+        from datetime import timezone, timedelta as _td
+        mvt_now = datetime.now(timezone.utc) + _td(hours=5)
+        date_str = mvt_now.strftime("%d-%m-%Y")
+
+        # Method 4 = Umm al-Qura (standard across Maldives/Gulf)
+        url = (f"https://api.aladhan.com/v1/timingsByCity/{date_str}"
+               f"?city=Male&country=Maldives&method=4")
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            log.warning(f"Prayer times API: HTTP {resp.status_code}")
+            return None
+
+        d = resp.json().get("data", {})
+        timings = d.get("timings", {})
+        hijri   = d.get("date", {}).get("hijri", {})
+
+        # Extract prayer times (strip timezone suffix like "+05:00")
+        def clean_t(t): return t[:5] if t else "--:--"
+
+        prayers = {
+            "Fajr":    clean_t(timings.get("Fajr",    "")),
+            "Dhuhr":   clean_t(timings.get("Dhuhr",   "")),
+            "Asr":     clean_t(timings.get("Asr",     "")),
+            "Maghrib": clean_t(timings.get("Maghrib", "")),
+            "Isha":    clean_t(timings.get("Isha",    "")),
+        }
+
+        # Hijri date
+        h_day   = int(hijri.get("day", 0))
+        h_month = hijri.get("month", {}).get("number", 0)
+        h_month_name = hijri.get("month", {}).get("en", "")
+        h_year  = hijri.get("year", "")
+
+        # Special day — check API holidays first, then built-in dict
+        api_holidays = hijri.get("holidays", [])
+        special_name = api_holidays[0] if api_holidays else None
+        special_desc = ""
+
+        if not special_name:
+            key = (h_month, h_day)
+            if key in HIJRI_SPECIAL_DAYS:
+                special_name, special_desc = HIJRI_SPECIAL_DAYS[key]
+
+        log.info(f"🕌 Prayer times fetched — Hijri: {h_day} {h_month_name} {h_year}"
+                 + (f" | {special_name}" if special_name else ""))
+
+        return {
+            "prayers":      prayers,
+            "hijri_day":    h_day,
+            "hijri_month":  h_month_name,
+            "hijri_year":   h_year,
+            "special_name": special_name,
+            "special_desc": special_desc,
+        }
+
+    except Exception as e:
+        log.error(f"Prayer times: {e}")
+        return None
+
 def generate_outlook(hourly_slots, mvt_now):
     """
     Convert next 12 hours of Tomorrow.io hourly slots into a one-line outlook.
@@ -2949,12 +3030,12 @@ def draw_weather_icon(draw, code, x, y, size=40):
     else:  # Default cloud
         draw.ellipse([cx-s//2, cy-s//6, cx+s//2, cy+s//2], fill=(180,190,220,240))
 
-def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_data=None):
-    """Samuga branded weather card v3 — 2500x2500, cinematic, sea conditions."""
+def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_data=None, prayer_data=None):
+    """Samuga branded weather card v3 — 2500x3000, cinematic, sea conditions, prayer times, Hijri."""
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
     import math, io
 
-    W, H = 2500, (3000 if island_data else 2200)
+    W, H = 2500, (3600 if (island_data and prayer_data) else 3000 if island_data else 2600 if prayer_data else 2200)
     img = Image.new("RGB", (W, H), (0, 0, 0))
     draw = ImageDraw.Draw(img, "RGBA")
 
@@ -3120,14 +3201,14 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
     lcw = draw.textlength(loc, font=f_large)
     draw.text(((W-lcw)//2, loc_y), loc, font=f_large, fill=(255,255,255,230))
 
-    # ── WEATHER ICON — below location, above temperature ──────────────────────
-    icon_y = loc_y + 130   # clear gap below location text
-    draw_weather_icon(draw, code, W//2, icon_y, size=110)  # reduced from 180
+    # ── WEATHER ICON — sits cleanly between location and temperature ───────────
+    icon_y = loc_y + 120
+    draw_weather_icon(draw, code, W//2, icon_y, size=140)
 
     # ── TEMPERATURE ───────────────────────────────────────────────────────────
     temp_str = f"{temp}°"
     ttw2 = draw.textlength(temp_str, font=f_giant)
-    temp_y = icon_y + 160   # tight enough to feel connected, not overlapping
+    temp_y = icon_y + 200
     draw.text(((W-ttw2)//2, temp_y), temp_str, font=f_giant, fill=(255,255,255,255))
 
     # ── CONDITION ─────────────────────────────────────────────────────────────
@@ -3205,8 +3286,71 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
     div2 = sea_y + 10
     draw.line([(80,div2),(W-80,div2)], fill=(255,255,255,35), width=2)
 
+    # ── PRAYER TIMES (left) + HIJRI CALENDAR (right) ─────────────────────────
+    if prayer_data:
+        pr_y = div2 + 50
+        prayers  = prayer_data.get("prayers", {})
+        h_day    = prayer_data.get("hijri_day", "")
+        h_month  = prayer_data.get("hijri_month", "")
+        h_year   = prayer_data.get("hijri_year", "")
+        sp_name  = prayer_data.get("special_name", "")
+        sp_desc  = prayer_data.get("special_desc", "")
+
+        # ── LEFT: Prayer times ────────────────────────────────────────────────
+        px = 90
+        draw.text((px, pr_y), "PRAYER TIMES", font=f_xs, fill=(255,220,100,200))
+        draw.text((px+320, pr_y), "Malé, Maldives", font=f_xs, fill=(255,255,255,120))
+        pr_y += 52
+
+        prayer_order = [("Fajr","Fajr"),("Dhuhr","Dhuhr"),
+                        ("Asr","Asr"),("Maghrib","Maghrib"),("Isha","Isha")]
+        prayer_icons = {"Fajr":"☽","Dhuhr":"☀","Asr":"🌤","Maghrib":"🌅","Isha":"★"}
+        for name, key in prayer_order:
+            icon_ch = prayer_icons.get(name, "•")
+            draw.text((px, pr_y), f"{icon_ch}  {name}", font=f_small, fill=(255,255,255,220))
+            t_val = prayers.get(key, "--:--")
+            tw_p = int(draw.textlength(t_val, font=f_small))
+            draw.text((px + 500 - tw_p, pr_y), t_val, font=f_small, fill=(160,215,255,230))
+            pr_y += 90
+
+        # ── RIGHT: Hijri calendar ─────────────────────────────────────────────
+        rx = W // 2 + 80
+        ry = div2 + 50
+        draw.text((rx, ry), "HIJRI CALENDAR", font=f_xs, fill=(255,220,100,200))
+        ry += 52
+
+        # Big Hijri day number
+        h_day_str = str(h_day)
+        hdw = draw.textlength(h_day_str, font=F(220, True))
+        draw.text((rx, ry), h_day_str, font=F(220, True), fill=(255,255,255,240))
+        ry += 240
+
+        # Month + Year
+        draw.text((rx, ry), h_month, font=f_med, fill=(255,255,255,210))
+        ry += 70
+        draw.text((rx, ry), f"{h_year} AH", font=f_body, fill=(200,225,255,160))
+        ry += 60
+
+        # Special day box
+        if sp_name:
+            # Gold highlight box
+            box_pad = 16
+            box_w   = W - rx - 80
+            draw.rounded_rectangle(
+                [(rx-box_pad, ry), (rx+box_w, ry+100+box_pad*2)],
+                radius=16, fill=(60,45,0,160)
+            )
+            draw.text((rx, ry+box_pad), sp_name, font=F(36,True), fill=(255,220,80,255))
+            if sp_desc:
+                draw.text((rx, ry+box_pad+48), sp_desc, font=F(28), fill=(255,200,60,200))
+
+        div3 = div2 + 50 + 5*90 + 80  # prayer rows height + padding
+        draw.line([(80,div3),(W-80,div3)], fill=(255,255,255,35), width=2)
+    else:
+        div3 = div2
+
     # ── HOURLY STRIP — next 8 hours ───────────────────────────────────────────
-    hourly_y = div2 + 40
+    hourly_y = div3 + 40
     now_hour = mvt.hour
     slot_w = (W - 160) // 8
     displayed = 0
@@ -3415,7 +3559,7 @@ def send_weather_update(time_of_day="morning"):
         if not data:
             log.error("Weather: no data"); return
 
-        # Fetch island forecasts (5 islands — ~10 API calls, well within 500/day limit)
+        # Fetch island forecasts
         log.info("🏝️ Fetching island forecasts...")
         islands = get_island_forecasts()
         if islands:
@@ -3423,7 +3567,16 @@ def send_weather_update(time_of_day="morning"):
         else:
             log.warning("🏝️ No island forecast data — card will show Malé only")
 
-        card = generate_weather_card(data, island_data=islands if islands else None)
+        # Fetch prayer times + Hijri date
+        log.info("🕌 Fetching prayer times...")
+        prayer_info = get_prayer_times()
+        if prayer_info:
+            log.info(f"🕌 Prayer times fetched")
+        else:
+            log.warning("🕌 Prayer times unavailable")
+
+        card = generate_weather_card(data, island_data=islands if islands else None,
+                                     prayer_data=prayer_info)
         current  = data.get("current", {})
         daily_d  = data.get("daily", {})
         temp     = round(current.get("temperature_2m", 29))
@@ -4798,7 +4951,9 @@ def handle_updates():
                                         send_text(_chat_id, "❌ Weather data unavailable right now.", thread_id=_thread_id)
                                         return
                                     islands = get_island_forecasts()
-                                    card = generate_weather_card(data, island_data=islands if islands else None)
+                                    prayer_info = get_prayer_times()
+                                    card = generate_weather_card(data, island_data=islands if islands else None,
+                                                                 prayer_data=prayer_info)
                                     current = data.get("current", {})
                                     temp  = round(current.get("temperature_2m", 29))
                                     code  = current.get("weathercode", 0)
