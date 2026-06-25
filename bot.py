@@ -4744,7 +4744,7 @@ def send_weekly_analytics():
             + "<b>Social Posting:</b>" + chr(10)
             + "  Success: " + str(analytics["social_success"]) + chr(10)
             + "  Failed: " + str(analytics["social_fail"]) + chr(10) + chr(10)
-            + "<b>Bot:</b> Samuga News Bot v3.2" + chr(10)
+            + f"<b>Bot:</b> Samuga AI v{SAMUGA_VERSION}" + chr(10)
             + "Samuga Media | @samugacommunity"
         )
         # ── Phase 2: weekly engagement crunch + readiness ──
@@ -6264,7 +6264,7 @@ def handle_updates():
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("🚀 Samuga News Bot v6.2 starting (archive + learning + FB/IG insights)...")
+    log.info(f"🚀 Samuga AI v{SAMUGA_VERSION} starting (newsroom intelligence + story timelines + live brain)...")
     # Install Noto fonts for Thaana/Dhivehi support
     if not os.path.exists("/usr/share/fonts/truetype/noto/NotoSansThaana-Bold.ttf") and not os.path.exists("/app/NotoSansThaana-Bold.ttf"):
         try:
