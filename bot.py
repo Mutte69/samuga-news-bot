@@ -64,6 +64,7 @@ BUFFER_TOKEN        = os.environ.get("BUFFER_ACCESS_TOKEN", "")
 BUFFER_FB_ID        = os.environ.get("BUFFER_FACEBOOK_ID", "")
 BUFFER_IG_ID        = os.environ.get("BUFFER_INSTAGRAM_ID", "")
 BUFFER_TW_ID        = os.environ.get("BUFFER_TWITTER_ID", "")
+_last_buffer_error  = {"response": "No posts attempted yet"}
 # Meta Graph API — reads FB + IG engagement off your own page
 META_PAGE_TOKEN     = os.environ.get("META_PAGE_TOKEN", "")
 META_PAGE_ID        = os.environ.get("META_PAGE_ID", "")
@@ -2404,6 +2405,7 @@ mutation CreatePost($input: CreatePostInput!) {
             timeout=20
         )
         log.info(f"Buffer raw [{channel_id[:8]}]: {resp.status_code} | {resp.text[:400]}")
+        _last_buffer_error["response"] = f"HTTP {resp.status_code}: {resp.text[:300]}"
         if resp.status_code == 200:
             data = resp.json()
             if "errors" in data:
@@ -6381,30 +6383,47 @@ def handle_updates():
                                 except Exception as e:
                                     lines.append(f"🖼️ <b>imgbb:</b> ❌ {str(e)[:60]}")
                                     test_url = None
-                                # 2. Buffer token
+                                # 2. Buffer token — test with real GraphQL endpoint
                                 if not BUFFER_TOKEN:
                                     lines.append("\n📡 <b>Buffer:</b> ❌ BUFFER_ACCESS_TOKEN not set")
                                 else:
                                     try:
-                                        r = requests.get("https://api.buffer.com/1/user.json",
-                                            headers={"Authorization": f"Bearer {BUFFER_TOKEN}"},
+                                        # Use the same GraphQL query the bot actually uses
+                                        r = requests.post(
+                                            "https://api.buffer.com",
+                                            json={"query": "{ viewer { id name } }"},
+                                            headers={"Authorization": f"Bearer {BUFFER_TOKEN}",
+                                                     "Content-Type": "application/json"},
                                             timeout=10)
                                         if r.status_code == 200:
-                                            name = r.json().get("name","?")
-                                            lines.append(f"\n📡 <b>Buffer token:</b> ✅ Valid ({name})")
+                                            data = r.json()
+                                            if "errors" in data:
+                                                err = data["errors"][0].get("message","unknown")
+                                                if "401" in str(err) or "auth" in str(err).lower() or "token" in str(err).lower():
+                                                    lines.append(f"\n📡 <b>Buffer token:</b> ❌ EXPIRED/INVALID\n"
+                                                                 f"   buffer.com → Settings → Apps → regenerate token\n"
+                                                                 f"   Update BUFFER_ACCESS_TOKEN in Railway")
+                                                else:
+                                                    lines.append(f"\n📡 <b>Buffer token:</b> ⚠️ GraphQL error: {err[:80]}")
+                                            else:
+                                                name = data.get("data",{}).get("viewer",{}).get("name","?")
+                                                lines.append(f"\n📡 <b>Buffer token:</b> ✅ Valid (account: {name})")
                                         elif r.status_code == 401:
                                             lines.append(f"\n📡 <b>Buffer token:</b> ❌ EXPIRED\n"
                                                          f"   buffer.com → Settings → Apps → regenerate token\n"
                                                          f"   Update BUFFER_ACCESS_TOKEN in Railway")
                                         else:
-                                            lines.append(f"\n📡 <b>Buffer token:</b> ⚠️ HTTP {r.status_code}")
+                                            lines.append(f"\n📡 <b>Buffer token:</b> ⚠️ HTTP {r.status_code}: {r.text[:100]}")
                                     except Exception as e:
-                                        lines.append(f"\n📡 <b>Buffer:</b> ❌ {str(e)[:60]}")
+                                        lines.append(f"\n📡 <b>Buffer:</b> ❌ {str(e)[:80]}")
                                 # 3. Channel IDs
                                 lines.append("\n📋 <b>Channel IDs configured:</b>")
                                 lines.append(f"  FB: {'✅' if BUFFER_FB_ID else '❌ not set'}")
                                 lines.append(f"  IG: {'✅' if BUFFER_IG_ID else '❌ not set'}")
                                 lines.append(f"  X:  {'✅' if BUFFER_TW_ID else '❌ not set'}")
+                                # 4. Last actual Buffer API response
+                                lines.append(f"\n🔎 <b>Last Buffer API response:</b>")
+                                lines.append(f"<code>{_last_buffer_error.get('response','None yet')[:200]}</code>")
                                 send_text(_cid, "\n".join(lines), thread_id=_tid)
                             threading.Thread(target=_buffercheck, daemon=True).start()
 
