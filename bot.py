@@ -2684,8 +2684,18 @@ def get_weather_data():
                     daily_min.append(v.get("temperatureMin", 26))
                     daily_wmo.append(_tomorrow_code_to_wmo(v.get("weatherCodeMax", 1000)))
                     sr = v.get("sunriseTime", ""); ss = v.get("sunsetTime", "")
-                    if sr: sunrise_str = sr[11:16]
-                    if ss: sunset_str  = ss[11:16]
+                    if sr:
+                        from datetime import datetime as _dt, timezone as _tz, timedelta as _td2
+                        try:
+                            sr_utc = _dt.fromisoformat(sr.replace("Z","+00:00"))
+                            sunrise_str = (sr_utc + _td2(hours=5)).strftime("%H:%M")
+                        except: sunrise_str = sr[11:16]
+                    if ss:
+                        from datetime import datetime as _dt, timezone as _tz, timedelta as _td2
+                        try:
+                            ss_utc = _dt.fromisoformat(ss.replace("Z","+00:00"))
+                            sunset_str = (ss_utc + _td2(hours=5)).strftime("%H:%M")
+                        except: sunset_str = ss[11:16]
                 daily = {
                     "temperature_2m_max": daily_max or [32],
                     "temperature_2m_min": daily_min or [26],
@@ -2834,8 +2844,18 @@ def get_island_forecasts():
                     daily_wmo.append(_tomorrow_code_to_wmo(v.get("weatherCodeMax", 1000)))
                     sr = v.get("sunriseTime", "")
                     ss = v.get("sunsetTime", "")
-                    if sr: sunrise_str = sr[11:16]
-                    if ss: sunset_str  = ss[11:16]
+                    if sr:
+                        from datetime import datetime as _dt, timedelta as _td2
+                        try:
+                            sr_utc = _dt.fromisoformat(sr.replace("Z","+00:00"))
+                            sunrise_str = (sr_utc + _td2(hours=5)).strftime("%H:%M")
+                        except: sunrise_str = sr[11:16]
+                    if ss:
+                        from datetime import datetime as _dt, timedelta as _td2
+                        try:
+                            ss_utc = _dt.fromisoformat(ss.replace("Z","+00:00"))
+                            sunset_str = (ss_utc + _td2(hours=5)).strftime("%H:%M")
+                        except: sunset_str = ss[11:16]
 
                 daily = {
                     "temperature_2m_max": daily_max or [32],
@@ -3096,18 +3116,18 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
 
     # ── LOCATION ──────────────────────────────────────────────────────────────
     loc = "Malé, Maldives"
-    loc_y = 220
+    loc_y = 240
     lcw = draw.textlength(loc, font=f_large)
     draw.text(((W-lcw)//2, loc_y), loc, font=f_large, fill=(255,255,255,230))
 
-    # ── BIG WEATHER ICON — between location and temperature ───────────────────
-    icon_y = loc_y + 110
-    draw_weather_icon(draw, code, W//2, icon_y, size=180)
+    # ── WEATHER ICON — below location, above temperature ──────────────────────
+    icon_y = loc_y + 130   # clear gap below location text
+    draw_weather_icon(draw, code, W//2, icon_y, size=110)  # reduced from 180
 
     # ── TEMPERATURE ───────────────────────────────────────────────────────────
     temp_str = f"{temp}°"
     ttw2 = draw.textlength(temp_str, font=f_giant)
-    temp_y = icon_y + 200
+    temp_y = icon_y + 160   # tight enough to feel connected, not overlapping
     draw.text(((W-ttw2)//2, temp_y), temp_str, font=f_giant, fill=(255,255,255,255))
 
     # ── CONDITION ─────────────────────────────────────────────────────────────
