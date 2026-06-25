@@ -1042,6 +1042,25 @@ def _detect_event_type(title):
             return ev
     return None
 
+def _notify_developing_story(story_id, title, source_count, source_list):
+    """
+    Proactively ping Content Lab when a story is confirmed by multiple sources.
+    This is the bot acting like an editor: 'this is becoming today's lead story'.
+    """
+    try:
+        msg = (
+            f"🔥 <b>Developing Story Alert</b>\n\n"
+            f"<b>{title[:100]}</b>\n\n"
+            f"This story is now confirmed by <b>{source_count} sources</b> "
+            f"({source_list}).\n"
+            f"It's likely becoming a lead story today.\n\n"
+            f"📚 Full timeline: <code>/story {story_id}</code>"
+        )
+        send_text(CORE_TEAM_CHAT_ID, msg, thread_id=CONTENT_LAB_THREAD_ID)
+        log.info(f"🔥 Proactive alert sent: Story #{story_id} ({source_count} sources)")
+    except Exception as e:
+        log.debug(f"Notify developing story: {e}")
+
 def find_or_create_story(title, category, article_id, summary, source, link):
     """
     Find an existing active story this article belongs to, or create a new one.
@@ -1110,6 +1129,21 @@ def find_or_create_story(title, category, article_id, summary, source, link):
                              (matched_id,), fetch="one")
             update_num = cnt[0] if cnt else 1
             log.info(f"📚 Story #{matched_id} updated (update #{update_num}): {title[:50]}")
+
+            # ── PROACTIVE ALERT — story just crossed 3 updates = likely lead story ──
+            # Fires exactly once, when update_count hits 3, so we don't spam.
+            if update_num == 3:
+                try:
+                    # Count distinct sources on this story
+                    src_rows = db_execute("""
+                        SELECT DISTINCT source FROM story_updates WHERE story_id=%s AND source IS NOT NULL
+                    """, (matched_id,), fetch="all") or []
+                    sources = [s[0] for s in src_rows if s[0]]
+                    src_list = ", ".join(sources[:5]) if sources else "multiple outlets"
+                    _notify_developing_story(matched_id, title, len(sources), src_list)
+                except Exception as e:
+                    log.debug(f"Proactive alert: {e}")
+
             return (matched_id, False, update_num)
         else:
             # Create a new story
@@ -2434,8 +2468,44 @@ def post_article(article, seen, social_only=False, allow_social=True):
     except Exception as e:
         log.debug(f"Story attach: {e}")
 
-    # ── English BREAKING: publish instantly, no approval ──
+    # ── Confidence gate — high-priority but unconfirmed news gets held ──
+    priority = score_article(article)
+    confidence, conf_reasons = confidence_score(article)
+    article["_priority"] = priority
+    article["_confidence"] = confidence
+    hold, hold_reason = should_hold_for_review(priority, confidence, breaking)
+
+    # ── English BREAKING: publish instantly UNLESS confidence too low ──
     if breaking and not is_dv:
+        if hold:
+            # Don't auto-post — queue for review with a warning instead
+            log.info(f"🛑 Breaking held for review: {hold_reason} — {article['title'][:50]}")
+            try:
+                card_bytes, caption, rewritten, keyword = _build_card_and_caption(article)
+                key = store_pending_approval(
+                    card_bytes, caption, article["title"], article["link"], cat=cat, lang="en",
+                    dv_text=None, keyword=keyword, source=article.get("source","LOCAL"),
+                    is_breaking=True, allow_social=allow_social
+                )
+                approval_queue[key]["rewritten"] = rewritten
+                approval_queue[key]["summary"] = article.get("summary","")
+                approval_queue[key]["article_id"] = article["id"]
+                approval_queue[key]["_cluster_size"] = article.get("_cluster_size", 1)
+                approval_queue[key]["_confidence"] = confidence
+                approval_queue[key]["_hold_reason"] = hold_reason
+                _send_approval_card(key, approval_queue[key])
+                db_mark_status(article["id"], "queued")
+                # Alert core team this needs a fast decision
+                send_text(CORE_TEAM_CHAT_ID,
+                    f"⚠️ <b>BREAKING held for review</b>\n{hold_reason}\n\n"
+                    f"<b>{article['title'][:90]}</b>\n"
+                    f"Source: {article.get('source','?')} · Confidence: {confidence}%\n\n"
+                    f"Approve with <code>/approved {key}</code> if verified.",
+                    thread_id=CONTENT_LAB_THREAD_ID)
+            except Exception as e:
+                log.error(f"Breaking hold queue: {e}")
+            return False
+        # Confidence OK — publish instantly as normal
         card_bytes, caption, rewritten, keyword = _build_card_and_caption(article)
         tg_ok, _social = _publish_now(card_bytes, caption, cat, article["title"], article["link"],
                             is_breaking_flag=True, allow_social=allow_social,
@@ -2638,30 +2708,136 @@ def score_breakdown(a):
     total = sum(p for _, p in items)
     return total, items
 
+def confidence_score(a):
+    """
+    Returns (confidence_pct, [(reason, points), ...]).
+
+    Confidence ≠ Priority.
+    Priority = "how important is this story"
+    Confidence = "how sure are we it's real and accurate"
+
+    A story can be HIGH priority but LOW confidence (big claim, one shaky source)
+    → that should be held for human review, not auto-posted.
+
+    Confidence is built from:
+      - Source reliability (official/trusted = high)
+      - Multiple sources reporting the same event (corroboration)
+      - Story Intelligence confirmation (part of a developing thread)
+      - Official source language (president office, police, MNDF, court)
+    """
+    confidence = 0
+    reasons = []
+    source = a.get("source", "").lower()
+    title_lower = a["title"].lower()
+    summary_lower = a.get("summary", "").lower()
+    text = title_lower + " " + summary_lower
+
+    # 1. Base confidence from source reliability (0-50 of the score)
+    rel = source_reliability(a.get("source", ""))
+    base = int(rel * 0.5)  # 95 reliability → 47 base
+    confidence += base
+    reasons.append((f"Source reliability ({a.get('source','?')})", base))
+
+    # 2. Corroboration — multiple independent sources = much higher confidence
+    cluster_size = a.get("_cluster_size", 1)
+    if cluster_size >= 3:
+        confidence += 35
+        reasons.append((f"Confirmed by {cluster_size} sources", 35))
+    elif cluster_size == 2:
+        confidence += 20
+        reasons.append(("Confirmed by 2 sources", 20))
+    else:
+        # Single source — confidence depends heavily on who it is
+        if rel < 75:
+            confidence -= 15
+            reasons.append(("Single unverified source", -15))
+
+    # 3. Official source language — government/authority confirmation
+    official_markers = ["president", "police", "mndf", "ministry", "court",
+                        "majlis", "parliament", "official", "government",
+                        "hdc", "customs", "mma", "health protection"]
+    if any(m in source for m in ["presidency", "psm", "police", "mndf"]):
+        confidence += 15
+        reasons.append(("Official source", 15))
+    elif any(m in text for m in official_markers):
+        confidence += 8
+        reasons.append(("Cites official authority", 8))
+
+    # 4. Story Intelligence — part of a confirmed developing thread
+    if a.get("_story_id") and not a.get("_story_is_new", True):
+        confidence += 10
+        reasons.append(("Part of developing story", 10))
+
+    # 5. Rumor/uncertainty language lowers confidence
+    rumor_markers = ["allegedly", "rumor", "rumour", "unconfirmed", "claims",
+                     "reportedly", "sources say", "believed to"]
+    if any(m in text for m in rumor_markers):
+        confidence -= 12
+        reasons.append(("Uncertain language", -12))
+
+    # Clamp 0-100
+    confidence = max(0, min(100, confidence))
+    return confidence, reasons
+
+# Threshold: stories above this priority but below this confidence get HELD
+HIGH_PRIORITY_THRESHOLD = 140   # important story
+LOW_CONFIDENCE_THRESHOLD = 55   # but we're not sure
+
+def should_hold_for_review(priority, confidence, is_breaking_flag):
+    """
+    Returns (hold, reason) — True if a high-priority but low-confidence story
+    should be held for human review instead of auto-posting.
+    """
+    if priority >= HIGH_PRIORITY_THRESHOLD and confidence < LOW_CONFIDENCE_THRESHOLD:
+        return (True, f"High priority ({priority}) but low confidence ({confidence}%) — needs review")
+    # Breaking news with very low confidence is especially risky
+    if is_breaking_flag and confidence < 45:
+        return (True, f"Breaking but unconfirmed ({confidence}% confidence) — verify first")
+    return (False, "")
+
+
 def format_score_breakdown(a):
-    """Pretty HTML block for Telegram showing the itemized score."""
+    """Pretty HTML block for Telegram showing the itemized score + confidence."""
     total, items = score_breakdown(a)
     lines = [f"🧮 <b>Why this scored {total}</b>", f"<i>{a['title'][:90]}</i>", ""]
+    lines.append("<b>PRIORITY — how important:</b>")
     for label, pts in items:
         sign = "➕" if pts > 0 else "➖"
         lines.append(f"  {sign} {label}: <b>{pts:+d}</b>")
     if not items:
         lines.append("  <i>(no scoring signals matched)</i>")
+
+    # ── Confidence breakdown ──
+    try:
+        conf, conf_reasons = confidence_score(a)
+        lines.append("")
+        lines.append(f"<b>CONFIDENCE — how sure: {conf}%</b>")
+        for label, pts in conf_reasons:
+            sign = "➕" if pts > 0 else "➖"
+            lines.append(f"  {sign} {label}: <b>{pts:+d}</b>")
+        # Verdict
+        breaking_flag = is_breaking(a["title"], a.get("summary",""), a["cat"])
+        hold, hold_reason = should_hold_for_review(total, conf, breaking_flag)
+        lines.append("")
+        if hold:
+            lines.append(f"🛑 <b>HOLD:</b> {hold_reason}")
+        elif conf >= 75:
+            lines.append("✅ <b>High confidence</b> — safe to post.")
+        elif conf >= 55:
+            lines.append("🟡 <b>Moderate confidence</b> — fine to post.")
+        else:
+            lines.append("⚠️ <b>Low confidence</b> — consider verifying.")
+    except Exception as e:
+        log.debug(f"confidence in breakdown: {e}")
+
     lines.append("")
     try:
         if is_breaking(a["title"], a.get("summary",""), a["cat"]):
-            lines.append("📌 <b>Breaking</b> → posts immediately, no approval.")
+            lines.append("📌 <b>Breaking</b> → posts immediately (if confidence OK).")
         elif a.get("lang") == "dv":
             lines.append("📌 <b>Dhivehi</b> → always queued for Content Lab review.")
         else:
             lines.append("📌 <b>Regular English</b> → queued; auto-posts in 15 min if not reviewed.")
-    except Exception:
-        pass
-    try:
-        if learning_is_active():
-            lines.append(f"🧠 Learning <b>ON</b> — audience data may shift score ±{LEARN_CAP}.")
-        else:
-            lines.append("🧠 Learning <b>off</b> — audience data not affecting scores yet.")
     except Exception:
         pass
     return "\n".join(lines)
