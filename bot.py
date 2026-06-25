@@ -3219,7 +3219,19 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
     sea_icon, sea_label, sea_advice = sea_condition(wind, gusts, precip_p, code)
 
     # ── Background — deep layered atmospheric ─────────────────────────────────
-    if alert_mode:
+    if alert_mode and alert_level:
+        # Each MMS level gets its own tinted background
+        if alert_level == "white":
+            TOP, BOT = (30, 45, 70), (12, 22, 42)      # light steel blue
+        elif alert_level == "yellow":
+            TOP, BOT = (60, 50, 8), (28, 22, 4)        # dark yellowish
+        elif alert_level == "orange":
+            TOP, BOT = (70, 38, 6), (32, 16, 3)        # dark orangish
+        elif alert_level == "red":
+            TOP, BOT = (55, 6, 6), (18, 2, 2)          # deep red (serious)
+        else:
+            TOP, BOT = (45, 5, 5), (15, 2, 2)
+    elif alert_mode:
         TOP, BOT = (45, 5, 5), (15, 2, 2)
     elif code in [95,96,99]:
         TOP, BOT = (18, 10, 45), (6, 4, 22)
@@ -3282,9 +3294,16 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
     img  = img_rgba.convert("RGB")
     draw = ImageDraw.Draw(img, "RGBA")
 
-    # Alert red tint overlay
+    # Alert tint overlay — coloured by level
     if alert_mode:
-        overlay = Image.new("RGBA", (W,H), (80,0,0,40))
+        tint_map = {
+            "white":  (60, 90, 130, 30),
+            "yellow": (120, 100, 10, 35),
+            "orange": (140, 70, 5, 35),
+            "red":    (90, 0, 0, 45),
+        }
+        tc = tint_map.get(alert_level, (80, 0, 0, 40))
+        overlay = Image.new("RGBA", (W,H), tc)
         img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
         draw = ImageDraw.Draw(img, "RGBA")
 
@@ -3306,42 +3325,45 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
     f_xs     = F(32)           # sub-labels
     f_xxs    = F(26)           # footer, source
 
-    # ── SAMUGA LOGO — top left ────────────────────────────────────────────────
+    # ── MMS Alert banner FIRST (so logo sits below it, not under it) ──────────
+    banner_h = 0
+    if alert_mode and alert_level:
+        level_cfg = MMS_ALERT_LEVELS.get(alert_level, MMS_ALERT_LEVELS["white"])
+        acolor = level_cfg["color"]
+        banner_h = 130
+        draw.rectangle([(0, 0), (W, banner_h)], fill=(acolor[0], acolor[1], acolor[2], 235))
+        btext = f"{level_cfg['emoji']}  {level_cfg['label']}  —  {level_cfg['headline'].upper()}"
+        btw = draw.textlength(btext, font=f_small)
+        txt_color = (20,20,20,255) if alert_level in ["white","yellow"] else (255,255,255,255)
+        draw.text(((W-btw)//2, 38), btext, font=f_small, fill=txt_color)
+    elif alert_mode:
+        banner_h = 110
+        draw.rectangle([(0, 0), (W, banner_h)], fill=(200, 40, 40, 235))
+        btext = "⚠  WEATHER ALERT  ⚠"
+        btw = draw.textlength(btext, font=f_small)
+        draw.text(((W-btw)//2, 30), btext, font=f_small, fill=(255,255,255,255))
+
+    # ── SAMUGA LOGO — top left (below banner if in alert mode) ────────────────
+    logo_y = (banner_h + 25) if alert_mode else 55
     try:
         logo = Image.open("logo.png").convert("RGBA")
         lh = 120; lw2 = int(logo.width * lh / logo.height)
         logo = logo.resize((lw2, lh), Image.LANCZOS)
-        ir = img.convert("RGBA"); ir.paste(logo, (70, 55), logo)
+        ir = img.convert("RGBA"); ir.paste(logo, (70, logo_y), logo)
         img = ir.convert("RGB"); draw = ImageDraw.Draw(img, "RGBA")
     except Exception as e:
         log.debug(f"weather logo: {e}")
-        # Fallback text logo
-        draw.text((70, 55), "SAMUGA MEDIA", font=f_xs, fill=(255,255,255,200))
+        draw.text((70, logo_y), "SAMUGA MEDIA", font=f_xs, fill=(255,255,255,200))
 
-    # Channel tag — top right
+    # Channel tag — top right (below banner if in alert mode)
     tag = "t.me/samugacommunity"
     ttw = draw.textlength(tag, font=f_xs)
-    draw.text((W-ttw-70, 78), tag, font=f_xs, fill=(255,255,255,130))
-
-    # MMS Alert banner — coloured by level
-    if alert_mode and alert_level:
-        level_cfg = MMS_ALERT_LEVELS.get(alert_level, MMS_ALERT_LEVELS["white"])
-        acolor = level_cfg["color"]
-        # Full-width coloured banner strip
-        draw.rectangle([(0, 0), (W, 130)], fill=(acolor[0], acolor[1], acolor[2], 230))
-        btext = f"{level_cfg['emoji']}  {level_cfg['label']}  —  {level_cfg['headline'].upper()}"
-        btw = draw.textlength(btext, font=f_small)
-        # Dark text on light banners, white on dark
-        txt_color = (20,20,20,255) if alert_level in ["white","yellow"] else (255,255,255,255)
-        draw.text(((W-btw)//2, 38), btext, font=f_small, fill=txt_color)
-    elif alert_mode:
-        btext = "⚠  WEATHER ALERT  ⚠"
-        btw = draw.textlength(btext, font=f_small)
-        draw.text(((W-btw)//2, 70), btext, font=f_small, fill=(255,80,80,255))
+    tag_y = (banner_h + 45) if alert_mode else 78
+    draw.text((W-ttw-70, tag_y), tag, font=f_xs, fill=(255,255,255,130))
 
     # ── LOCATION ──────────────────────────────────────────────────────────────
     loc = "Malé, Maldives"
-    loc_y = 240
+    loc_y = (banner_h + 180) if alert_mode else 240
     lcw = draw.textlength(loc, font=f_large)
     draw.text(((W-lcw)//2, loc_y), loc, font=f_large, fill=(255,255,255,230))
 
