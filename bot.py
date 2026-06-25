@@ -2554,17 +2554,31 @@ ISLAND_LOCATIONS = [
 
 # ── Hijri special days — built-in for offline fallback ───────────────────────
 HIJRI_SPECIAL_DAYS = {
-    (1,  1):  ("Islamic New Year",        "The beginning of the Hijri year"),
-    (1, 10):  ("Day of Ashura",           "A day of fasting and reflection"),
-    (3, 12):  ("Mawlid al-Nabi",          "Birth of the Prophet ﷺ"),
-    (7, 27):  ("Isra and Mi'raj",         "The Night Journey of the Prophet ﷺ"),
-    (8, 15):  ("Shab-e-Barat",            "Night of forgiveness and blessings"),
-    (9,  1):  ("First Day of Ramadan",    "The blessed month of fasting begins"),
-    (9, 27):  ("Laylat al-Qadr",          "The Night of Power — better than 1000 months"),
-    (10, 1):  ("Eid al-Fitr",             "The festival of breaking the fast"),
-    (12, 9):  ("Day of Arafah",           "The greatest day — the day of Hajj"),
-    (12,10):  ("Eid al-Adha",             "The festival of sacrifice"),
-    (12,18):  ("Eid al-Ghadir",           "A blessed day of remembrance"),
+    (1,  1):  ("Islamic New Year",     "Marks the Prophet ﷺ migration from Makkah to Madinah, the start of the Hijri calendar."),
+    (1, 10):  ("Ashura",               "The day Allah saved Prophet Musa and his people from Pharaoh. Fasting today is a Sunnah that expiates the past year's minor sins."),
+    (3, 12):  ("Mawlid al-Nabi",       "Commemorates the birth of Prophet Muhammad ﷺ, the mercy to all creation."),
+    (7, 27):  ("Isra & Mi'raj",        "The miraculous night journey of the Prophet ﷺ from Makkah to Jerusalem and his ascension to the heavens."),
+    (8, 15):  ("Shab-e-Barat",         "The night of forgiveness, when Allah descends and forgives those who seek His mercy."),
+    (9,  1):  ("First of Ramadan",     "The blessed month of fasting begins — a time of mercy, forgiveness and closeness to Allah."),
+    (9, 27):  ("Laylat al-Qadr",       "The Night of Power, better than a thousand months. The Quran was first revealed on this night."),
+    (10, 1):  ("Eid al-Fitr",          "The festival of breaking the fast, celebrating the completion of Ramadan."),
+    (12, 9):  ("Day of Arafah",        "The greatest day of Hajj. Fasting today expiates the sins of two years for non-pilgrims."),
+    (12,10):  ("Eid al-Adha",          "The festival of sacrifice, honouring Prophet Ibrahim's devotion to Allah."),
+    (12,18):  ("Eid al-Ghadir",        "A day of remembrance and reflection in the Islamic tradition."),
+}
+
+# Extra detail for API-detected holidays not in our dict
+SPECIAL_DAY_DETAILS = {
+    "Ashura":           "The day Allah saved Prophet Musa from Pharaoh. Fasting today is a Sunnah that expiates the past year's minor sins.",
+    "Day of Arafah":    "The greatest day of Hajj. Fasting today expiates the sins of two years for non-pilgrims.",
+    "Arafa":            "The greatest day of Hajj. Fasting today expiates the sins of two years for non-pilgrims.",
+    "Lailat-ul-Qadr":   "The Night of Power, better than a thousand months. The Quran was first revealed tonight.",
+    "Laylat al-Qadr":   "The Night of Power, better than a thousand months. The Quran was first revealed tonight.",
+    "Ramadan":          "The blessed month of fasting — mercy, forgiveness and closeness to Allah.",
+    "Eid-ul-Fitr":      "The festival of breaking the fast, celebrating the completion of Ramadan.",
+    "Eid-ul-Adha":      "The festival of sacrifice, honouring Prophet Ibrahim's devotion to Allah.",
+    "Mawlid al-Nabi ﷺ": "Commemorates the birth of Prophet Muhammad ﷺ, the mercy to all creation.",
+    "Isra and Mi'raj":  "The night journey of the Prophet ﷺ and his ascension to the heavens.",
 }
 
 def get_prayer_times():
@@ -2612,7 +2626,15 @@ def get_prayer_times():
         special_name = api_holidays[0] if api_holidays else None
         special_desc = ""
 
-        if not special_name:
+        if special_name:
+            # Try to enrich API holiday with a meaningful description
+            special_desc = SPECIAL_DAY_DETAILS.get(special_name, "")
+            # Also try matching our built-in dict for description
+            if not special_desc:
+                key = (h_month, h_day)
+                if key in HIJRI_SPECIAL_DAYS:
+                    _, special_desc = HIJRI_SPECIAL_DAYS[key]
+        else:
             key = (h_month, h_day)
             if key in HIJRI_SPECIAL_DAYS:
                 special_name, special_desc = HIJRI_SPECIAL_DAYS[key]
@@ -2812,20 +2834,66 @@ def get_weather_data():
         log.error(f"Open-Meteo fallback: {e}")
     return None
 
+def _island_openmeteo_fallback(island, mvt_now):
+    """Fetch a single island's forecast from Open-Meteo (free, no key)."""
+    try:
+        url = ("https://api.open-meteo.com/v1/forecast"
+               f"?latitude={island['lat']}&longitude={island['lon']}"
+               "&current=temperature_2m,weathercode"
+               "&hourly=temperature_2m,weathercode,precipitation_probability"
+               "&timezone=Indian%2FMaldives&forecast_days=1")
+        resp = requests.get(url, timeout=12)
+        if resp.status_code != 200:
+            return {"name": island["name"], "temp": 29, "code": 1000, "outlook": "Mostly cloudy"}
+        d = resp.json()
+        temp = round(d.get("current", {}).get("temperature_2m", 29))
+        code = d.get("current", {}).get("weathercode", 1)
+        # Build slots compatible with generate_outlook (uses native Tomorrow codes;
+        # Open-Meteo uses WMO codes which generate_outlook also tolerates via labels)
+        hourly = d.get("hourly", {})
+        times = hourly.get("time", [])
+        wcodes = hourly.get("weathercode", [])
+        precs = hourly.get("precipitation_probability", [])
+        slots = []
+        for i in range(min(12, len(times))):
+            # Open-Meteo times are local MVT already; convert to fake UTC for generate_outlook (-5)
+            slots.append({"time": times[i] + ":00Z",
+                          "values": {"weatherCode": _wmo_to_tomorrow(wcodes[i] if i < len(wcodes) else 1),
+                                     "precipitationProbability": precs[i] if i < len(precs) else 0}})
+        outlook = generate_outlook(slots, mvt_now) if slots else "Mostly cloudy"
+        return {"name": island["name"], "temp": temp, "code": code, "outlook": outlook}
+    except Exception as e:
+        log.debug(f"Island Open-Meteo {island['name']}: {e}")
+        return {"name": island["name"], "temp": 29, "code": 1000, "outlook": "Mostly cloudy"}
+
+def _wmo_to_tomorrow(wmo):
+    """Rough WMO → Tomorrow.io code for outlook labelling."""
+    if wmo in [95,96,99]: return 8000
+    if wmo in [65,82]:    return 4201
+    if wmo in [61,63,80,81]: return 4001
+    if wmo in [51,53,55]: return 4000
+    if wmo in [45,48]:    return 2000
+    if wmo in [3]:        return 1001
+    if wmo in [2]:        return 1101
+    if wmo in [1]:        return 1100
+    return 1000
+
 def get_island_forecasts():
     """
-    Fetch 12-hour hourly forecast for all 5 islands via Tomorrow.io.
-    Returns list of {name, temp, code, outlook} dicts, or [] on failure.
+    Fetch 12-hour hourly forecast for all 5 islands.
+    Primary: Tomorrow.io. Fallback per-island: Open-Meteo (so never 'Data unavailable').
+    Returns list of {name, temp, code, outlook} dicts.
     """
     TOMORROW_API_KEY = os.environ.get("TOMORROW_API_KEY", "")
-    if not TOMORROW_API_KEY:
-        return []
-
     from datetime import datetime, timezone, timedelta as _td
     mvt_now = datetime.now(timezone.utc) + _td(hours=5)
     results = []
 
     for island in ISLAND_LOCATIONS:
+        # If no Tomorrow.io key, go straight to Open-Meteo
+        if not TOMORROW_API_KEY:
+            results.append(_island_openmeteo_fallback(island, mvt_now))
+            continue
         try:
             params = (f"?location={island['lat']},{island['lon']}"
                       f"&apikey={TOMORROW_API_KEY}&units=metric")
@@ -2835,9 +2903,8 @@ def get_island_forecasts():
             fc = requests.get(f"{base}/forecast{params}", timeout=12)
 
             if rt.status_code != 200 or fc.status_code != 200:
-                log.warning(f"Island forecast {island['name']}: HTTP {rt.status_code}/{fc.status_code}")
-                results.append({"name": island["name"], "temp": 29,
-                                 "code": 1000, "outlook": "Data unavailable"})
+                log.warning(f"Island {island['name']}: Tomorrow.io {rt.status_code}/{fc.status_code} — Open-Meteo fallback")
+                results.append(_island_openmeteo_fallback(island, mvt_now))
                 continue
 
             rv = rt.json()["data"]["values"]
@@ -2852,9 +2919,8 @@ def get_island_forecasts():
             log.info(f"🏝️ {island['name']}: {temp}°C — {outlook}")
 
         except Exception as e:
-            log.error(f"Island forecast {island['name']}: {e}")
-            results.append({"name": island["name"], "temp": 29,
-                             "code": 1000, "outlook": "Data unavailable"})
+            log.error(f"Island forecast {island['name']}: {e} — Open-Meteo fallback")
+            results.append(_island_openmeteo_fallback(island, mvt_now))
 
     return results
 
@@ -3035,7 +3101,7 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
     import math, io
 
-    W, H = 2500, (3600 if (island_data and prayer_data) else 3000 if island_data else 2600 if prayer_data else 2200)
+    W, H = 2500, (3050 if island_data else 2300)
     img = Image.new("RGB", (W, H), (0, 0, 0))
     draw = ImageDraw.Draw(img, "RGBA")
 
@@ -3201,15 +3267,80 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
     lcw = draw.textlength(loc, font=f_large)
     draw.text(((W-lcw)//2, loc_y), loc, font=f_large, fill=(255,255,255,230))
 
-    # ── WEATHER ICON — sits cleanly between location and temperature ───────────
-    icon_y = loc_y + 120
+    # ── WEATHER ICON — dead centre between location and temperature ────────────
+    icon_y = loc_y + 165
     draw_weather_icon(draw, code, W//2, icon_y, size=140)
 
     # ── TEMPERATURE ───────────────────────────────────────────────────────────
     temp_str = f"{temp}°"
     ttw2 = draw.textlength(temp_str, font=f_giant)
-    temp_y = icon_y + 200
+    temp_y = icon_y + 175
     draw.text(((W-ttw2)//2, temp_y), temp_str, font=f_giant, fill=(255,255,255,255))
+
+    # ── PRAYER TIMES (left of temp) + HIJRI (right of temp) ───────────────────
+    if prayer_data:
+        prayers  = prayer_data.get("prayers", {})
+        h_day    = prayer_data.get("hijri_day", "")
+        h_month  = prayer_data.get("hijri_month", "")
+        h_year   = prayer_data.get("hijri_year", "")
+        sp_name  = prayer_data.get("special_name", "")
+        sp_desc  = prayer_data.get("special_desc", "")
+
+        flank_y = temp_y + 30   # align with top of big temperature
+
+        # ── LEFT: Prayer times ────────────────────────────────────────────────
+        px = 90
+        py = flank_y
+        draw.text((px, py), "PRAYER TIMES", font=f_xs, fill=(255,220,100,210))
+        py += 60
+        prayer_order = ["Fajr","Dhuhr","Asr","Maghrib","Isha"]
+        for name in prayer_order:
+            draw.text((px, py), name, font=f_small, fill=(255,255,255,220))
+            t_val = prayers.get(name, "--:--")
+            tw_p = int(draw.textlength(t_val, font=f_small))
+            draw.text((px + 430 - tw_p, py), t_val, font=f_small, fill=(160,215,255,235))
+            py += 78
+
+        # ── RIGHT: Hijri calendar ─────────────────────────────────────────────
+        rx = W - 90 - 540   # right block left edge (room for long month names)
+        ry = flank_y
+        draw.text((rx, ry), "HIJRI CALENDAR", font=f_xs, fill=(255,220,100,210))
+        ry += 60
+        # Big day number
+        h_day_str = str(h_day)
+        draw.text((rx, ry), h_day_str, font=F(150, True), fill=(255,255,255,245))
+        ry += 165
+        # Month + year below the number
+        draw.text((rx, ry), h_month, font=f_med, fill=(255,255,255,215))
+        ry += 66
+        draw.text((rx, ry), f"{h_year} AH", font=f_body, fill=(200,225,255,165))
+        ry += 70
+
+        # Special day box (gold) with wrapped description
+        if sp_name:
+            box_left  = rx
+            box_right = W - 80
+            box_w_px  = box_right - box_left
+            # Wrap description to fit
+            desc_lines = []
+            if sp_desc:
+                words = sp_desc.split()
+                cur = ""
+                for w in words:
+                    test = (cur + " " + w).strip()
+                    if draw.textlength(test, font=F(28)) <= box_w_px - 40:
+                        cur = test
+                    else:
+                        desc_lines.append(cur); cur = w
+                if cur: desc_lines.append(cur)
+            box_h = 56 + len(desc_lines)*38 + 30
+            draw.rounded_rectangle([(box_left, ry),(box_right, ry+box_h)],
+                                   radius=18, fill=(58,44,4,180))
+            draw.text((box_left+24, ry+18), sp_name, font=F(38,True), fill=(255,220,80,255))
+            dyy = ry + 70
+            for dl in desc_lines:
+                draw.text((box_left+24, dyy), dl, font=F(28), fill=(255,205,90,210))
+                dyy += 38
 
     # ── CONDITION ─────────────────────────────────────────────────────────────
     cond_y = temp_y + 440
@@ -3285,69 +3416,7 @@ def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_
     sea_y += 160
     div2 = sea_y + 10
     draw.line([(80,div2),(W-80,div2)], fill=(255,255,255,35), width=2)
-
-    # ── PRAYER TIMES (left) + HIJRI CALENDAR (right) ─────────────────────────
-    if prayer_data:
-        pr_y = div2 + 50
-        prayers  = prayer_data.get("prayers", {})
-        h_day    = prayer_data.get("hijri_day", "")
-        h_month  = prayer_data.get("hijri_month", "")
-        h_year   = prayer_data.get("hijri_year", "")
-        sp_name  = prayer_data.get("special_name", "")
-        sp_desc  = prayer_data.get("special_desc", "")
-
-        # ── LEFT: Prayer times ────────────────────────────────────────────────
-        px = 90
-        draw.text((px, pr_y), "PRAYER TIMES", font=f_xs, fill=(255,220,100,200))
-        draw.text((px+320, pr_y), "Malé, Maldives", font=f_xs, fill=(255,255,255,120))
-        pr_y += 52
-
-        prayer_order = [("Fajr","Fajr"),("Dhuhr","Dhuhr"),
-                        ("Asr","Asr"),("Maghrib","Maghrib"),("Isha","Isha")]
-        prayer_icons = {"Fajr":"☽","Dhuhr":"☀","Asr":"🌤","Maghrib":"🌅","Isha":"★"}
-        for name, key in prayer_order:
-            icon_ch = prayer_icons.get(name, "•")
-            draw.text((px, pr_y), f"{icon_ch}  {name}", font=f_small, fill=(255,255,255,220))
-            t_val = prayers.get(key, "--:--")
-            tw_p = int(draw.textlength(t_val, font=f_small))
-            draw.text((px + 500 - tw_p, pr_y), t_val, font=f_small, fill=(160,215,255,230))
-            pr_y += 90
-
-        # ── RIGHT: Hijri calendar ─────────────────────────────────────────────
-        rx = W // 2 + 80
-        ry = div2 + 50
-        draw.text((rx, ry), "HIJRI CALENDAR", font=f_xs, fill=(255,220,100,200))
-        ry += 52
-
-        # Big Hijri day number
-        h_day_str = str(h_day)
-        hdw = draw.textlength(h_day_str, font=F(220, True))
-        draw.text((rx, ry), h_day_str, font=F(220, True), fill=(255,255,255,240))
-        ry += 240
-
-        # Month + Year
-        draw.text((rx, ry), h_month, font=f_med, fill=(255,255,255,210))
-        ry += 70
-        draw.text((rx, ry), f"{h_year} AH", font=f_body, fill=(200,225,255,160))
-        ry += 60
-
-        # Special day box
-        if sp_name:
-            # Gold highlight box
-            box_pad = 16
-            box_w   = W - rx - 80
-            draw.rounded_rectangle(
-                [(rx-box_pad, ry), (rx+box_w, ry+100+box_pad*2)],
-                radius=16, fill=(60,45,0,160)
-            )
-            draw.text((rx, ry+box_pad), sp_name, font=F(36,True), fill=(255,220,80,255))
-            if sp_desc:
-                draw.text((rx, ry+box_pad+48), sp_desc, font=F(28), fill=(255,200,60,200))
-
-        div3 = div2 + 50 + 5*90 + 80  # prayer rows height + padding
-        draw.line([(80,div3),(W-80,div3)], fill=(255,255,255,35), width=2)
-    else:
-        div3 = div2
+    div3 = div2
 
     # ── HOURLY STRIP — next 8 hours ───────────────────────────────────────────
     hourly_y = div3 + 40
