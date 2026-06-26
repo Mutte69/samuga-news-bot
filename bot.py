@@ -44,6 +44,14 @@ from fetchers import (
     get_local_headlines, rewrite_news, gemini_translate,
     RSS_FEEDS, LOCAL_FEEDS, DV_TELEGRAM_CHANNELS, DEFAULT_KEYWORDS
 )
+from scoring import (
+    is_breaking, is_dhivehi, source_reliability,
+    score_article, score_breakdown, confidence_score,
+    should_hold_for_review, format_score_breakdown,
+    is_duplicate_story, remember_story_title, register_in_cluster,
+    recent_posts, user_conversations, recent_story_titles,
+    BREAKING_KEYWORDS, BREAKING_BLACKLIST, SOURCE_RELIABILITY
+)
 
 # ── Structured logging: tags make Railway logs readable ──────────────────────
 # Usage: log.info("[FETCH] pulled 12 articles")  →  easy to filter in Railway
@@ -459,22 +467,6 @@ REJECT_RESPONSES = [
     "Okay the bin got a new resident. Hope it's comfortable in there. 🗑️",
     "Deleted faster than Manchii's sleep schedule. Which is saying something. ⚡",
     "Fair enough. Some stories aren't worth telling. This was one of them. Card gone. ✂️",
-]
-
-BREAKING_KEYWORDS = [
-    "killed","dead","dies","murder","shot","stabbed","explosion","bomb","attack",
-    "tsunami","earthquake","flood","disaster","sinking","collapsed","hostage",
-    "missing person","fire broke","crash landed","emergency landing","gas leak",
-    "capsized","swept away","search and rescue"
-]
-# Note: "arrested" and "raided" removed — those go through normal news flow
-
-# Keywords that should NEVER be breaking news
-BREAKING_BLACKLIST = [
-    "world cup","football","cricket","sports","fifa","champions league","premier league","tourism","resort","hotel","travel",
-    "award","ranking","luxury","boutique","hospitality","destination","lagoon",
-    "civil war","squad","team","player","match","game","season","transfer",
-    "economy","business","market","price","investment","opening","launch","event"
 ]
 
 # ── PostgreSQL Database Layer (v6) ────────────────────────────────────────────
@@ -1401,155 +1393,6 @@ def restore_state():
     except Exception as e:
         log.error(f"restore_state: {e}")
 
-# ── Memory ────────────────────────────────────────────────────────────────────
-recent_posts = []
-user_conversations = {}
-
-# ── Duplicate Story Detection ─────────────────────────────────────────────────
-# Tracks recently posted/queued story titles so the same event from different
-# sources (Mihaaru / Sun / PSM) doesn't get posted multiple times.
-recent_story_titles = []  # list of (title, timestamp)
-DUP_WINDOW_HOURS = 18     # consider stories within this window for dedup
-DUP_THRESHOLD = 0.55      # similarity above which two stories are "the same"
-
-_DUP_STOPWORDS = {
-    "the","a","an","of","in","on","at","to","for","and","or","is","are","was","were",
-    "has","have","had","with","by","from","as","that","this","it","its","their","they",
-    "maldives","maldivian","male","reported","says","said","after","over","amid","new",
-    "breaking","news","update","live","video","photo","watch","near","into","out","be","will"
-}
-
-# Synonym groups — different outlets use different words for the same event
-_DUP_SYNONYMS = {
-    "parliament":"majlis","majlis":"majlis",
-    "passes":"approve","approves":"approve","approved":"approve","passed":"approve","endorses":"approve","endorsed":"approve",
-    "crash":"accident","accident":"accident","collision":"accident","collide":"accident",
-    "injures":"injured","injured":"injured","hurt":"injured","wounded":"injured",
-    "visits":"visit","visit":"visit","arrives":"visit","arrival":"visit","trip":"visit","arrived":"visit",
-    "dies":"dead","died":"dead","killed":"dead","death":"dead","dead":"dead","passes away":"dead",
-    "fire":"fire","blaze":"fire",
-    "boat":"boat","speedboat":"boat","vessel":"boat","dhoni":"boat","launch":"boat","ferry":"boat",
-    "arrested":"arrest","arrest":"arrest","detained":"arrest","held":"arrest",
-    "minister":"minister","ministry":"minister",
-    "president":"president","raees":"president",
-}
-
-def _dup_canon(word):
-    return _DUP_SYNONYMS.get(word, word)
-
-def _dup_keywords(title):
-    """Extract canonicalized meaningful keywords from a title."""
-    import re as _re
-    t = title.lower()
-    t = _re.sub(r"[^a-z0-9\u0780-\u07bf ]", " ", t)  # keep latin, digits, thaana
-    return set(_dup_canon(w) for w in t.split() if w not in _DUP_STOPWORDS and len(w) > 2)
-
-def _title_similarity(a, b):
-    """Similarity 0-1 using canonicalized keyword overlap + containment."""
-    ka, kb = _dup_keywords(a), _dup_keywords(b)
-    if not ka or not kb:
-        return 0.0
-    overlap = len(ka & kb) / max(1, len(ka | kb))          # Jaccard
-    contain = len(ka & kb) / max(1, min(len(ka), len(kb))) # smaller-set containment
-    return max(overlap, contain * 0.85)
-
-def is_duplicate_story(title):
-    """True if a very similar story was posted/queued within the dedup window."""
-    global recent_story_titles
-    now = utcnow()
-    recent_story_titles = [(t, ts) for (t, ts) in recent_story_titles
-                           if (now - ts).total_seconds() < DUP_WINDOW_HOURS * 3600]
-    for (past_title, _ts) in recent_story_titles:
-        sim = _title_similarity(title, past_title)
-        if sim >= DUP_THRESHOLD:
-            log.info(f"🔁 Duplicate ({sim:.2f}): '{title[:45]}' ≈ '{past_title[:45]}'")
-            return True
-    return False
-
-def remember_story_title(title):
-    """Record a title so future similar stories are flagged as duplicates."""
-    recent_story_titles.append((title, utcnow()))
-    if len(recent_story_titles) > 200:
-        recent_story_titles.pop(0)
-    persist_state()
-
-# ── Story Clustering (v6) — group same event from multiple sources ───────────
-# When 3 outlets report the same fire, the bot doesn't post 3 times. It detects
-# they're the same story and posts ONCE as "🔥 Multiple sources reporting...".
-# story_clusters: cluster_key -> {"sources": set, "first_title": str, "ts": datetime}
-story_clusters = {}
-
-def _cluster_key(title):
-    """A stable-ish key for a story so the same event maps to the same cluster."""
-    kws = sorted(_dup_keywords(title))
-    return " ".join(kws[:6])  # top keywords as the signature
-
-# Maldivian place names + event types — strong signals two stories are the same event
-_CLUSTER_PLACES = ["hulhumale","male","male'","villingili","addu","fuvahmulah","kulhudhuffushi",
-    "thinadhoo","gan","hithadhoo","naifaru","dharavandhoo","maafushi","guraidhoo","thulusdhoo",
-    "vilimale","gulhi","dhiffushi","raa","baa","laamu","gaafu","seenu","haa","noonu","thaa"]
-_CLUSTER_EVENTS = {
-    "fire":["fire","blaze","burn"], "accident":["accident","crash","collision"],
-    "death":["dies","died","dead","killed","death","passed away"], "arrest":["arrest","arrested","detained"],
-    "drowning":["drown","drowned"], "sinking":["sink","sank","capsize","capsized"],
-    "robbery":["robbery","theft","stolen","burgle"], "stabbing":["stab","stabbed","stabbing"],
-    "protest":["protest","demonstration","rally"], "storm":["storm","flood","swell","udha"],
-}
-
-def _cluster_similarity(a, b):
-    """Looser similarity for clustering: same PLACE + same EVENT TYPE = same story."""
-    base = _title_similarity(a, b)
-    ta, tb = a.lower(), b.lower()
-    # Shared place?
-    place_a = next((p for p in _CLUSTER_PLACES if p in ta), None)
-    place_b = next((p for p in _CLUSTER_PLACES if p in tb), None)
-    same_place = place_a and place_a == place_b
-    # Shared event type?
-    def event_of(t):
-        for ev, kws in _CLUSTER_EVENTS.items():
-            if any(k in t for k in kws): return ev
-        return None
-    ev_a, ev_b = event_of(ta), event_of(tb)
-    same_event = ev_a and ev_a == ev_b
-    # Same place AND same event = almost certainly the same story
-    if same_place and same_event:
-        return max(base, 0.75)
-    # Same event + decent word overlap
-    if same_event and base >= 0.25:
-        return max(base, 0.60)
-    return base
-
-def register_in_cluster(title, source):
-    """
-    Record that `source` is reporting this story. Returns (cluster_size, sources_list).
-    If multiple sources report the same event, cluster_size > 1 = a corroborated story.
-    """
-    now = utcnow()
-    # Clean old clusters
-    expired = [k for k, v in story_clusters.items()
-               if (now - v["ts"]).total_seconds() > DUP_WINDOW_HOURS * 3600]
-    for k in expired:
-        del story_clusters[k]
-
-    # Find an existing cluster this title belongs to (cluster-aware fuzzy match)
-    matched_key = None
-    for k, v in story_clusters.items():
-        if _cluster_similarity(title, v["first_title"]) >= 0.58:
-            matched_key = k
-            break
-    if matched_key is None:
-        matched_key = _cluster_key(title)
-        story_clusters[matched_key] = {"sources": set(), "first_title": title, "ts": now}
-
-    story_clusters[matched_key]["sources"].add(source or "Unknown")
-    srcs = sorted(story_clusters[matched_key]["sources"])
-    return (len(srcs), srcs)
-
-# ── Phase 4: STORY INTELLIGENCE ──────────────────────────────────────────────
-# Groups article updates into ongoing story threads. Each real-world event
-# (a ferry sinking, a fire, an election) becomes ONE story with many updates.
-
-def _detect_place(title):
     """Detect a Maldivian place name in a headline."""
     t = title.lower()
     for p in _CLUSTER_PLACES:
@@ -1750,38 +1593,6 @@ def get_active_stories(limit=10):
 # ── Source Reliability Scoring ────────────────────────────────────────────────
 # Higher = more trusted. Used as a tie-breaker and a scoring boost so a direct
 # Mihaaru/MvCrisis story outranks a Google News scrape of the same topic.
-SOURCE_RELIABILITY = {
-    "mvcrisis":    70,  # fast but mixes ads — lowered, filtered separately
-    "mihaaru":     95,
-    "sun":         92,
-    "sunonline":   92,
-    "psm":         90,
-    "psmnews":     90,
-    "presidency":  90,  # official gov source
-    "edition":     88,
-    "avas":        85,
-    "see":         82,
-    "maldivesindependent": 82,
-    "oneonline":   80,
-    "maldivesvoice": 78,
-    "visitmaldives": 75,
-    "google news": 55,  # aggregator — least trusted, often duplicates
-}
-DEFAULT_RELIABILITY = 60
-
-def source_reliability(source_name):
-    """Return a 0-100 reliability score for a source string."""
-    if not source_name:
-        return DEFAULT_RELIABILITY
-    s = source_name.lower()
-    for key, val in SOURCE_RELIABILITY.items():
-        if key in s:
-            return val
-    return DEFAULT_RELIABILITY
-
-# Analytics counters (reset weekly)
-analytics = {"posts_by_cat": {}, "breaking_count": 0, "social_success": 0, "social_fail": 0, "week_start": None}
-
 def track_analytics(cat, is_breaking=False, social_ok=None):
     global analytics
     from datetime import timezone as _tz
@@ -1824,54 +1635,6 @@ def is_fresh(entry, hours=24):
             return utcnow() - dt < timedelta(hours=hours)
     except Exception as e: log.debug(f"is_fresh parse: {e}")
     return True
-
-def is_breaking(title, summary="", cat=""):
-    text = (title + " " + summary).lower()
-
-    # Never breaking for these categories
-    if cat in ["FOOTBALL", "TOURISM", "WEATHER", "SPORTS", "LIFESTYLE"]: return False
-
-    # Never breaking if it looks like an ad/promo (submarine hire, speedboat rental, etc.)
-    if _looks_like_ad(text): return False
-
-    # Check blacklist first — if any blacklist term present, not breaking
-    if any(bl in text for bl in BREAKING_BLACKLIST): return False
-
-    # Must match a real breaking keyword
-    if not any(kw in text for kw in BREAKING_KEYWORDS): return False
-
-    # For LOCAL category — must be Maldives related
-    if cat == "LOCAL":
-        mv_terms = ["maldives","male","malé","dhivehi","maldivian","raajje","atoll",
-                    "police","court","majlis","minister","president","island"]
-        if not any(t in text for t in mv_terms): return False
-
-    return True
-
-last_regular_post_time = None
-
-# ── Daily posting counters (reset at midnight MVT) ────────────────────────────
-def _mvt_today():
-    return (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
-
-daily_sports_count  = {"date": None, "count": 0}
-daily_world_count   = {"date": None, "count": 0}
-daily_tourism_count = {"date": None, "count": 0}
-
-def can_post_cat_today(counter_dict, max_count):
-    today = _mvt_today()
-    if counter_dict["date"] != today:
-        counter_dict["date"] = today
-        counter_dict["count"] = 0
-    return counter_dict["count"] < max_count
-
-def increment_cat_count(counter_dict):
-    today = _mvt_today()
-    if counter_dict["date"] != today:
-        counter_dict["date"] = today
-        counter_dict["count"] = 0
-    counter_dict["count"] += 1
-    persist_state()
 
 def can_post_regular():
     """
@@ -3066,272 +2829,15 @@ def post_article(article, seen, social_only=False, allow_social=True):
 
 
 # ── Run Job ───────────────────────────────────────────────────────────────────
-def score_article(a):
-    """Score article by Maldives relevance + breaking priority"""
-    score = 0
-    title_lower = a["title"].lower()
-    summary_lower = a.get("summary","").lower()
-    cat = a["cat"]
-    # Category priority — LOCAL is king
-    if cat == "LOCAL": score += 80
-    elif cat == "DISASTER": score += 70
-    elif cat == "WEATHER": score += 30
-    elif cat == "TOURISM": score += 20
-    elif cat == "WORLD": score += 10
-    elif cat in ["FOOTBALL", "SPORTS"]: score += 2  # Very low priority
-    # Maldives keywords boost
-    mv_kws = ["maldives","male","dhivehi","raajje","mvr","atoll","island","gaa",
-              "parliament","majlis","president","minister","police","court","malé",
-              "hulhumale","addu","fuvahmulah","laamu","economy","rufiyaa"]
-    for kw in mv_kws:
-        if kw in title_lower or kw in summary_lower: score += 20
-    # Sports penalty — only post if really relevant
-    if cat in ["FOOTBALL", "SPORTS"]:
-        maldives_sports = ["maldives","dhivehi","raajje","team maldives","national team"]
-        if not any(kw in title_lower + summary_lower for kw in maldives_sports):
-            score -= 30  # Heavy penalty for non-Maldives sports
-    # World news — only if Maldives related
-    if cat == "WORLD":
-        if not any(kw in title_lower + summary_lower for kw in ["maldives","indian ocean","south asia","economy"]):
-            score -= 20
-    # Breaking boost
-    if is_breaking(a["title"], a.get("summary",""), cat): score += 80
-    # Source reliability — trusted sources rank higher (0-25 boost)
-    rel = source_reliability(a.get("source",""))
-    score += int((rel - 50) / 2)  # 100→+25, 55→+2, 60→+5
-    # Trending boost — stories about hot topics rank higher (+30 if trending)
-    try:
-        trending, theme, count = is_trending_topic(a["title"], a.get("summary",""))
-        if trending:
-            score += 30
-            a["_trend_theme"] = theme  # stash for display
-    except Exception as e:
-        log.debug(f"trend check in score: {e}")
-    # Corroboration boost — if multiple outlets are covering the same event,
-    # it's a bigger story. +12 per extra source (capped at +36). The bot SEES
-    # the consensus and ranks accordingly — but never credits competitors publicly.
-    cluster_size = a.get("_cluster_size", 1)
-    if cluster_size >= 2:
-        score += min((cluster_size - 1) * 12, 36)
-    # ── Engagement nudge (Phase 2) — ±LEARN_CAP, INERT until /learning on ──
-    try:
-        eng_pts, eng_theme = topic_weight_for(a["title"], a.get("summary",""))
-        if eng_pts:
-            score += eng_pts
-            a["_engagement_pts"] = eng_pts
-            a["_engagement_theme"] = eng_theme
-    except Exception as e:
-        log.debug(f"engagement nudge: {e}")
-    return score
-
-def score_breakdown(a):
-    """
-    Return (total, [(label, points), ...]) explaining how an article scored.
-    Mirrors score_article() so the team can see exactly why a story ranked.
-    """
-    items = []
-    title_lower = a["title"].lower()
-    summary_lower = a.get("summary", "").lower()
-    text = title_lower + " " + summary_lower
-    cat = a["cat"]
-
-    cat_base = {"LOCAL": 80, "DISASTER": 70, "WEATHER": 30, "TOURISM": 20,
-                "WORLD": 10, "FOOTBALL": 2, "SPORTS": 2}.get(cat, 0)
-    if cat_base:
-        items.append((f"Category ({cat})", cat_base))
-
-    mv_kws = ["maldives","male","dhivehi","raajje","mvr","atoll","island","gaa",
-              "parliament","majlis","president","minister","police","court","malé",
-              "hulhumale","addu","fuvahmulah","laamu","economy","rufiyaa"]
-    mv_hits = sum(1 for kw in mv_kws if kw in title_lower or kw in summary_lower)
-    if mv_hits:
-        items.append((f"Maldives keywords (x{mv_hits})", mv_hits * 20))
-
-    if cat in ["FOOTBALL", "SPORTS"]:
-        maldives_sports = ["maldives","dhivehi","raajje","team maldives","national team"]
-        if not any(kw in text for kw in maldives_sports):
-            items.append(("Non-Maldives sports penalty", -30))
-
-    if cat == "WORLD":
-        if not any(kw in text for kw in ["maldives","indian ocean","south asia","economy"]):
-            items.append(("Non-relevant world penalty", -20))
-
-    try:
-        if is_breaking(a["title"], a.get("summary",""), cat):
-            items.append(("Breaking news", 80))
-    except Exception:
-        pass
-
-    rel = source_reliability(a.get("source", ""))
-    rel_pts = int((rel - 50) / 2)
-    if rel_pts:
-        items.append((f"Source trust ({a.get('source','?')}, {rel}/100)", rel_pts))
-
-    try:
-        trending, theme, count = is_trending_topic(a["title"], a.get("summary",""))
-        if trending:
-            items.append((f"Trending topic ({theme}, {count} stories)", 30))
-    except Exception:
-        pass
-
-    cluster_size = a.get("_cluster_size", 1)
-    if cluster_size >= 2:
-        corr = min((cluster_size - 1) * 12, 36)
-        items.append((f"Corroborated ({cluster_size} sources)", corr))
-
-    try:
-        eng_pts, eng_theme = topic_weight_for(a["title"], a.get("summary",""))
-        if eng_pts:
-            items.append((f"Audience nudge ({eng_theme})", eng_pts))
-    except Exception:
-        pass
-
-    total = sum(p for _, p in items)
-    return total, items
-
-def confidence_score(a):
-    """
-    Returns (confidence_pct, [(reason, points), ...]).
-
-    Confidence ≠ Priority.
-    Priority = "how important is this story"
-    Confidence = "how sure are we it's real and accurate"
-
-    A story can be HIGH priority but LOW confidence (big claim, one shaky source)
-    → that should be held for human review, not auto-posted.
-
-    Confidence is built from:
-      - Source reliability (official/trusted = high)
-      - Multiple sources reporting the same event (corroboration)
-      - Story Intelligence confirmation (part of a developing thread)
-      - Official source language (president office, police, MNDF, court)
-    """
-    confidence = 0
-    reasons = []
-    source = a.get("source", "").lower()
-    title_lower = a["title"].lower()
-    summary_lower = a.get("summary", "").lower()
-    text = title_lower + " " + summary_lower
-
-    # 1. Base confidence from source reliability (0-50 of the score)
-    rel = source_reliability(a.get("source", ""))
-    base = int(rel * 0.5)  # 95 reliability → 47 base
-    confidence += base
-    reasons.append((f"Source reliability ({a.get('source','?')})", base))
-
-    # 2. Corroboration — multiple independent sources = much higher confidence
-    cluster_size = a.get("_cluster_size", 1)
-    if cluster_size >= 3:
-        confidence += 35
-        reasons.append((f"Confirmed by {cluster_size} sources", 35))
-    elif cluster_size == 2:
-        confidence += 20
-        reasons.append(("Confirmed by 2 sources", 20))
-    else:
-        # Single source — confidence depends heavily on who it is
-        if rel < 75:
-            confidence -= 15
-            reasons.append(("Single unverified source", -15))
-
-    # 3. Official source language — government/authority confirmation
-    official_markers = ["president", "police", "mndf", "ministry", "court",
-                        "majlis", "parliament", "official", "government",
-                        "hdc", "customs", "mma", "health protection"]
-    if any(m in source for m in ["presidency", "psm", "police", "mndf"]):
-        confidence += 15
-        reasons.append(("Official source", 15))
-    elif any(m in text for m in official_markers):
-        confidence += 8
-        reasons.append(("Cites official authority", 8))
-
-    # 4. Story Intelligence — part of a confirmed developing thread
-    if a.get("_story_id") and not a.get("_story_is_new", True):
-        confidence += 10
-        reasons.append(("Part of developing story", 10))
-
-    # 5. Rumor/uncertainty language lowers confidence
-    rumor_markers = ["allegedly", "rumor", "rumour", "unconfirmed", "claims",
-                     "reportedly", "sources say", "believed to"]
-    if any(m in text for m in rumor_markers):
-        confidence -= 12
-        reasons.append(("Uncertain language", -12))
-
-    # Clamp 0-100
-    confidence = max(0, min(100, confidence))
-    return confidence, reasons
-
-# Threshold: stories above this priority but below this confidence get HELD
-HIGH_PRIORITY_THRESHOLD = 140   # important story
-LOW_CONFIDENCE_THRESHOLD = 55   # but we're not sure
-
-def should_hold_for_review(priority, confidence, is_breaking_flag):
-    """
-    Returns (hold, reason) — True if a high-priority but low-confidence story
-    should be held for human review instead of auto-posting.
-    """
-    if priority >= HIGH_PRIORITY_THRESHOLD and confidence < LOW_CONFIDENCE_THRESHOLD:
-        return (True, f"High priority ({priority}) but low confidence ({confidence}%) — needs review")
-    # Breaking news with very low confidence is especially risky
-    if is_breaking_flag and confidence < 45:
-        return (True, f"Breaking but unconfirmed ({confidence}% confidence) — verify first")
-    return (False, "")
-
-
-def format_score_breakdown(a):
-    """Pretty HTML block for Telegram showing the itemized score + confidence."""
-    total, items = score_breakdown(a)
-    lines = [f"🧮 <b>Why this scored {total}</b>", f"<i>{a['title'][:90]}</i>", ""]
-    lines.append("<b>PRIORITY — how important:</b>")
-    for label, pts in items:
-        sign = "➕" if pts > 0 else "➖"
-        lines.append(f"  {sign} {label}: <b>{pts:+d}</b>")
-    if not items:
-        lines.append("  <i>(no scoring signals matched)</i>")
-
-    # ── Confidence breakdown ──
-    try:
-        conf, conf_reasons = confidence_score(a)
-        lines.append("")
-        lines.append(f"<b>CONFIDENCE — how sure: {conf}%</b>")
-        for label, pts in conf_reasons:
-            sign = "➕" if pts > 0 else "➖"
-            lines.append(f"  {sign} {label}: <b>{pts:+d}</b>")
-        # Verdict
-        breaking_flag = is_breaking(a["title"], a.get("summary",""), a["cat"])
-        hold, hold_reason = should_hold_for_review(total, conf, breaking_flag)
-        lines.append("")
-        if hold:
-            lines.append(f"🛑 <b>HOLD:</b> {hold_reason}")
-        elif conf >= 75:
-            lines.append("✅ <b>High confidence</b> — safe to post.")
-        elif conf >= 55:
-            lines.append("🟡 <b>Moderate confidence</b> — fine to post.")
-        else:
-            lines.append("⚠️ <b>Low confidence</b> — consider verifying.")
-    except Exception as e:
-        log.debug(f"confidence in breakdown: {e}")
-
-    lines.append("")
-    try:
-        if is_breaking(a["title"], a.get("summary",""), a["cat"]):
-            lines.append("📌 <b>Breaking</b> → posts immediately (if confidence OK).")
-        elif a.get("lang") == "dv":
-            lines.append("📌 <b>Dhivehi</b> → always queued for Content Lab review.")
-        else:
-            lines.append("📌 <b>Regular English</b> → queued; auto-posts in 15 min if not reviewed.")
-    except Exception:
-        pass
-    return "\n".join(lines)
-
 def run_job(social_only=False, breaking_only=False):
     """
     Every 15-min scan:
       - Breaking news: posts immediately to all platforms (no queue, no limit)
       - Breaking low-confidence: goes to Alert, auto-posts in 30 min if no action
-      - Regular English: max 2-3 best per HOUR go to Content Lab — bot picks, not all
+      - Regular English: max 2-3 best per HOUR go to Content Lab - bot picks, not all
       - Regular Dhivehi: max 2-3 best per HOUR go to Content Lab
       - Total Content Lab cards: max 6 per hour (3 EN + 3 DV)
-      - Breaking is completely separate — never counts toward hourly budget
+      - Breaking is completely separate - never counts toward hourly budget
     """
     global daily_sports_count, daily_world_count, daily_tourism_count, _pending_article
     h = get_mvt_hour()
@@ -6648,6 +6154,10 @@ if __name__ == "__main__":
 
     init_database()  # connect to Postgres (falls back to JSON if unavailable)
     restore_state()  # bring back dedup memory, daily counters, pending cards, analytics
+
+    # Wire scoring module with utcnow
+    import scoring as _sc
+    _sc.utcnow = utcnow
 
     # Wire fetchers module with shared AI client
     import fetchers as _ft
