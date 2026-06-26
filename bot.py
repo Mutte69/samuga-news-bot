@@ -7335,7 +7335,7 @@ def start_api_server():
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
     import signal, atexit
-
+if __name__ == "__main__":
     def _graceful_shutdown(signum=None, frame=None):
         """Save all state before Railway kills the process on redeploy."""
         log.info("🛑 Shutdown signal received — saving state before exit...")
