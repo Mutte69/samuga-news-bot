@@ -4872,7 +4872,7 @@ if __name__ == "__main__":
     log.info("📲 Social queue worker started (10-min gap between posts)")
 
     init_database()  # connect to Postgres (falls back to JSON if unavailable)
-    restore_state()  # bring back dedup memory, daily counters, pending cards, analytics
+    pass  # restore_state()  # temporarily disabled  # bring back dedup memory, daily counters, pending cards, analytics
 
 
 # ── State Persistence (JSON fallback — survives Railway restarts) ─────────────
