@@ -608,6 +608,36 @@ def init_database():
                         created_at  TIMESTAMPTZ DEFAULT NOW()
                     );
                 """)
+                # Public Samuga AI chat analytics — one public brain across Website, Telegram, and future WhatsApp.
+                # This stores what people ask, so Samuga can learn public interest trends.
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public_chat_messages (
+                        id            SERIAL PRIMARY KEY,
+                        platform      TEXT,
+                        session_id    TEXT,
+                        user_key      TEXT,
+                        user_message  TEXT,
+                        bot_reply     TEXT,
+                        lang          TEXT,
+                        intent        TEXT,
+                        topics        TEXT[],
+                        used_search   BOOLEAN DEFAULT FALSE,
+                        created_at    TIMESTAMPTZ DEFAULT NOW()
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_public_chat_created ON public_chat_messages(created_at);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_public_chat_platform ON public_chat_messages(platform);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_public_chat_intent ON public_chat_messages(intent);")
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public_interest_daily (
+                        day           DATE,
+                        topic         TEXT,
+                        platform      TEXT,
+                        count         INTEGER DEFAULT 0,
+                        updated_at    TIMESTAMPTZ DEFAULT NOW(),
+                        PRIMARY KEY (day, topic, platform)
+                    );
+                """)
                 # Phase 4: STORY INTELLIGENCE — ongoing story threads ("Story #248")
                 # A story groups many article updates about the same real-world event.
                 cur.execute("""
@@ -760,6 +790,16 @@ def db_publish_article_for_website(article_id, title="", summary="", category="L
 
     public_title = strip_source_links(title or "")[:500]
     public_summary = samuga_public_summary(public_title, summary or "")[:2600]
+
+    # Quality gate: never publish Latin Thaana as broken English/Dhivehi.
+    # Gemini converts it to proper English or Thaana. If conversion fails, hold it back.
+    public_title, public_summary, lang, lang_ok = normalize_article_language_for_public(
+        public_title, public_summary, lang=lang
+    )
+    if not lang_ok:
+        log.warning(f"🌐 Website publish held — language cleanup failed: {public_title[:70]}")
+        return
+
     public_link = SAMUGA_PUBLIC_LINK
     public_source = SAMUGA_PUBLIC_SOURCE
     safe_cat = canonical_category(category or "LOCAL", public_title, public_summary)
@@ -2667,20 +2707,133 @@ def _gemini_post(prompt, timeout=15):
     return None
 
 def make_dhivehi_caption(english_text, title):
-    """Convert English news caption to Dhivehi using Gemini (with model fallback)."""
+    """Convert English/Latin news text to clean Dhivehi Thaana using Gemini."""
     if not GEMINI_API_KEY:
         return None
-    prompt = f"""You are a Maldivian news writer. Write a short news caption in Dhivehi (Thaana script) for this news.
+    prompt = f"""You are a Maldivian news editor for Samuga Media.
 
-English title: {title}
-English summary: {english_text}
+Write a short public news caption in proper Dhivehi Thaana script.
 
-Write 2-3 sentences in natural Dhivehi as it would appear in a Maldivian news channel.
-Return ONLY the Dhivehi text in Thaana script, nothing else."""
+Rules:
+- Output ONLY Dhivehi Thaana.
+- 2 to 3 natural sentences.
+- Clean Maldivian news style.
+- Do not add facts that are not in the input.
+- Do not include external source links.
+- Do not leave Latin Thaana/romanized Dhivehi.
+- Brand names can stay in English only if necessary.
+
+Title:
+{title}
+
+Summary:
+{english_text}
+"""
     result = _gemini_post(prompt)
-    if result:
+    if result and is_dhivehi(result):
         log.info("✅ Gemini Dhivehi caption done")
-    return result
+        return strip_source_links(result).strip()
+    if result:
+        log.warning("Gemini Dhivehi caption returned non-Thaana text — rejected")
+    return None
+
+
+# ── Dhivehi Quality Layer: Latin Thaana → Proper Thaana / English ─────────────
+_LATIN_THAANA_WORDS = [
+    "raajje","mihaaru","avas","dhuvas","dhivehi","vaguthu","gothun","medhu",
+    "hurihaa","dhathuru","furusathu","baakee","haftaa","majlis","sarukaaru",
+    "rayyithun","tharaggee","qanoon","fuluhun","khabaru","miadhu","airport",
+    "guriathulun","govaalaifi","kuri","mahchah","mifaharu","dhaaira","kanthah"
+]
+
+def looks_latin_thaana(text):
+    """Detect romanized Dhivehi/Latin Thaana so it does not leak into website as English."""
+    s = str(text or "").lower()
+    if not s or is_dhivehi(s):
+        return False
+    hits = sum(1 for w in _LATIN_THAANA_WORDS if w in s)
+    # Romanized Dhivehi often has aa/ee/oo/dh/th/haa patterns.
+    pattern_hits = len(re.findall(r"\b[a-z]*(?:dh|th|aa|ee|oo|vv|lh|sh)[a-z]*\b", s))
+    return hits >= 2 or (hits >= 1 and pattern_hits >= 3)
+
+def gemini_latin_thaana_to_thaana(text):
+    """Rewrite Latin Thaana / romanized Dhivehi into clean Thaana news style."""
+    if not GEMINI_API_KEY:
+        return None
+    prompt = f"""Rewrite the following romanized Dhivehi / Latin Thaana into proper Dhivehi Thaana script.
+
+Rules:
+- Output ONLY Dhivehi Thaana.
+- Clean newsroom style.
+- Do not add new facts.
+- Do not use Latin letters unless it is a brand name that cannot be translated.
+- Keep it concise.
+
+Text:
+{text}
+"""
+    out = _gemini_post(prompt, timeout=20)
+    if out and is_dhivehi(out):
+        return strip_source_links(out).strip()
+    return None
+
+def gemini_latin_thaana_to_english(text):
+    """Translate romanized Dhivehi / Latin Thaana to clean English for English website articles."""
+    if not GEMINI_API_KEY:
+        return None
+    prompt = f"""Translate this romanized Dhivehi / Latin Thaana news text into clean English.
+
+Rules:
+- Output ONLY English.
+- Do not add new facts.
+- Keep names and places accurate.
+- Clean news style.
+
+Text:
+{text}
+"""
+    out = _gemini_post(prompt, timeout=20)
+    if out and not is_dhivehi(out):
+        return strip_source_links(out).strip()
+    return None
+
+def normalize_article_language_for_public(title="", summary="", lang="en", prefer="auto"):
+    """
+    Public quality gate:
+    - Dhivehi public text must be real Thaana.
+    - Latin Thaana is converted by Gemini before public website/social use.
+    - If conversion fails, caller can hold/skip instead of publishing ugly text.
+    Returns (title, summary, lang, ok).
+    """
+    title = strip_source_links(title or "")
+    summary = strip_source_links(summary or "")
+    combined = f"{title} {summary}".strip()
+    current_lang = (lang or "en").lower()
+    has_thaana = is_dhivehi(combined)
+    latin_dv = looks_latin_thaana(combined)
+
+    if current_lang in ("dv", "dhivehi") or has_thaana:
+        if has_thaana:
+            return title, summary, "dv", True
+        if latin_dv:
+            converted = gemini_latin_thaana_to_thaana(combined)
+            if converted:
+                return converted[:500], converted[:2600], "dv", True
+            return title, summary, "dv", False
+        return title, summary, "en", True
+
+    if latin_dv:
+        # For English website side, convert Latin Thaana to English. If Gemini cannot,
+        # do not publish it publicly as broken English.
+        converted = gemini_latin_thaana_to_english(combined)
+        if converted:
+            # Use first sentence as title-ish if original title was romanized.
+            sent = re.split(r"(?<=[.!?])\s+", converted.strip(), maxsplit=1)
+            new_title = sent[0][:500] if sent else converted[:500]
+            return new_title, converted[:2600], "en", True
+        return title, summary, "en", False
+
+    return title, summary, "en", True
 
 # ── Auto Poll ─────────────────────────────────────────────────────────────────
 POLL_KEYWORDS = [
@@ -6655,26 +6808,19 @@ def handle_updates():
                                 reply_to=msg_id)
                             log.info(f"🚫 DM rate limit hit: {display_name} ({user_id})")
                         else:
-                            log.info(f"💬 DM {display_name} [{count}/{limit}]: {text[:50]}")
-                            # Check for story-timeline questions first
-                            story_answer = answer_story_query(text)
-                            if story_answer:
-                                send_text(chat_id, story_answer, reply_to=msg_id, thread_id=thread_id)
-                            elif is_dhivehi(text):
-                                log.info("🇲🇻 Dhivehi detected — using Gemini")
-                                headlines = get_local_headlines()
-                                context = "\n".join(headlines[:5]) if headlines else ""
-                                history = get_conversation(user_id)
-                                reply = chat_with_gemini_dhivehi(text, context, history)
-                                if reply:
-                                    add_to_conversation(user_id, "user", text)
-                                    add_to_conversation(user_id, "assistant", reply)
-                                else:
-                                    reply = chat_with_claude(text, user_id)
-                                    send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
-                            else:
-                                reply = chat_with_claude(text, user_id)
-                                send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
+                            log.info(f"💬 Public Telegram Samuga AI {display_name} [{count}/{limit}]: {text[:50]}")
+                            try:
+                                reply = public_samuga_ai_chat(
+                                    message=text,
+                                    platform="telegram",
+                                    user_key=user_id,
+                                    session_id=str(chat_id),
+                                    lang=("dv" if is_dhivehi(text) else "en")
+                                )
+                            except Exception as e:
+                                log.error(f"Unified public Telegram chat failed: {e}")
+                                reply = "Small issue on my side bro 😅 Try again in a moment."
+                            send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
 
                 elif chat_type in ["group","supergroup"]:
                     is_core_team = str(chat_id) == CORE_TEAM_CHAT_ID
@@ -7800,22 +7946,20 @@ def handle_updates():
 
                             threading.Thread(target=_reply_coreteam, daemon=True).start()
 
-                    # Regular group — only respond when tagged
+                    # Regular public group — only respond when tagged, using the same public Samuga AI brain
                     elif tagged and clean:
-                        log.info(f"💬 Group {display_name}: {clean[:50]}")
-                        if is_dhivehi(clean):
-                            log.info("🇲🇻 Dhivehi group mention — using Gemini")
-                            headlines = get_local_headlines()
-                            context = "\n".join(headlines[:5]) if headlines else ""
-                            history = get_conversation(user_id)
-                            reply = chat_with_gemini_dhivehi(clean, context, history)
-                            if reply:
-                                add_to_conversation(user_id, "user", clean)
-                                add_to_conversation(user_id, "assistant", reply)
-                            else:
-                                reply = chat_with_claude(clean, user_id)
-                        else:
-                            reply = chat_with_claude(clean, user_id)
+                        log.info(f"💬 Public group Samuga AI {display_name}: {clean[:50]}")
+                        try:
+                            reply = public_samuga_ai_chat(
+                                message=clean,
+                                platform="telegram_group",
+                                user_key=f"{chat_id}:{user_id}",
+                                session_id=str(chat_id),
+                                lang=("dv" if is_dhivehi(clean) else "en")
+                            )
+                        except Exception as e:
+                            log.error(f"Unified public group chat failed: {e}")
+                            reply = "Small issue on my side bro 😅 Try again in a moment."
                         send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
         except Exception as e:
             log.error(f"Update loop: {e}"); time.sleep(5)
@@ -7842,10 +7986,10 @@ def _api_has_thaana(text):
     return any("\u0780" <= ch <= "\u07BF" for ch in str(text or ""))
 
 def _api_lang(title, summary, lang):
-    lang = str(lang or "").lower()
-    if lang in ("dv", "dhivehi"):
-        return "dv"
-    return "dv" if _api_has_thaana((title or "") + " " + (summary or "")) else "en"
+    # Website language must be based on actual script quality.
+    # Do not show Latin Thaana in the Dhivehi side.
+    text = (title or "") + " " + (summary or "")
+    return "dv" if _api_has_thaana(text) else "en"
 
 def _api_category(cat, title="", summary=""):
     try:
@@ -7872,7 +8016,7 @@ def api_home():
         "status": "online",
         "name": "Samuga News Bot API",
         "version": SAMUGA_VERSION,
-        "endpoints": ["/api/stories", "/api/article?id=ARTICLE_ID", "/api/health", "/api/chat"]
+        "endpoints": ["/api/stories", "/api/article?id=ARTICLE_ID", "/api/health", "/api/chat", "/api/public-interest"]
     })
 
 @api_app.get("/api/health")
@@ -7901,6 +8045,25 @@ def api_health():
         "latest": latest,
         "queue": len(_social_queue) if "_social_queue" in globals() else 0
     })
+
+
+@api_app.get("/api/public-interest")
+def api_public_interest():
+    """Aggregated public Samuga AI interest radar. No private messages exposed."""
+    try:
+        rows = db_execute("""
+            SELECT topic, platform, SUM(count) AS total
+            FROM public_interest_daily
+            WHERE day >= CURRENT_DATE - INTERVAL '7 days'
+            GROUP BY topic, platform
+            ORDER BY total DESC
+            LIMIT 50
+        """, fetch="all") or []
+        items = [{"topic": r[0], "platform": r[1], "count": int(r[2] or 0)} for r in rows]
+        return jsonify({"ok": True, "window": "7d", "items": items})
+    except Exception as e:
+        log.error(f"Website API /api/public-interest error: {e}")
+        return jsonify({"ok": False, "items": []})
 
 @api_app.get("/api/stories")
 def api_stories():
@@ -7931,6 +8094,11 @@ def api_stories():
             safe_title = _api_clean_text(strip_source_links(title), 500)
             safe_summary = _api_clean_text(strip_source_links(article_excerpt or summary), 420)
             if not safe_title:
+                continue
+
+            # Hide old broken Latin Thaana rows from the website feed.
+            # New rows are fixed before publish by normalize_article_language_for_public().
+            if looks_latin_thaana(f"{safe_title} {safe_summary}") and not _api_has_thaana(f"{safe_title} {safe_summary}"):
                 continue
 
             # Dedupe same headline in API so the site stays clean
@@ -7986,6 +8154,8 @@ def api_article():
 
         safe_title = _api_clean_text(strip_source_links(title), 500)
         safe_summary = _api_clean_text(strip_source_links(summary), 1800)
+        if looks_latin_thaana(f"{safe_title} {safe_summary}") and not _api_has_thaana(f"{safe_title} {safe_summary}"):
+            return jsonify({"error": "article language cleanup pending"}), 404
         safe_category = _api_category(category, safe_title, safe_summary)
         safe_lang = _api_lang(safe_title, safe_summary, lang)
         body = article_body
@@ -8227,13 +8397,256 @@ def _public_chat_context(rows):
     return "\n".join(lines)
 
 
+
+# ── Unified Public Samuga AI Brain ────────────────────────────────────────────
+# Website chat, public Telegram DM, and future WhatsApp should all call this one
+# function so Samuga AI has one public personality, one memory, and one analytics stream.
+
+_PUBLIC_TOPIC_KEYWORDS = {
+    "housing": ["housing","flat","flats","rent","land","apartment","gedhoru","hiya","vinares","ފްލެޓް","ބިން"],
+    "politics": ["politics","president","minister","majlis","parliament","mdp","pnc","ppm","election","bill","law","ރައީސް","މަޖިލީސް"],
+    "economy": ["economy","dollar","usd","mvr","rufiyaa","debt","tax","price","inflation","budget","ޑޮލަރ","ރުފިޔާ"],
+    "tourism": ["tourism","tourist","resort","travel","airport","arrival","hotel","ޓޫރިޒަމް"],
+    "crime": ["police","arrest","court","murder","stab","drug","gang","theft","ފުލުހުން","ކޯޓު"],
+    "health": ["health","hospital","doctor","clinic","aasandha","disease","ސިއްހަތު","ހޮސްޕިޓަލް"],
+    "education": ["school","student","visa","university","teacher","exam","ސްކޫލް","ދަރިވަރު"],
+    "weather": ["weather","rain","storm","wind","sea","alert","mms","ވައި","ވާރޭ"],
+    "foreign": ["iran","israel","us","usa","america","india","china","qatar","uk","war","global","world","އިންޑިޔާ","ޗައިނާ"],
+    "sports": ["sports","football","fifa","match","team","ކުޅިވަރު","ފުޓްބޯޅަ"],
+}
+
+_CURRENT_GLOBAL_WORDS = [
+    "now","current","latest","today","breaking","happening","war","conflict","iran","israel",
+    "america","us ","usa","ukraine","russia","qatar","oil","global","world"
+]
+
+def public_detect_topics(message):
+    low = (message or "").lower()
+    topics = []
+    for topic, kws in _PUBLIC_TOPIC_KEYWORDS.items():
+        if any(k in low for k in kws):
+            topics.append(topic)
+    if not topics and _public_chat_is_news_query(message):
+        topics.append("news")
+    if not topics:
+        topics.append("general")
+    return topics[:5]
+
+def public_detect_intent(message):
+    low = (message or "").lower()
+    if any(w in low for w in ["hi", "hello", "hey", "salaam", "ހެލޯ"]) and len(low.split()) <= 4:
+        return "greeting"
+    if any(w in low for w in ["breaking", "urgent", "ބްރޭކިންގ"]):
+        return "breaking_news"
+    if any(w in low for w in ["summarize", "summary", "briefing", "biggest", "today", "މިއަދު"]):
+        return "briefing"
+    if _public_chat_is_news_query(message):
+        return "news_query"
+    if any(w in low for w in _CURRENT_GLOBAL_WORDS):
+        return "current_global"
+    return "general_chat"
+
+def public_is_global_current_query(message):
+    low = " " + (message or "").lower() + " "
+    local_hits = ["maldives","raajje","dhivehi","male","malé","samuga","ރާއްޖެ","ދިވެހި"]
+    if any(x in low for x in local_hits):
+        return False
+    return any(w in low for w in _CURRENT_GLOBAL_WORDS) or any(t in public_detect_topics(message) for t in ["foreign"])
+
+def public_log_chat(platform, session_id, user_key, user_message, bot_reply, lang, intent, topics, used_search=False):
+    """Store public Samuga AI chats for interest analytics across website/Telegram/future WhatsApp."""
+    try:
+        if not DB_ENABLED:
+            return
+        topics = topics or ["general"]
+        db_execute("""
+            INSERT INTO public_chat_messages
+                (platform, session_id, user_key, user_message, bot_reply, lang, intent, topics, used_search)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            platform, str(session_id or "")[:120], str(user_key or "")[:160],
+            str(user_message or "")[:1200], str(bot_reply or "")[:1800],
+            lang, intent, topics, bool(used_search)
+        ))
+        for topic in topics:
+            db_execute("""
+                INSERT INTO public_interest_daily (day, topic, platform, count, updated_at)
+                VALUES (CURRENT_DATE, %s, %s, 1, NOW())
+                ON CONFLICT (day, topic, platform)
+                DO UPDATE SET count = public_interest_daily.count + 1, updated_at = NOW()
+            """, (topic, platform))
+    except Exception as e:
+        log.debug(f"Public chat analytics save failed: {e}")
+
+def public_session_key(platform, user_key, session_id=""):
+    platform = str(platform or "web").lower()
+    user_key = str(user_key or "anon")[:80]
+    session_id = str(session_id or "default")[:80]
+    if platform == "telegram":
+        return f"public:telegram:{user_key}"
+    if platform == "whatsapp":
+        return f"public:whatsapp:{user_key}"
+    return f"public:web:{user_key}:{session_id}"
+
+def public_get_recent_interest(limit=8):
+    try:
+        rows = db_execute("""
+            SELECT topic, SUM(count) AS c
+            FROM public_interest_daily
+            WHERE day >= CURRENT_DATE - INTERVAL '3 days'
+            GROUP BY topic
+            ORDER BY c DESC
+            LIMIT %s
+        """, (limit,), fetch="all") or []
+        return ", ".join([f"{r[0]} ({r[1]})" for r in rows])
+    except Exception:
+        return ""
+
+def public_build_live_context(message, lang="en"):
+    """Use Tavily smartly: local queries search Maldives; global/current queries search globally."""
+    try:
+        if not TAVILY_API_KEY:
+            return "", False
+        if public_is_global_current_query(message):
+            q = message
+        elif _public_chat_is_news_query(message):
+            q = f"Maldives news {message}"
+        else:
+            # For normal questions we usually don't need search.
+            return "", False
+        ctx = tavily_search(q)
+        return strip_source_links(_api_clean_text(ctx, 1800)), bool(ctx)
+    except Exception as e:
+        log.warning(f"Public Samuga AI live search failed: {e}")
+        return "", False
+
+def public_samuga_ai_chat(message, platform="web", user_key="", session_id="", lang=None):
+    """
+    One public Samuga AI for website + @SamugaNewsBot + future WhatsApp.
+    This is NOT the private core-team brain.
+    """
+    message = _public_chat_clean_message(message)
+    if not message:
+        return "Ask me something bro. I can chat or help with latest news."
+
+    detected_lang = "dv" if (lang == "dv" or is_dhivehi(message)) else "en"
+    skey = public_session_key(platform, user_key, session_id)
+    history = get_conversation(skey)[-8:]
+    intent = public_detect_intent(message)
+    topics = public_detect_topics(message)
+
+    # Story intelligence first if the archive can directly answer.
+    story_answer = None
+    try:
+        story_answer = answer_story_query(message)
+    except Exception as e:
+        log.debug(f"Public story query fallback: {e}")
+
+    latest_rows = []
+    search_rows = []
+    db_context = ""
+    if intent in ("news_query", "breaking_news", "briefing", "current_global") or topics != ["general"]:
+        latest_rows = _public_chat_latest_rows(lang=None if detected_lang == "en" else "dv", limit=8, hours=48)
+        search_rows = _public_chat_search_rows(message, lang=None if detected_lang == "en" else "dv", limit=6)
+        context_rows = search_rows or latest_rows
+        if intent == "breaking_news":
+            breaking_rows = [r for r in latest_rows if str(r.get("category","")).upper() == "BREAKING"]
+            context_rows = breaking_rows or latest_rows[:4]
+        db_context = _public_chat_context(context_rows[:6])
+
+    live_context, used_search = public_build_live_context(message, lang=detected_lang)
+    interests = public_get_recent_interest()
+
+    if story_answer and not public_is_global_current_query(message):
+        reply = _public_chat_clean_reply(story_answer)
+        add_to_conversation(skey, "user", message)
+        add_to_conversation(skey, "assistant", reply)
+        public_log_chat(platform, session_id, user_key, message, reply, detected_lang, intent, topics, used_search=False)
+        return reply
+
+    system = f"""You are Samuga AI, the single public chatbot for Samuga Media.
+You are used on the website, Telegram @SamugaNewsBot, and later WhatsApp.
+You are friendly, sharp, and useful — like a Maldivian news buddy, not a hard-coded bot.
+
+IMPORTANT IDENTITY:
+- You are the PUBLIC Samuga AI, not the private core-team newsroom brain.
+- Never reveal admin/content-lab/private commands.
+- You can answer Maldives news, global current events, and normal questions.
+- For current/global questions, use live search context if provided.
+- For Maldives questions, use Samuga archive first, then live search if helpful.
+- Do not include external source URLs. Send people to @samugacommunity for Samuga updates.
+- Keep replies conversational. No markdown **, ###, long separators, or robotic lists.
+- Short by default. If news: max 3 items unless user asks for more.
+- Remember the chat history and answer follow-ups naturally.
+- If user uses Dhivehi/Thaana, answer in natural Dhivehi. If English, answer in English.
+
+Public interest radar from recent chats: {interests or "not enough data yet"}.
+"""
+
+    user_block = f"""User message:
+{message}
+
+Intent: {intent}
+Topics: {", ".join(topics)}
+Platform: {platform}
+Fresh Samuga archive context:
+{db_context or "No direct Samuga archive context found."}
+
+Live search context:
+{live_context or "No live search context used or available."}
+"""
+
+    try:
+        messages = []
+        for h in history[-8:]:
+            role = h.get("role")
+            content = h.get("content", "")
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content[:1200]})
+        messages.append({"role": "user", "content": user_block})
+
+        if detected_lang == "dv" and GEMINI_API_KEY:
+            # Gemini is stronger for Dhivehi. Include history manually in prompt.
+            hist_txt = "\n".join([f"{h.get('role')}: {h.get('content','')}" for h in history[-6:]])
+            gemini_prompt = f"""{system}
+
+Recent chat history:
+{hist_txt}
+
+{user_block}
+
+Answer now in natural Dhivehi Thaana if the user used Dhivehi; otherwise English.
+"""
+            reply = _gemini_post(gemini_prompt, timeout=25) or ""
+            if not reply:
+                raise RuntimeError("Gemini public chat returned empty")
+        else:
+            msg = ai.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=650,
+                system=system,
+                messages=messages
+            )
+            reply = msg.content[0].text.strip()
+
+    except Exception as e:
+        log.error(f"Unified public Samuga AI failed: {e}")
+        # Safe fallback: show latest DB rows if available.
+        if latest_rows:
+            reply = _public_chat_format_news(latest_rows[:3], lang=detected_lang)
+        else:
+            reply = "I had a small issue checking live updates bro. Try again in a moment."
+
+    reply = _public_chat_clean_reply(reply)
+    add_to_conversation(skey, "user", message)
+    add_to_conversation(skey, "assistant", reply)
+    public_log_chat(platform, session_id, user_key, message, reply, detected_lang, intent, topics, used_search=used_search)
+    return reply
+
+
 @api_app.route("/api/chat", methods=["POST", "OPTIONS"])
 def api_chat():
-    """
-    Public website chat for Samuga AI.
-    This mirrors the public @SamugaNewsBot chat style, NOT the private core-team brain.
-    It can chat normally, but when the user asks news/current questions it uses fresh Samuga DB context first.
-    """
+    """Public website chat endpoint using the unified public Samuga AI brain."""
     if request.method == "OPTIONS":
         return jsonify({"ok": True})
 
@@ -8257,112 +8670,29 @@ def api_chat():
             return jsonify({
                 "ok": False,
                 "error": "empty_message",
-                "reply": "Ask me something bro. I can chat or help with latest Maldives news."
+                "reply": "Ask me something bro. I can chat or help with latest news."
             }), 400
 
         if _public_chat_is_blocked(message):
             return jsonify({
                 "ok": True,
-                "reply": "I can only do public chat and public news here bro. Posting, approvals, and newsroom controls are only for the private Samuga team Telegram."
+                "reply": "I can only do public chat and public news here bro. Posting, approvals, and newsroom controls are only for the private Samuga team."
             })
 
-        user_id = f"web:{client_id}:{session_id}"
-        log.info(f"🌐 Website chat {client_id}: {message[:80]}")
+        log.info(f"🌐 Website public Samuga AI {client_id}: {message[:80]}")
+        reply = public_samuga_ai_chat(
+            message=message,
+            platform="web",
+            user_key=client_id,
+            session_id=session_id,
+            lang=lang
+        )
 
-        # Keep the same public Telegram bot feeling:
-        # 1) Story timeline/search answer if the bot already knows a direct story answer
-        # 2) Fresh Samuga website DB context for news/current questions
-        # 3) Normal friendly public Samuga AI chat for casual/general questions
-        story_answer = None
-        try:
-            story_answer = answer_story_query(message)
-        except Exception as e:
-            log.warning(f"Website story query fallback: {e}")
-
-        if story_answer:
-            reply = story_answer
-        else:
-            is_news_question = _public_chat_is_news_query(message)
-            is_breaking_question = any(w in message.lower() for w in ["breaking", "urgent", "ބްރޭކިންގ"])
-            is_briefing_question = any(w in message.lower() for w in ["briefing", "summarize", "summary", "today", "biggest", "މިއަދު"])
-
-            latest_rows = _public_chat_latest_rows(lang=lang, limit=8, hours=36)
-            search_rows = _public_chat_search_rows(message, lang=lang, limit=6)
-
-            context_rows = search_rows or latest_rows
-            if is_breaking_question:
-                breaking_rows = [r for r in latest_rows if str(r.get("category", "")).upper() == "BREAKING"]
-                context_rows = breaking_rows or latest_rows[:4]
-
-            context = _public_chat_context(context_rows[:6])
-            tavily_context = _public_chat_tavily_context(message, lang=lang) if is_news_question else ""
-
-            # For public website chat, use the public Samuga AI style — not core-team brain.
-            # The prompt keeps answers short and human, while fresh context prevents old memory headlines.
-            if is_news_question:
-                if lang == "dv":
-                    safe_prompt = (
-                        "You are Samuga AI, the public SamugaNewsBot style assistant. "
-                        "Answer in natural Dhivehi if the user used Dhivehi, otherwise simple English. "
-                        "Use fresh Samuga context first, and Tavily live search context only to add current facts. "
-                        "Do not mention old stories from memory. Do not use markdown symbols like ** or ###. "
-                        "Keep it short. For latest news, give maximum 3 items. Do not include external source links; direct users to @samugacommunity. "
-                        "For breaking, only say breaking if context actually looks breaking. "
-                        "Be friendly like a chat, not a formal article.\n\n"
-                        f"Fresh Samuga context:\n{context}\n\nTavily live search context:\n{tavily_context}\n\n"
-                        f"User asked: {message}"
-                    )
-                else:
-                    if is_breaking_question:
-                        mode = "breaking news check"
-                    elif is_briefing_question:
-                        mode = "short daily briefing"
-                    else:
-                        mode = "latest news chat"
-                    safe_prompt = (
-                        "You are Samuga AI, the public @SamugaNewsBot style assistant. "
-                        "Reply naturally, friendly, and human — like a helpful Maldivian news buddy. "
-                        "Use fresh Samuga context first, and Tavily live search context only to add current facts. "
-                        "Do not use old headlines from memory. Do not use markdown symbols like **, ###, or long separators. "
-                        "Do not dump a long list. Maximum 3 short items unless the user asks for more. "
-                        "Avoid repeating the title and summary. Keep each item to one short sentence. "
-                        "Do not include external source links or tell users to visit source websites; send them to @samugacommunity for full updates. End with one natural follow-up question.\n\n"
-                        f"Mode: {mode}\n"
-                        f"Fresh Samuga context:\n{context}\n\nTavily live search context:\n{tavily_context}\n\n"
-                        f"User asked: {message}"
-                    )
-            else:
-                safe_prompt = (
-                    "You are Samuga AI, the public @SamugaNewsBot style assistant. "
-                    "Chat naturally and friendly. You can answer normal questions too. "
-                    "If the question is about news, use the fresh Samuga context below. "
-                    "Do not reveal private newsroom/admin details. Do not approve/reject/post anything. "
-                    "Keep the answer short and conversational. No markdown symbols like **. Do not include external source links; direct users to @samugacommunity when needed.\n\n"
-                    f"Fresh Samuga context if needed:\n{context}\n\n"
-                    f"User message: {message}"
-                )
-
-            if lang == "dv":
-                try:
-                    history = get_conversation(user_id)
-                    reply = chat_with_gemini_dhivehi(safe_prompt, context, history)
-                    if reply:
-                        add_to_conversation(user_id, "user", message)
-                        add_to_conversation(user_id, "assistant", reply)
-                    else:
-                        reply = chat_with_claude(safe_prompt, user_id)
-                except Exception as e:
-                    log.error(f"Website Dhivehi public chat fallback: {e}")
-                    reply = chat_with_claude(safe_prompt, user_id)
-            else:
-                reply = chat_with_claude(safe_prompt, user_id)
-
-        reply = _public_chat_clean_reply(reply) or "Sorry bro, I couldn't answer that right now. Try asking again."
         return jsonify({
             "ok": True,
             "reply": reply,
-            "source": "Samuga AI public chat",
-            "mode": "public_samuganewsbot_style",
+            "source": "Unified public Samuga AI",
+            "mode": "public_samuga_ai",
             "rate_limit": {"limit": limit, "window_seconds": _PUBLIC_CHAT_WINDOW}
         })
 
