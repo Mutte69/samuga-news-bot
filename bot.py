@@ -628,14 +628,33 @@ def db_execute(query, params=None, fetch=None):
             _db_pool.putconn(conn)
 
 def db_record_article(article, score=0, reliability=0, status="seen", is_breaking=False):
-    """Insert or update an article in the archive. Safe no-op if DB disabled."""
+    """
+    Insert or update an article in the archive. Safe no-op if DB disabled.
+
+    Important website fix:
+    Never downgrade an article that is already website-visible/public.
+    Previously, a later db_record_article(... status='seen') could overwrite
+    'posted', which made English website stories disappear or stop updating.
+    """
     if not DB_ENABLED:
         return
     db_execute("""
         INSERT INTO articles (id, title, summary, link, source, category, lang, score, reliability, is_breaking, status)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT (id) DO UPDATE SET
-            score=EXCLUDED.score, reliability=EXCLUDED.reliability, status=EXCLUDED.status
+            title=COALESCE(NULLIF(EXCLUDED.title,''), articles.title),
+            summary=COALESCE(NULLIF(EXCLUDED.summary,''), articles.summary),
+            link=COALESCE(NULLIF(EXCLUDED.link,''), articles.link),
+            source=COALESCE(NULLIF(EXCLUDED.source,''), articles.source),
+            category=COALESCE(NULLIF(EXCLUDED.category,''), articles.category),
+            lang=COALESCE(NULLIF(EXCLUDED.lang,''), articles.lang),
+            score=GREATEST(COALESCE(articles.score,0), COALESCE(EXCLUDED.score,0)),
+            reliability=GREATEST(COALESCE(articles.reliability,0), COALESCE(EXCLUDED.reliability,0)),
+            is_breaking=COALESCE(EXCLUDED.is_breaking, articles.is_breaking),
+            status=CASE
+                WHEN articles.status IN ('posted','published','social_posted') THEN articles.status
+                ELSE EXCLUDED.status
+            END
     """, (
         article.get("id"), article.get("title","")[:500], article.get("summary","")[:2000],
         article.get("link",""), article.get("source",""),
@@ -647,33 +666,26 @@ def db_mark_status(article_id, status, posted=False):
     """
     Update an article's lifecycle status.
 
-    Website safety rule:
-    Never downgrade a website-visible English story from posted → queued.
-    This was the reason the website stopped receiving updates after English
-    stories entered Content Lab.
+    Website fix:
+    English stories are published to website as soon as they enter Content Lab.
+    After that, old code called db_mark_status(id, 'queued') and accidentally
+    hid them from /api/stories. This function now blocks queued/seen from
+    downgrading posted/published/social_posted rows.
     """
     if not DB_ENABLED or not article_id:
         return
-
-    status = str(status or "").lower()
-
-    if posted or status in ("posted", "published", "social_posted"):
-        db_execute("UPDATE articles SET status=%s, posted_at=NOW() WHERE id=%s", (status or "posted", article_id))
-        return
-
-    # Do not let later queue logic hide an already-public story from /api/stories.
-    if status == "queued":
+    if posted:
+        db_execute("UPDATE articles SET status=%s, posted_at=COALESCE(posted_at, NOW()) WHERE id=%s", (status, article_id))
+    else:
         db_execute("""
             UPDATE articles
             SET status = CASE
-                WHEN status IN ('posted','published','social_posted') THEN status
-                ELSE 'queued'
+                WHEN status IN ('posted','published','social_posted') AND %s IN ('queued','seen')
+                    THEN status
+                ELSE %s
             END
             WHERE id=%s
-        """, (article_id,))
-        return
-
-    db_execute("UPDATE articles SET status=%s WHERE id=%s", (status, article_id))
+        """, (status, status, article_id))
 
 def db_publish_article_for_website(article_id, title="", summary="", category="LOCAL",
                                    source="Samuga Media", link="", lang="en",
@@ -712,7 +724,7 @@ def db_publish_article_for_website(article_id, title="", summary="", category="L
             reliability=GREATEST(COALESCE(articles.reliability,0), COALESCE(EXCLUDED.reliability,0)),
             is_breaking=COALESCE(EXCLUDED.is_breaking, articles.is_breaking),
             status='posted',
-            posted_at=NOW(),
+            posted_at=COALESCE(articles.posted_at, NOW()),
             match_key=COALESCE(NULLIF(EXCLUDED.match_key,''), articles.match_key)
     """, (
         article_id, (title or "")[:500], (summary or "")[:2000], link or "",
@@ -7621,7 +7633,7 @@ def api_health():
         row = db_execute("""
             SELECT title, posted_at, found_at, status
             FROM articles
-            WHERE status IN ('posted','published','social_posted')
+            WHERE (status IN ('posted','published','social_posted') OR (status='queued' AND lang='en'))
             ORDER BY COALESCE(posted_at, found_at) DESC NULLS LAST
             LIMIT 1
         """, fetch="one")
@@ -7656,7 +7668,7 @@ def api_stories():
         rows = db_execute("""
             SELECT id, title, summary, category, source, link, posted_at, found_at, lang, status
             FROM articles
-            WHERE status IN ('posted','published','social_posted')
+            WHERE (status IN ('posted','published','social_posted') OR (status='queued' AND lang='en'))
             ORDER BY COALESCE(posted_at, found_at) DESC NULLS LAST
             LIMIT 80
         """, fetch="all") or []
@@ -7699,34 +7711,33 @@ def api_stories():
 
 # ── Public Website Chat API ───────────────────────────────────────────────────
 # Safe public chat endpoint for samugamedia.com.
-# This route behaves like the PUBLIC @SamugaNewsBot, not the private core-team brain.
-# It can chat normally, and for current/news questions it uses BOTH:
-#   1) fresh Samuga DB stories
-#   2) Tavily live search
+# IMPORTANT: Website chat should answer from TODAY'S Samuga archive first,
+# not from old model memory. It also cleans markdown so replies feel human.
 _PUBLIC_CHAT_RATE = {}  # ip -> [timestamps]
 _PUBLIC_CHAT_LIMIT = 12
-_PUBLIC_CHAT_WINDOW = 60 * 10
-_PUBLIC_CHAT_MAX_CHARS = 700
+_PUBLIC_CHAT_WINDOW = 60 * 10  # 12 messages per 10 minutes per IP
+_PUBLIC_CHAT_MAX_CHARS = 600
 _PUBLIC_CHAT_BLOCKED_COMMANDS = [
     "/approve", "/approved", "/reject", "/confirm", "/cancel", "/ai ",
     "/remember", "/forget", "/memory", "/learning", "/post", "/queue",
     "approve this", "reject this", "post this", "send to telegram", "send to facebook",
-    "send to instagram", "content lab", "core team", "admin", "database password",
-    "token", "api key", "environment variable"
+    "send to instagram", "content lab", "core team", "admin", "database", "token",
+    "api key", "password", "environment variable"
 ]
 _PUBLIC_CHAT_NEWS_WORDS = [
     "latest", "news", "headline", "headlines", "today", "update", "updates", "breaking",
-    "current", "what happened", "briefing", "summary", "summarize", "maldives",
-    "politics", "business", "sport", "weather", "ޚަބަރު", "ޚަބަރ", "އަޕްޑޭޓް", "މިއަދު"
+    "current", "what happened", "briefing", "summary", "summarize", "ޚަބަރު", "އަޕްޑޭޓް", "މިއަދު"
 ]
 
 def _public_chat_client_id():
+    """Return a stable-ish client ID for rate limiting behind Railway/proxies."""
     forwarded = request.headers.get("X-Forwarded-For", "")
     if forwarded:
         return forwarded.split(",")[0].strip()[:80]
     return (request.remote_addr or "unknown")[:80]
 
 def _public_chat_allowed(client_id):
+    """Simple in-memory rate limiter. Good enough for Phase 1 public chat."""
     now = time.time()
     window_start = now - _PUBLIC_CHAT_WINDOW
     hits = [t for t in _PUBLIC_CHAT_RATE.get(client_id, []) if t >= window_start]
@@ -7741,9 +7752,12 @@ def _public_chat_allowed(client_id):
     return True, _PUBLIC_CHAT_LIMIT
 
 def _public_chat_clean_message(message):
-    return _api_clean_text(message, _PUBLIC_CHAT_MAX_CHARS).strip()
+    """Clean and cap public website message."""
+    msg = _api_clean_text(message, _PUBLIC_CHAT_MAX_CHARS)
+    return msg.strip()
 
 def _public_chat_is_blocked(message):
+    """Block admin/control prompts from the public website chat."""
     low = (message or "").lower()
     if low.startswith("/") and not low.startswith("/search"):
         return True
@@ -7754,8 +7768,8 @@ def _public_chat_is_news_query(message):
     return any(w in low for w in _PUBLIC_CHAT_NEWS_WORDS)
 
 def _public_chat_clean_reply(reply):
+    """Make AI replies feel like chat, not raw Markdown/bot formatting."""
     txt = str(reply or "")
-    # Website chat should not expose markdown-ish bot formatting
     txt = txt.replace("**", "")
     txt = txt.replace("__", "")
     txt = txt.replace("###", "")
@@ -7764,19 +7778,10 @@ def _public_chat_clean_reply(reply):
     txt = re.sub(r"\n\s*[-*]\s+", "\n• ", txt)
     txt = re.sub(r"\n{3,}", "\n\n", txt)
     txt = re.sub(r"[ \t]{2,}", " ", txt)
-    # keep line breaks, but strip HTML
-    txt = _html.unescape(txt)
-    txt = _api_re.sub(r"<[^>]+>", " ", txt)
-    txt = _api_re.sub(r"[ \t]{2,}", " ", txt).strip()
-    if len(txt) > 1400:
-        txt = txt[:1400].rsplit(" ", 1)[0] + "..."
-    return txt
+    return _api_clean_text(txt.strip(), 1000)
 
-def _public_chat_latest_rows(lang=None, limit=8, hours=72):
-    """
-    Newest public website stories. 72h window so the AI has context,
-    but the prompt tells it to prefer newest/current.
-    """
+def _public_chat_latest_rows(lang=None, limit=8, hours=30):
+    """Read newest public website stories from DB. Default: recent/current only."""
     try:
         since = utcnow() - timedelta(hours=hours)
         rows = db_execute("""
@@ -7792,7 +7797,7 @@ def _public_chat_latest_rows(lang=None, limit=8, hours=72):
         seen = set()
         for title, summary, category, source, link, posted_at, found_at, row_lang, status in rows:
             safe_title = _api_clean_text(title, 260)
-            safe_summary = _api_clean_text(summary, 420)
+            safe_summary = _api_clean_text(summary, 380)
             if not safe_title:
                 continue
             detected = _api_lang(safe_title, safe_summary, row_lang)
@@ -7820,15 +7825,16 @@ def _public_chat_latest_rows(lang=None, limit=8, hours=72):
         return []
 
 def _public_chat_search_rows(message, lang=None, limit=6):
-    """Small archive search from Samuga DB for named topics."""
+    """Simple archive search from website DB for specific user topics."""
     try:
         terms = [w for w in re.findall(r"[\w\u0780-\u07BF]{3,}", message or "") if w.lower() not in {
-            "latest", "news", "today", "what", "about", "show", "give", "tell", "breaking",
-            "ޚަބަރު", "މިއަދު"
+            "latest", "news", "today", "what", "about", "show", "give", "tell", "ޚަބަރު", "މިއަދު"
         }]
         if not terms:
             return []
-        pattern = "%" + "%".join(terms[:3]) + "%"
+        # Use up to 3 strong terms to avoid huge/slow search.
+        q = " ".join(terms[:3])
+        pattern = f"%{q}%"
         rows = db_execute("""
             SELECT title, summary, category, source, link, posted_at, found_at, lang, status
             FROM articles
@@ -7837,12 +7843,11 @@ def _public_chat_search_rows(message, lang=None, limit=6):
             ORDER BY COALESCE(posted_at, found_at) DESC NULLS LAST
             LIMIT %s
         """, (pattern, pattern, pattern, limit * 3), fetch="all") or []
-
         clean = []
         seen = set()
         for title, summary, category, source, link, posted_at, found_at, row_lang, status in rows:
             safe_title = _api_clean_text(title, 260)
-            safe_summary = _api_clean_text(summary, 420)
+            safe_summary = _api_clean_text(summary, 380)
             detected = _api_lang(safe_title, safe_summary, row_lang)
             if lang in ("en", "dv") and detected != lang:
                 continue
@@ -7867,45 +7872,46 @@ def _public_chat_search_rows(message, lang=None, limit=6):
         log.error(f"Website chat search rows error: {e}")
         return []
 
-def _public_chat_context(rows):
+def _public_chat_format_news(rows, lang="en", searched=False):
+    """Friendly website chat answer from real Samuga DB rows."""
     if not rows:
-        return "No fresh Samuga DB stories available."
+        return "I don't see fresh public stories in the website archive yet bro. Try again in a few minutes." if lang != "dv" else "ވެބްސައިޓް އާކައިވްގައި އަދި އާ ޚަބަރެއް ނުފެނޭ. މަދުކޮށް ފަހުން އަހާލާ."
+
+    if lang == "dv":
+        intro = "މިއީ ސަމުގާގެ އެންމެ އާ ޚަބަރުތައް:" if not searched else "މިއީ ހޯދުމުން ފެނުނު ޚަބަރުތައް:"
+        parts = [intro]
+        for i, r in enumerate(rows[:6], 1):
+            line = f"{i}. {r['title']}"
+            if r.get("summary"):
+                line += f" — {r['summary'][:180]}"
+            parts.append(line)
+        parts.append("އެއް ޚަބަރެއް ތަފްސީލުން ބުނަން ބޭނުންތަ؟")
+        return "\n\n".join(parts)
+
+    intro = "Here are the latest stories on Samuga right now:" if not searched else "Here’s what I found in the Samuga archive:"
+    parts = [intro]
+    for i, r in enumerate(rows[:6], 1):
+        line = f"{i}. {r['title']}"
+        if r.get("summary"):
+            line += f" — {r['summary'][:190]}"
+        line += f"\nSource: {r.get('source','Samuga Media')} • {r.get('time','Recent')}"
+        parts.append(line)
+    parts.append("Ask me about any one of these and I’ll explain it clearly.")
+    return "\n\n".join(parts)
+
+def _public_chat_context(rows):
     lines = []
     for r in rows[:8]:
-        lines.append(
-            f"- [{r.get('category','LOCAL')}] {r.get('title','')} | "
-            f"{r.get('summary','')} | Source: {r.get('source','Samuga Media')} | "
-            f"Time: {r.get('time','Recent')} | Link: {r.get('url','#')}"
-        )
+        lines.append(f"- {r['title']} | {r.get('summary','')} | {r.get('source','')} | {r.get('time','')}")
     return "\n".join(lines)
 
-def _public_chat_live_search(message, lang="en"):
-    """
-    Tavily live search for public website chat.
-    Used alongside Samuga DB so chat is not limited to stale website rows.
-    """
-    try:
-        if not TAVILY_API_KEY:
-            return ""
-        q = message
-        low = message.lower()
-        if _public_chat_is_news_query(message) and "maldives" not in low:
-            q = f"Maldives latest news {message}"
-        elif "samuga" in low:
-            q = f"Samuga Media Maldives {message}"
-        return tavily_search(q) or ""
-    except Exception as e:
-        log.error(f"Website chat Tavily search error: {e}")
-        return ""
 
 @api_app.route("/api/chat", methods=["POST", "OPTIONS"])
 def api_chat():
     """
     Public website chat for Samuga AI.
-    Mirrors public @SamugaNewsBot style:
-    - casual chat works naturally
-    - latest/news questions use Samuga DB + Tavily live search
-    - private admin/core team/content lab actions are blocked
+    This mirrors the public @SamugaNewsBot chat style, NOT the private core-team brain.
+    It can chat normally, but when the user asks news/current questions it uses fresh Samuga DB context first.
     """
     if request.method == "OPTIONS":
         return jsonify({"ok": True})
@@ -7936,87 +7942,105 @@ def api_chat():
         if _public_chat_is_blocked(message):
             return jsonify({
                 "ok": True,
-                "reply": "That side is private for the Samuga team bro. Here I can help with public news, explanations, and normal chat."
+                "reply": "I can only do public chat and public news here bro. Posting, approvals, and newsroom controls are only for the private Samuga team Telegram."
             })
 
-        user_id = f"website:{client_id}:{session_id}"
-        is_news = _public_chat_is_news_query(message) or needs_web_search(message)
-        rows = []
-        live_context = ""
+        user_id = f"web:{client_id}:{session_id}"
+        log.info(f"🌐 Website chat {client_id}: {message[:80]}")
 
-        if is_news:
-            searched_rows = _public_chat_search_rows(message, lang=lang, limit=5)
-            latest_rows = _public_chat_latest_rows(lang=lang, limit=8, hours=72)
-            # For specific topic questions, search rows first; otherwise latest first
-            rows = searched_rows or latest_rows
-            live_context = _public_chat_live_search(message, lang=lang)
-        else:
-            # give a tiny context only; do not force news into casual chat
-            rows = _public_chat_latest_rows(lang=lang, limit=3, hours=24)
-            live_context = ""
-
-        db_context = _public_chat_context(rows)
-
-        if lang == "dv":
-            style = (
-                "Reply in natural Dhivehi Thaana if the user used Dhivehi. "
-                "If the user wrote English, reply in simple English."
-            )
-        else:
-            style = "Reply in simple natural English."
-
-        system_prompt = f"""You are Samuga AI, the public @SamugaNewsBot assistant for Samuga Media.
-
-IMPORTANT IDENTITY:
-- You are the public Samuga AI chat, not the private core-team newsroom brain.
-- You can chat normally, answer questions, explain news, and guide users.
-- You cannot approve, reject, publish, or reveal private admin/content-lab controls.
-
-STYLE:
-- {style}
-- Friendly, warm, human, and conversational. You may say "bro" sometimes if the user talks that way.
-- Do not sound hard-coded.
-- Do not use markdown symbols like **, ###, long separators, or robotic formatting.
-- Keep replies short unless the user asks for detail.
-- For latest/breaking/news questions, use the newest Samuga DB context first and live Tavily context second.
-- If Samuga DB and live search disagree, say what is from Samuga and what is from live search.
-- Do not invent facts. If unsure, say you are checking or that you don't have confirmation.
-- For "breaking now", only call something breaking if the context clearly suggests urgent/breaking; otherwise say "nothing massive confirmed right now" and mention the hottest updates.
-
-Fresh Samuga DB context:
-{db_context}
-
-Live Tavily/search context:
-{live_context or "No live search result available."}
-"""
-
-        messages = get_conversation(user_id).copy()
-        messages.append({"role": "user", "content": message})
-
+        # Keep the same public Telegram bot feeling:
+        # 1) Story timeline/search answer if the bot already knows a direct story answer
+        # 2) Fresh Samuga website DB context for news/current questions
+        # 3) Normal friendly public Samuga AI chat for casual/general questions
+        story_answer = None
         try:
-            msg = ai.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=750,
-                system=system_prompt,
-                messages=messages
-            )
-            reply = msg.content[0].text.strip()
+            story_answer = answer_story_query(message)
         except Exception as e:
-            log.error(f"Website public chat Claude error: {e}")
-            # fallback to old public chat brain
-            reply = chat_with_claude(message, user_id)
+            log.warning(f"Website story query fallback: {e}")
 
-        reply = _public_chat_clean_reply(reply) or "Sorry bro, I couldn't answer that right now. Try again."
+        if story_answer:
+            reply = story_answer
+        else:
+            is_news_question = _public_chat_is_news_query(message)
+            is_breaking_question = any(w in message.lower() for w in ["breaking", "urgent", "ބްރޭކިންގ"])
+            is_briefing_question = any(w in message.lower() for w in ["briefing", "summarize", "summary", "today", "biggest", "މިއަދު"])
 
-        add_to_conversation(user_id, "user", message)
-        add_to_conversation(user_id, "assistant", reply)
+            latest_rows = _public_chat_latest_rows(lang=lang, limit=8, hours=36)
+            search_rows = _public_chat_search_rows(message, lang=lang, limit=6)
 
-        log.info(f"🌐 Website chat {client_id}: {message[:70]}")
+            context_rows = search_rows or latest_rows
+            if is_breaking_question:
+                breaking_rows = [r for r in latest_rows if str(r.get("category", "")).upper() == "BREAKING"]
+                context_rows = breaking_rows or latest_rows[:4]
+
+            context = _public_chat_context(context_rows[:6])
+
+            # For public website chat, use the public Samuga AI style — not core-team brain.
+            # The prompt keeps answers short and human, while fresh context prevents old memory headlines.
+            if is_news_question:
+                if lang == "dv":
+                    safe_prompt = (
+                        "You are Samuga AI, the public SamugaNewsBot style assistant. "
+                        "Answer in natural Dhivehi if the user used Dhivehi, otherwise simple English. "
+                        "Use ONLY the fresh Samuga context below for news facts. "
+                        "Do not mention old stories from memory. Do not use markdown symbols like ** or ###. "
+                        "Keep it short. For latest news, give maximum 3 items. "
+                        "For breaking, only say breaking if context actually looks breaking. "
+                        "Be friendly like a chat, not a formal article.\n\n"
+                        f"Fresh Samuga context:\n{context}\n\n"
+                        f"User asked: {message}"
+                    )
+                else:
+                    if is_breaking_question:
+                        mode = "breaking news check"
+                    elif is_briefing_question:
+                        mode = "short daily briefing"
+                    else:
+                        mode = "latest news chat"
+                    safe_prompt = (
+                        "You are Samuga AI, the public @SamugaNewsBot style assistant. "
+                        "Reply naturally, friendly, and human — like a helpful Maldivian news buddy. "
+                        "Use ONLY the fresh Samuga context below for news facts. "
+                        "Do not use old headlines from memory. Do not use markdown symbols like **, ###, or long separators. "
+                        "Do not dump a long list. Maximum 3 short items unless the user asks for more. "
+                        "Avoid repeating the title and summary. Keep each item to one short sentence. "
+                        "End with one natural follow-up question.\n\n"
+                        f"Mode: {mode}\n"
+                        f"Fresh Samuga context:\n{context}\n\n"
+                        f"User asked: {message}"
+                    )
+            else:
+                safe_prompt = (
+                    "You are Samuga AI, the public @SamugaNewsBot style assistant. "
+                    "Chat naturally and friendly. You can answer normal questions too. "
+                    "If the question is about news, use the fresh Samuga context below. "
+                    "Do not reveal private newsroom/admin details. Do not approve/reject/post anything. "
+                    "Keep the answer short and conversational. No markdown symbols like **.\n\n"
+                    f"Fresh Samuga context if needed:\n{context}\n\n"
+                    f"User message: {message}"
+                )
+
+            if lang == "dv":
+                try:
+                    history = get_conversation(user_id)
+                    reply = chat_with_gemini_dhivehi(safe_prompt, context, history)
+                    if reply:
+                        add_to_conversation(user_id, "user", message)
+                        add_to_conversation(user_id, "assistant", reply)
+                    else:
+                        reply = chat_with_claude(safe_prompt, user_id)
+                except Exception as e:
+                    log.error(f"Website Dhivehi public chat fallback: {e}")
+                    reply = chat_with_claude(safe_prompt, user_id)
+            else:
+                reply = chat_with_claude(safe_prompt, user_id)
+
+        reply = _public_chat_clean_reply(reply) or "Sorry bro, I couldn't answer that right now. Try asking again."
         return jsonify({
             "ok": True,
             "reply": reply,
             "source": "Samuga AI public chat",
-            "mode": "public_samuganewsbot_tavily",
+            "mode": "public_samuganewsbot_style",
             "rate_limit": {"limit": limit, "window_seconds": _PUBLIC_CHAT_WINDOW}
         })
 
@@ -8027,7 +8051,6 @@ Live Tavily/search context:
             "error": "server_error",
             "reply": "Something went wrong bro 😅 Try again in a moment."
         })
-
 
 def start_api_server():
     """Start the public website API on Railway's assigned PORT."""
