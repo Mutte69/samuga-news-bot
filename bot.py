@@ -7331,7 +7331,7 @@ def api_stories():
 def start_api_server():
     port = int(os.environ.get("PORT", 8080))
     log.info(f"🌐 Website API starting on port {port}")
-    api_app.run(host="0.0.0.0", port=port)── Entry ─────────────────────────────────────────────────────────────────────
+ api_app.run(host="0.0.0.0", port=port)
 if __name__ == "__main__":
     import signal, atexit
 
