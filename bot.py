@@ -273,7 +273,11 @@ def expire_old_approvals():
             buf = io.BytesIO(item["card_bytes"])
             queue_for_social(buf, item["caption"],
                 key_label=f"{k.upper()} (breaking auto)",
-                tg_ok=False, post_telegram=True, is_breaking=True)
+                tg_ok=False, post_telegram=True, is_breaking=True,
+                article_id=item.get("article_id"), title=item.get("title",""),
+                summary=item.get("summary",""), cat=item.get("cat","BREAKING"),
+                source=item.get("source","Samuga Media"), link=item.get("link",""),
+                lang=item.get("lang","en"))
             send_text(CORE_TEAM_CHAT_ID,
                 f"⏰ <b>{k.upper()} Breaking auto-posted</b> (30min, no review)\n"
                 f"📰 {item.get('title','')[:80]}",
@@ -294,7 +298,11 @@ def expire_old_approvals():
             buf = io.BytesIO(item["card_bytes"])
             queue_for_social(buf, item["caption"],
                 key_label=f"{k.upper()} (auto)",
-                tg_ok=False, post_telegram=True)
+                tg_ok=False, post_telegram=True,
+                article_id=item.get("article_id"), title=item.get("title",""),
+                summary=item.get("summary",""), cat=item.get("cat","LOCAL"),
+                source=item.get("source","Samuga Media"), link=item.get("link",""),
+                lang=item.get("lang","en"), is_breaking=item.get("is_breaking", False))
             send_text(CORE_TEAM_CHAT_ID,
                 f"⏰ <b>{k.upper()}</b> auto-posted (45min, no review)\n📰 {item.get('title','')[:80]}",
                 thread_id=ALERT_THREAD_ID)
@@ -325,7 +333,11 @@ def expire_old_approvals():
                 if tg_ok:
                     card.seek(0)
                     queue_for_social(io.BytesIO(card.getvalue()), full_caption,
-                                     key_label=k.upper(), tg_ok=True)
+                                     key_label=k.upper(), tg_ok=True,
+                                     article_id=item.get("article_id"), title=item.get("title",""),
+                                     summary=item.get("summary",""), cat=item.get("cat","BREAKING"),
+                                     source=item.get("source","Samuga Media"), link=item.get("link",""),
+                                     lang="dv", is_breaking=True)
                     send_text(CORE_TEAM_CHAT_ID,
                         f"⏰ <b>{k.upper()} Breaking Dhivehi auto-posted</b> (2h, no review)\n"
                         f"📰 {item['title'][:70]}",
@@ -576,18 +588,55 @@ def db_record_article(article, score=0, reliability=0, status="seen", is_breakin
             score=EXCLUDED.score, reliability=EXCLUDED.reliability, status=EXCLUDED.status
     """, (
         article.get("id"), article.get("title","")[:500], article.get("summary","")[:2000],
-        article.get("link",""), article.get("source",""), article.get("cat",""),
+        article.get("link",""), article.get("source",""),
+        canonical_category(article.get("cat","LOCAL"), article.get("title",""), article.get("summary","")),
         article.get("lang","en"), score, reliability, is_breaking, status
     ))
 
 def db_mark_status(article_id, status, posted=False):
     """Update an article's lifecycle status (queued/posted/rejected/duplicate)."""
-    if not DB_ENABLED:
+    if not DB_ENABLED or not article_id:
         return
     if posted:
         db_execute("UPDATE articles SET status=%s, posted_at=NOW() WHERE id=%s", (status, article_id))
     else:
         db_execute("UPDATE articles SET status=%s WHERE id=%s", (status, article_id))
+
+def db_publish_article_for_website(article_id, title="", summary="", category="LOCAL",
+                                   source="Samuga Media", link="", lang="en",
+                                   score=0, reliability=0, is_breaking=False):
+    """
+    Make sure any publicly posted/queued-to-post story is visible on the website.
+    This fixes the issue where Telegram/FB/IG/X get posts but /api/stories stays old.
+    Safe no-op if DB is disabled.
+    """
+    if not DB_ENABLED or not article_id:
+        return
+    safe_cat = canonical_category(category or "LOCAL", title or "", summary or "")
+    db_execute("""
+        INSERT INTO articles
+            (id, title, summary, link, source, category, lang, score, reliability,
+             is_breaking, status, posted_at, match_key)
+        VALUES
+            (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'posted',NOW(),%s)
+        ON CONFLICT (id) DO UPDATE SET
+            title=COALESCE(NULLIF(EXCLUDED.title,''), articles.title),
+            summary=COALESCE(NULLIF(EXCLUDED.summary,''), articles.summary),
+            link=COALESCE(NULLIF(EXCLUDED.link,''), articles.link),
+            source=COALESCE(NULLIF(EXCLUDED.source,''), articles.source),
+            category=COALESCE(NULLIF(EXCLUDED.category,''), articles.category),
+            lang=COALESCE(NULLIF(EXCLUDED.lang,''), articles.lang),
+            score=GREATEST(COALESCE(articles.score,0), COALESCE(EXCLUDED.score,0)),
+            reliability=GREATEST(COALESCE(articles.reliability,0), COALESCE(EXCLUDED.reliability,0)),
+            is_breaking=COALESCE(EXCLUDED.is_breaking, articles.is_breaking),
+            status='posted',
+            posted_at=COALESCE(articles.posted_at, NOW()),
+            match_key=COALESCE(NULLIF(EXCLUDED.match_key,''), articles.match_key)
+    """, (
+        article_id, (title or "")[:500], (summary or "")[:2000], link or "",
+        source or "Samuga Media", safe_cat, lang or "en", score or 0,
+        reliability or 0, bool(is_breaking), _caption_match_key(title or "")
+    ))
 
 # ── Phase 2: bot_kv helpers + learning logger ────────────────────────────────
 def kv_get(key, default=None):
@@ -856,6 +905,19 @@ def persist_state():
                     "img_bytes_b64": __import__("base64").b64encode(item["img_bytes"]).decode(),
                     "caption": item["caption"],
                     "queued_at": item["queued_at"].isoformat(),
+                    "article_id": item.get("article_id"),
+                    "title": item.get("title",""),
+                    "summary": item.get("summary",""),
+                    "cat": item.get("cat","LOCAL"),
+                    "source": item.get("source","Samuga Media"),
+                    "link": item.get("link",""),
+                    "lang": item.get("lang","en"),
+                    "is_breaking": item.get("is_breaking", False),
+                    "key_label": item.get("key_label","Post"),
+                    "tg_ok": item.get("tg_ok", False),
+                    "post_telegram": item.get("post_telegram", True),
+                    "notify_chat_id": item.get("notify_chat_id"),
+                    "notify_thread_id": item.get("notify_thread_id"),
                 })
         state = {
             "recent_story_titles": [(t, ts.isoformat()) for (t, ts) in recent_story_titles],
@@ -953,6 +1015,19 @@ def restore_state():
                             "img_bytes": _b64.b64decode(item["img_bytes_b64"]),
                             "caption": item["caption"],
                             "queued_at": datetime.fromisoformat(item["queued_at"]),
+                            "article_id": item.get("article_id"),
+                            "title": item.get("title",""),
+                            "summary": item.get("summary",""),
+                            "cat": item.get("cat","LOCAL"),
+                            "source": item.get("source","Samuga Media"),
+                            "link": item.get("link",""),
+                            "lang": item.get("lang","en"),
+                            "is_breaking": item.get("is_breaking", False),
+                            "key_label": item.get("key_label","Post"),
+                            "tg_ok": item.get("tg_ok", False),
+                            "post_telegram": item.get("post_telegram", True),
+                            "notify_chat_id": item.get("notify_chat_id"),
+                            "notify_thread_id": item.get("notify_thread_id"),
                         })
                     except Exception: pass
             log.info(f"📲 Social queue restored: {len(_social_queue)} post(s) waiting")
@@ -2497,6 +2572,26 @@ def _social_queue_worker():
                             last_regular_post_time = utcnow()
                             persist_state()
                         log.info(f"[QUEUE] Telegram: {'✅' if tg_ok else '❌'}")
+                        if tg_ok and item.get("article_id"):
+                            try:
+                                db_publish_article_for_website(
+                                    article_id=item.get("article_id"),
+                                    title=item.get("title",""),
+                                    summary=item.get("summary",""),
+                                    category=item.get("cat","LOCAL"),
+                                    source=item.get("source","Samuga Media"),
+                                    link=item.get("link",""),
+                                    lang=item.get("lang","en"),
+                                    is_breaking=item.get("is_breaking", False)
+                                )
+                                if isinstance(tg_ok, int):
+                                    db_set_article_message(item.get("article_id"), tg_ok)
+                                if item.get("title"):
+                                    remember_post(item.get("title"), item.get("cat","LOCAL"),
+                                                  (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M"),
+                                                  item.get("is_breaking", False))
+                            except Exception as e:
+                                log.error(f"[WEBSITE] queue publish sync failed: {e}")
                     except Exception as e:
                         log.error(f"[QUEUE] Telegram: {e}")
                 else:
@@ -2533,13 +2628,29 @@ def _social_queue_worker():
             log.error(f"[QUEUE] Worker error: {e}")
 
 def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=None,
-                     key_label="Post", tg_ok=True, post_telegram=False):
+                     key_label="Post", tg_ok=True, post_telegram=False,
+                     article_id=None, title="", summary="", cat="LOCAL",
+                     source="Samuga Media", link="", lang="en", is_breaking=False):
     """
     Add a card to the 10-minute publish queue.
     post_telegram=True  → queue will post to Telegram community too (standard flow)
     post_telegram=False → Telegram was already posted separately (breaking news)
+
+    Website sync fix:
+    If article_id/title are passed, the article is marked as posted for /api/stories
+    immediately when it enters the public publishing queue.
     """
     img_bytes = img_buf.getvalue() if hasattr(img_buf, "getvalue") else img_buf
+
+    if article_id:
+        try:
+            db_publish_article_for_website(
+                article_id=article_id, title=title, summary=summary, category=cat,
+                source=source, link=link, lang=lang, is_breaking=is_breaking
+            )
+        except Exception as e:
+            log.error(f"[WEBSITE] publish sync before queue failed: {e}")
+
     with _social_queue_lock:
         _social_queue.append({
             "img_bytes":        img_bytes,
@@ -2550,6 +2661,14 @@ def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=Non
             "key_label":        key_label,
             "tg_ok":            tg_ok,
             "post_telegram":    post_telegram,
+            "article_id":       article_id,
+            "title":            title,
+            "summary":          summary,
+            "cat":              cat,
+            "source":           source,
+            "link":             link,
+            "lang":             lang,
+            "is_breaking":      is_breaking,
         })
         queue_pos = len(_social_queue)
 
@@ -2744,6 +2863,12 @@ def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_
 
     if tg_ok:
         remember_post(title, cat, ts)
+        if article_id:
+            db_publish_article_for_website(
+                article_id=article_id, title=title, summary=summary, category=cat,
+                source="Samuga Media", link=link, lang=("dv" if is_dhivehi(title + " " + summary) else "en"),
+                is_breaking=is_breaking_flag
+            )
         if isinstance(tg_ok, int) and article_id:        # Phase 2: store msg id
             db_set_article_message(article_id, tg_ok)
         if article_id:                                    # Phase 2.5: store match key for FB/IG
@@ -6271,7 +6396,15 @@ def handle_updates():
                                                     notify_thread_id=_tid,
                                                     key_label=_key.upper(),
                                                     tg_ok=False,
-                                                    post_telegram=True   # queue posts Telegram too
+                                                    post_telegram=True,   # queue posts Telegram too
+                                                    article_id=_item.get("article_id"),
+                                                    title=_item.get("title",""),
+                                                    summary=_item.get("summary",""),
+                                                    cat=_item.get("cat","LOCAL"),
+                                                    source=_item.get("source","Samuga Media"),
+                                                    link=_item.get("link",""),
+                                                    lang="dv",
+                                                    is_breaking=_item.get("is_breaking", False)
                                                 )
                                             except Exception as e:
                                                 log.error(f"DV approval processing: {e}")
@@ -6304,7 +6437,15 @@ def handle_updates():
                                                 notify_thread_id=thread_id,
                                                 key_label=key.upper(),
                                                 tg_ok=False,
-                                                post_telegram=True
+                                                post_telegram=True,
+                                                article_id=item.get("article_id"),
+                                                title=item.get("title",""),
+                                                summary=item.get("summary",""),
+                                                cat=item.get("cat","LOCAL"),
+                                                source=item.get("source","Samuga Media"),
+                                                link=item.get("link",""),
+                                                lang=item.get("lang","en"),
+                                                is_breaking=item.get("is_breaking", False)
                                             )
                                             ok = True
 
@@ -7278,19 +7419,15 @@ def handle_updates():
             log.error(f"Update loop: {e}"); time.sleep(5)
 
 # ── Website API ───────────────────────────────────────────────────────────────
-from flask import Flask, jsonify, send_file, request, Response
+from flask import Flask, jsonify, request
 import html as _html
 import re as _api_re
 
 api_app = Flask(__name__)
 api_app.json.ensure_ascii = False
 
-# Small in-memory card cache so the website doesn't regenerate the same PNG every refresh
-_WEBSITE_CARD_CACHE = {}  # article_id -> {"ts": datetime, "bytes": bytes}
-_WEBSITE_CARD_CACHE_SECONDS = 60 * 60 * 6  # 6 hours
-
 def _api_clean_text(value, limit=900):
-    """Clean DB text for website/API/card rendering."""
+    """Clean DB text for website/API rendering."""
     value = str(value or "")
     value = _html.unescape(value)
     value = _api_re.sub(r"<[^>]+>", " ", value)
@@ -7298,23 +7435,20 @@ def _api_clean_text(value, limit=900):
     value = _api_re.sub(r"\s+", " ", value).strip()
     return value[:limit]
 
-def _website_card_text(title, summary):
-    """
-    Build the text that appears on the website PNG card.
-    English: title as headline + short summary as body.
-    Dhivehi: keep spaces so Thaana shaping path handles it better.
-    """
-    title = _api_clean_text(title, 260)
-    summary = _api_clean_text(summary, 220)
+def _api_has_thaana(text):
+    return any("\u0780" <= ch <= "\u07BF" for ch in str(text or ""))
 
-    has_thaana = any("\u0780" <= ch <= "\u07BF" for ch in (title + summary))
-    if not summary:
-        return title or "Samuga Media"
+def _api_lang(title, summary, lang):
+    lang = str(lang or "").lower()
+    if lang in ("dv", "dhivehi"):
+        return "dv"
+    return "dv" if _api_has_thaana((title or "") + " " + (summary or "")) else "en"
 
-    if has_thaana:
-        return (title + " " + summary[:130]).strip()
-
-    return (title.rstrip(".") + ". " + summary[:160]).strip()
+def _api_category(cat, title="", summary=""):
+    try:
+        return canonical_category(cat or "LOCAL", title or "", summary or "")
+    except Exception:
+        return (cat or "LOCAL").upper()
 
 def _absolute_api_url(path):
     """Build full Railway URL for GitHub Pages."""
@@ -7322,10 +7456,11 @@ def _absolute_api_url(path):
 
 @api_app.after_request
 def add_cors_headers(response):
-    """Allow GitHub Pages to read this API and image cards."""
+    """Allow GitHub Pages to read this API."""
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return response
 
 @api_app.get("/")
@@ -7334,41 +7469,83 @@ def api_home():
         "status": "online",
         "name": "Samuga News Bot API",
         "version": SAMUGA_VERSION,
-        "endpoints": ["/api/stories", "/api/card/<article_id>.png"]
+        "endpoints": ["/api/stories", "/api/health"]
+    })
+
+@api_app.get("/api/health")
+def api_health():
+    latest = None
+    try:
+        row = db_execute("""
+            SELECT title, posted_at, found_at, status
+            FROM articles
+            WHERE status IN ('posted','published','social_posted')
+            ORDER BY COALESCE(posted_at, found_at) DESC NULLS LAST
+            LIMIT 1
+        """, fetch="one")
+        if row:
+            latest = {
+                "title": _api_clean_text(row[0], 160),
+                "time": (row[1] or row[2]).strftime("%d %b %Y • %H:%M") if (row[1] or row[2]) else "Recent",
+                "status": row[3]
+            }
+    except Exception as e:
+        log.error(f"Website API /api/health error: {e}")
+
+    return jsonify({
+        "status": "online",
+        "db_enabled": bool(DB_ENABLED),
+        "latest": latest,
+        "queue": len(_social_queue) if "_social_queue" in globals() else 0
     })
 
 @api_app.get("/api/stories")
 def api_stories():
     """
     Public website feed for GitHub Pages.
-    Returns latest posted stories + a generated Samuga card image URL.
+
+    Important:
+    The website should show article data, not Telegram/Instagram square cards.
+    So this endpoint returns clean JSON only: title, summary, category, source, url, time, lang.
+    It reads all statuses that mean public/published. Queue items are marked posted
+    by queue_for_social() when they enter the public publishing queue.
     """
     try:
         rows = db_execute("""
-            SELECT id, title, summary, category, source, link, posted_at, found_at
+            SELECT id, title, summary, category, source, link, posted_at, found_at, lang, status
             FROM articles
-            WHERE status = 'posted'
-            ORDER BY posted_at DESC NULLS LAST, found_at DESC NULLS LAST
-            LIMIT 30
-        """, fetch="all")
+            WHERE status IN ('posted','published','social_posted')
+            ORDER BY COALESCE(posted_at, found_at) DESC NULLS LAST
+            LIMIT 80
+        """, fetch="all") or []
 
         stories = []
-        for row in rows or []:
-            article_id, title, summary, category, source, link, posted_at, found_at = row
+        seen_titles = set()
+
+        for row in rows:
+            article_id, title, summary, category, source, link, posted_at, found_at, lang, status = row
             dt = posted_at or found_at
             safe_title = _api_clean_text(title, 500)
             safe_summary = _api_clean_text(summary, 1200)
-            safe_category = category or "LOCAL"
+            if not safe_title:
+                continue
+
+            # Dedupe same headline in API so the site stays clean
+            key = _caption_match_key(safe_title) or safe_title.lower()[:80]
+            if key in seen_titles:
+                continue
+            seen_titles.add(key)
 
             stories.append({
                 "id": article_id,
-                "title": safe_title or "Untitled story",
+                "title": safe_title,
                 "summary": safe_summary,
-                "category": safe_category,
+                "category": _api_category(category, safe_title, safe_summary),
                 "source": source or "Samuga Media",
                 "url": link or "#",
                 "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent",
-                "image": _absolute_api_url(f"/api/card/{article_id}.png") if article_id else ""
+                "lang": _api_lang(safe_title, safe_summary, lang),
+                "status": status or "posted"
             })
 
         return jsonify(stories)
@@ -7376,80 +7553,6 @@ def api_stories():
     except Exception as e:
         log.error(f"Website API /api/stories error: {e}")
         return jsonify([])
-
-@api_app.get("/api/card/<article_id>.png")
-def api_story_card(article_id):
-    """
-    Dynamic website image card.
-    Uses the SAME generate_card() pipeline as Telegram/social cards, but serves it as PNG for the website.
-    """
-    try:
-        # Serve cached card if available
-        cached = _WEBSITE_CARD_CACHE.get(article_id)
-        if cached and (utcnow() - cached["ts"]).total_seconds() < _WEBSITE_CARD_CACHE_SECONDS:
-            return send_file(
-                io.BytesIO(cached["bytes"]),
-                mimetype="image/png",
-                download_name=f"{article_id}.png",
-                max_age=21600
-            )
-
-        row = db_execute("""
-            SELECT title, summary, category, source, posted_at, found_at
-            FROM articles
-            WHERE id = %s
-            LIMIT 1
-        """, (article_id,), fetch="one")
-
-        if not row:
-            return Response("Card not found", status=404)
-
-        title, summary, category, source, posted_at, found_at = row
-        dt = posted_at or found_at or mvt_now()
-        timestamp = dt.strftime("%d %b %Y • %H:%M") if hasattr(dt, "strftime") else "Recent"
-
-        cat = category or "LOCAL"
-        card_text = _website_card_text(title, summary)
-
-        # Use a simple category-aware background keyword. If Pexels key is missing, generate_card falls back to Samuga gradient.
-        keyword_map = {
-            "BREAKING": "emergency news",
-            "DISASTER": "emergency news",
-            "LOCAL": "maldives city",
-            "POLITICAL": "government building",
-            "POLITICS": "government building",
-            "BUSINESS": "business economy",
-            "LIFESTYLE": "maldives lifestyle",
-            "TOURISM": "maldives resort",
-            "WEATHER": "tropical weather",
-            "SPORTS": "football stadium",
-            "SPORT": "football stadium",
-            "WORLD": "world news"
-        }
-        bg = None
-        try:
-            bg = fetch_background_image(keyword_map.get(str(cat).upper(), "maldives news"))
-        except Exception as bg_err:
-            log.warning(f"Website card bg failed: {bg_err}")
-
-        card_buf = generate_card(card_text, source or "Samuga Media", timestamp, cat, bg)
-        card_bytes = card_buf.getvalue()
-
-        _WEBSITE_CARD_CACHE[article_id] = {"ts": utcnow(), "bytes": card_bytes}
-        if len(_WEBSITE_CARD_CACHE) > 80:
-            oldest_key = sorted(_WEBSITE_CARD_CACHE.items(), key=lambda x: x[1]["ts"])[0][0]
-            _WEBSITE_CARD_CACHE.pop(oldest_key, None)
-
-        return send_file(
-            io.BytesIO(card_bytes),
-            mimetype="image/png",
-            download_name=f"{article_id}.png",
-            max_age=21600
-        )
-
-    except Exception as e:
-        log.error(f"Website API /api/card/{article_id}.png error: {e}")
-        return Response("Card error", status=500)
 
 def start_api_server():
     """Start the public website API on Railway's assigned PORT."""
