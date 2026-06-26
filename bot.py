@@ -7278,14 +7278,51 @@ def handle_updates():
             log.error(f"Update loop: {e}"); time.sleep(5)
 
 # ── Website API ───────────────────────────────────────────────────────────────
-from flask import Flask, jsonify
+from flask import Flask, jsonify, send_file, request, Response
+import html as _html
+import re as _api_re
 
 api_app = Flask(__name__)
 api_app.json.ensure_ascii = False
 
+# Small in-memory card cache so the website doesn't regenerate the same PNG every refresh
+_WEBSITE_CARD_CACHE = {}  # article_id -> {"ts": datetime, "bytes": bytes}
+_WEBSITE_CARD_CACHE_SECONDS = 60 * 60 * 6  # 6 hours
+
+def _api_clean_text(value, limit=900):
+    """Clean DB text for website/API/card rendering."""
+    value = str(value or "")
+    value = _html.unescape(value)
+    value = _api_re.sub(r"<[^>]+>", " ", value)
+    value = _api_re.sub(r"https?://\S+", "", value)
+    value = _api_re.sub(r"\s+", " ", value).strip()
+    return value[:limit]
+
+def _website_card_text(title, summary):
+    """
+    Build the text that appears on the website PNG card.
+    English: title as headline + short summary as body.
+    Dhivehi: keep spaces so Thaana shaping path handles it better.
+    """
+    title = _api_clean_text(title, 260)
+    summary = _api_clean_text(summary, 220)
+
+    has_thaana = any("\u0780" <= ch <= "\u07BF" for ch in (title + summary))
+    if not summary:
+        return title or "Samuga Media"
+
+    if has_thaana:
+        return (title + " " + summary[:130]).strip()
+
+    return (title.rstrip(".") + ". " + summary[:160]).strip()
+
+def _absolute_api_url(path):
+    """Build full Railway URL for GitHub Pages."""
+    return request.url_root.rstrip("/") + path
+
 @api_app.after_request
 def add_cors_headers(response):
-    """Allow GitHub Pages to read this API."""
+    """Allow GitHub Pages to read this API and image cards."""
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
@@ -7297,19 +7334,18 @@ def api_home():
         "status": "online",
         "name": "Samuga News Bot API",
         "version": SAMUGA_VERSION,
-        "endpoints": ["/api/stories"]
+        "endpoints": ["/api/stories", "/api/card/<article_id>.png"]
     })
 
 @api_app.get("/api/stories")
 def api_stories():
     """
-    Public website feed for samugamedia.com / GitHub Pages.
-    Returns latest posted stories from PostgreSQL.
-    If DB is unavailable, returns an empty list instead of crashing.
+    Public website feed for GitHub Pages.
+    Returns latest posted stories + a generated Samuga card image URL.
     """
     try:
         rows = db_execute("""
-            SELECT title, summary, category, source, link, posted_at, found_at
+            SELECT id, title, summary, category, source, link, posted_at, found_at
             FROM articles
             WHERE status = 'posted'
             ORDER BY posted_at DESC NULLS LAST, found_at DESC NULLS LAST
@@ -7318,15 +7354,21 @@ def api_stories():
 
         stories = []
         for row in rows or []:
-            title, summary, category, source, link, posted_at, found_at = row
+            article_id, title, summary, category, source, link, posted_at, found_at = row
             dt = posted_at or found_at
+            safe_title = _api_clean_text(title, 500)
+            safe_summary = _api_clean_text(summary, 1200)
+            safe_category = category or "LOCAL"
+
             stories.append({
-                "title": title or "Untitled story",
-                "summary": summary or "",
-                "category": category or "Community",
+                "id": article_id,
+                "title": safe_title or "Untitled story",
+                "summary": safe_summary,
+                "category": safe_category,
                 "source": source or "Samuga Media",
                 "url": link or "#",
-                "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent"
+                "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent",
+                "image": _absolute_api_url(f"/api/card/{article_id}.png") if article_id else ""
             })
 
         return jsonify(stories)
@@ -7334,6 +7376,80 @@ def api_stories():
     except Exception as e:
         log.error(f"Website API /api/stories error: {e}")
         return jsonify([])
+
+@api_app.get("/api/card/<article_id>.png")
+def api_story_card(article_id):
+    """
+    Dynamic website image card.
+    Uses the SAME generate_card() pipeline as Telegram/social cards, but serves it as PNG for the website.
+    """
+    try:
+        # Serve cached card if available
+        cached = _WEBSITE_CARD_CACHE.get(article_id)
+        if cached and (utcnow() - cached["ts"]).total_seconds() < _WEBSITE_CARD_CACHE_SECONDS:
+            return send_file(
+                io.BytesIO(cached["bytes"]),
+                mimetype="image/png",
+                download_name=f"{article_id}.png",
+                max_age=21600
+            )
+
+        row = db_execute("""
+            SELECT title, summary, category, source, posted_at, found_at
+            FROM articles
+            WHERE id = %s
+            LIMIT 1
+        """, (article_id,), fetch="one")
+
+        if not row:
+            return Response("Card not found", status=404)
+
+        title, summary, category, source, posted_at, found_at = row
+        dt = posted_at or found_at or mvt_now()
+        timestamp = dt.strftime("%d %b %Y • %H:%M") if hasattr(dt, "strftime") else "Recent"
+
+        cat = category or "LOCAL"
+        card_text = _website_card_text(title, summary)
+
+        # Use a simple category-aware background keyword. If Pexels key is missing, generate_card falls back to Samuga gradient.
+        keyword_map = {
+            "BREAKING": "emergency news",
+            "DISASTER": "emergency news",
+            "LOCAL": "maldives city",
+            "POLITICAL": "government building",
+            "POLITICS": "government building",
+            "BUSINESS": "business economy",
+            "LIFESTYLE": "maldives lifestyle",
+            "TOURISM": "maldives resort",
+            "WEATHER": "tropical weather",
+            "SPORTS": "football stadium",
+            "SPORT": "football stadium",
+            "WORLD": "world news"
+        }
+        bg = None
+        try:
+            bg = fetch_background_image(keyword_map.get(str(cat).upper(), "maldives news"))
+        except Exception as bg_err:
+            log.warning(f"Website card bg failed: {bg_err}")
+
+        card_buf = generate_card(card_text, source or "Samuga Media", timestamp, cat, bg)
+        card_bytes = card_buf.getvalue()
+
+        _WEBSITE_CARD_CACHE[article_id] = {"ts": utcnow(), "bytes": card_bytes}
+        if len(_WEBSITE_CARD_CACHE) > 80:
+            oldest_key = sorted(_WEBSITE_CARD_CACHE.items(), key=lambda x: x[1]["ts"])[0][0]
+            _WEBSITE_CARD_CACHE.pop(oldest_key, None)
+
+        return send_file(
+            io.BytesIO(card_bytes),
+            mimetype="image/png",
+            download_name=f"{article_id}.png",
+            max_age=21600
+        )
+
+    except Exception as e:
+        log.error(f"Website API /api/card/{article_id}.png error: {e}")
+        return Response("Card error", status=500)
 
 def start_api_server():
     """Start the public website API on Railway's assigned PORT."""
