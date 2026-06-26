@@ -7578,7 +7578,7 @@ def add_cors_headers(response):
     """Allow GitHub Pages to read this API."""
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return response
 
@@ -7588,7 +7588,7 @@ def api_home():
         "status": "online",
         "name": "Samuga News Bot API",
         "version": SAMUGA_VERSION,
-        "endpoints": ["/api/stories", "/api/health"]
+        "endpoints": ["/api/stories", "/api/health", "/api/chat"]
     })
 
 @api_app.get("/api/health")
@@ -7672,6 +7672,145 @@ def api_stories():
     except Exception as e:
         log.error(f"Website API /api/stories error: {e}")
         return jsonify([])
+
+
+# ── Public Website Chat API ───────────────────────────────────────────────────
+# Safe public chat endpoint for samugamedia.com.
+# This reuses the Telegram public-chat brain but blocks admin/posting commands.
+_PUBLIC_CHAT_RATE = {}  # ip -> [timestamps]
+_PUBLIC_CHAT_LIMIT = 12
+_PUBLIC_CHAT_WINDOW = 60 * 10  # 12 messages per 10 minutes per IP
+_PUBLIC_CHAT_MAX_CHARS = 600
+_PUBLIC_CHAT_BLOCKED_COMMANDS = [
+    "/approve", "/approved", "/reject", "/confirm", "/cancel", "/ai ",
+    "/remember", "/forget", "/memory", "/learning", "/post", "/queue",
+    "approve this", "reject this", "post this", "send to telegram", "send to facebook",
+    "send to instagram", "content lab", "core team", "admin", "database", "token",
+    "api key", "password", "environment variable"
+]
+
+def _public_chat_client_id():
+    """Return a stable-ish client ID for rate limiting behind Railway/proxies."""
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:80]
+    return (request.remote_addr or "unknown")[:80]
+
+def _public_chat_allowed(client_id):
+    """Simple in-memory rate limiter. Good enough for Phase 1 public chat."""
+    now = time.time()
+    window_start = now - _PUBLIC_CHAT_WINDOW
+    hits = [t for t in _PUBLIC_CHAT_RATE.get(client_id, []) if t >= window_start]
+    if len(hits) >= _PUBLIC_CHAT_LIMIT:
+        _PUBLIC_CHAT_RATE[client_id] = hits
+        return False, _PUBLIC_CHAT_LIMIT
+    hits.append(now)
+    _PUBLIC_CHAT_RATE[client_id] = hits
+    # Keep dict small
+    if len(_PUBLIC_CHAT_RATE) > 1000:
+        for k in list(_PUBLIC_CHAT_RATE.keys())[:200]:
+            _PUBLIC_CHAT_RATE.pop(k, None)
+    return True, _PUBLIC_CHAT_LIMIT
+
+def _public_chat_clean_message(message):
+    """Clean and cap public website message."""
+    msg = _api_clean_text(message, _PUBLIC_CHAT_MAX_CHARS)
+    return msg.strip()
+
+def _public_chat_is_blocked(message):
+    """Block admin/control prompts from the public website chat."""
+    low = (message or "").lower()
+    if low.startswith("/") and not low.startswith("/search"):
+        return True
+    return any(term in low for term in _PUBLIC_CHAT_BLOCKED_COMMANDS)
+
+@api_app.route("/api/chat", methods=["POST", "OPTIONS"])
+def api_chat():
+    """
+    Public website chat for Samuga AI.
+
+    Allowed:
+    - Ask latest Maldives news
+    - Ask about Samuga stories/archive
+    - Dhivehi or English public Q&A
+
+    Blocked:
+    - Any admin/posting/approval command
+    - Anything that tries to control Telegram/socials/Content Lab
+    """
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True})
+
+    try:
+        client_id = _public_chat_client_id()
+        allowed, limit = _public_chat_allowed(client_id)
+        if not allowed:
+            return jsonify({
+                "ok": False,
+                "error": "rate_limited",
+                "reply": "Too many messages too fast bro 😅 Please wait a few minutes and try again."
+            }), 429
+
+        data = request.get_json(silent=True) or {}
+        message = _public_chat_clean_message(data.get("message", ""))
+        session_id = _api_clean_text(data.get("session_id", "web"), 80) or "web"
+
+        if not message:
+            return jsonify({
+                "ok": False,
+                "error": "empty_message",
+                "reply": "Ask me something about Maldives news bro."
+            }), 400
+
+        if _public_chat_is_blocked(message):
+            return jsonify({
+                "ok": True,
+                "reply": "I can only answer public news questions here bro. For approvals, posting, or newsroom controls, use the private Samuga team Telegram."
+            })
+
+        # Public sessions are separated from Telegram user IDs.
+        user_id = f"web:{client_id}:{session_id}"
+        log.info(f"🌐 Website chat {client_id}: {message[:80]}")
+
+        # Story timeline/archive questions get a deterministic answer first.
+        try:
+            story_answer = answer_story_query(message)
+        except Exception:
+            story_answer = None
+        if story_answer:
+            reply = story_answer
+        elif is_dhivehi(message):
+            try:
+                headlines = get_local_headlines()
+                context = "\n".join(headlines[:6]) if headlines else ""
+                history = get_conversation(user_id)
+                reply = chat_with_gemini_dhivehi(message, context, history)
+                if reply:
+                    add_to_conversation(user_id, "user", message)
+                    add_to_conversation(user_id, "assistant", reply)
+                else:
+                    reply = chat_with_claude(message, user_id)
+            except Exception as e:
+                log.error(f"Website Dhivehi chat fallback: {e}")
+                reply = chat_with_claude(message, user_id)
+        else:
+            reply = chat_with_claude(message, user_id)
+
+        reply = _api_clean_text(reply, 1400) or "Sorry bro, I couldn't answer that right now."
+        return jsonify({
+            "ok": True,
+            "reply": reply,
+            "source": "Samuga AI",
+            "rate_limit": {"limit": limit, "window_seconds": _PUBLIC_CHAT_WINDOW}
+        })
+
+    except Exception as e:
+        log.error(f"Website API /api/chat error: {e}")
+        return jsonify({
+            "ok": False,
+            "error": "server_error",
+            "reply": "Something went wrong bro 😅 Try again in a moment."
+        }), 500
 
 def start_api_server():
     """Start the public website API on Railway's assigned PORT."""
