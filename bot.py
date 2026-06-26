@@ -7281,6 +7281,7 @@ def handle_updates():
 from flask import Flask, jsonify
 
 api_app = Flask(__name__)
+api_app.json.ensure_ascii = False
 
 @api_app.after_request
 def add_cors_headers(response):
