@@ -39,6 +39,46 @@ log = logging.getLogger(__name__)
 
 SAMUGA_VERSION = "7.0"
 
+
+# Public destination shown to readers. We never expose competitor/source links on
+# Samuga public platforms; readers are directed back to Samuga Community.
+SAMUGA_PUBLIC_LINK = os.environ.get("SAMUGA_PUBLIC_LINK", "https://t.me/samugacommunity")
+SAMUGA_PUBLIC_SOURCE = os.environ.get("SAMUGA_PUBLIC_SOURCE", "Samuga Media")
+
+_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+_HTML_A_RE = re.compile(r"<a\s+[^>]*href=[\"'][^\"']+[\"'][^>]*>(.*?)</a>", re.IGNORECASE | re.DOTALL)
+
+
+def strip_source_links(text):
+    """Remove external source URLs/html links from public Samuga copy."""
+    s = str(text or "")
+    # Keep anchor label but remove href destination.
+    s = _HTML_A_RE.sub(r"\1", s)
+    s = _URL_RE.sub("", s)
+    s = re.sub(r"\s+([,.;:!?])", r"\1", s)
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def samuga_public_caption(caption):
+    """Clean any public caption before Telegram/social posting."""
+    clean = strip_source_links(caption)
+    if "@samugacommunity" not in clean and SAMUGA_PUBLIC_LINK not in clean:
+        clean = clean.rstrip() + "\n\n📡 <b>Samuga Media</b> | @samugacommunity"
+    return clean
+
+
+def samuga_public_summary(title="", summary="", rewritten=""):
+    """Create cleaner website article text. Prefer Samuga rewrite over source excerpt."""
+    primary = rewritten or summary or title or ""
+    primary = strip_source_links(primary)
+    primary = re.sub(r"\s+", " ", primary).strip()
+    # Website should feel like an article, not a scraped link/title dump.
+    if primary and len(primary.split()) < 18 and title:
+        primary = f"{strip_source_links(title)}. {primary}"
+    return primary[:2600]
+
 # ── Timezone-aware UTC helper (replaces deprecated utcnow()) ─────────
 from datetime import timezone as _tz
 def utcnow():
@@ -372,7 +412,7 @@ def expire_old_approvals():
                 kw = item.get("keyword","local")
                 bg = item.get("_bg_image") or fetch_background_image(kw, cat=item.get("cat"), title=item.get("title",""))
                 ts_now = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
-                card = generate_card(item["dv_text"], item.get("source","Samuga"), ts_now, item.get("cat","BREAKING"), bg)
+                card = generate_card(item["dv_text"], SAMUGA_PUBLIC_SOURCE, ts_now, item.get("cat","BREAKING"), bg)
                 full_caption = (
                     f"🇲🇻 <b>{item['title']}</b>\n\n"
                     f"{item['dv_text']}\n\n"
@@ -706,7 +746,12 @@ def db_publish_article_for_website(article_id, title="", summary="", category="L
     if lang in ("dv", "dhivehi") and not article_id.endswith("_dv"):
         article_id = f"{article_id}_dv"
 
-    safe_cat = canonical_category(category or "LOCAL", title or "", summary or "")
+    public_title = strip_source_links(title or "")[:500]
+    public_summary = samuga_public_summary(public_title, summary or "")[:2600]
+    public_link = SAMUGA_PUBLIC_LINK
+    public_source = SAMUGA_PUBLIC_SOURCE
+
+    safe_cat = canonical_category(category or "LOCAL", public_title, public_summary)
     db_execute("""
         INSERT INTO articles
             (id, title, summary, link, source, category, lang, score, reliability,
@@ -716,8 +761,8 @@ def db_publish_article_for_website(article_id, title="", summary="", category="L
         ON CONFLICT (id) DO UPDATE SET
             title=COALESCE(NULLIF(EXCLUDED.title,''), articles.title),
             summary=COALESCE(NULLIF(EXCLUDED.summary,''), articles.summary),
-            link=COALESCE(NULLIF(EXCLUDED.link,''), articles.link),
-            source=COALESCE(NULLIF(EXCLUDED.source,''), articles.source),
+            link=EXCLUDED.link,
+            source=EXCLUDED.source,
             category=COALESCE(NULLIF(EXCLUDED.category,''), articles.category),
             lang=COALESCE(NULLIF(EXCLUDED.lang,''), articles.lang),
             score=GREATEST(COALESCE(articles.score,0), COALESCE(EXCLUDED.score,0)),
@@ -727,9 +772,9 @@ def db_publish_article_for_website(article_id, title="", summary="", category="L
             posted_at=COALESCE(articles.posted_at, NOW()),
             match_key=COALESCE(NULLIF(EXCLUDED.match_key,''), articles.match_key)
     """, (
-        article_id, (title or "")[:500], (summary or "")[:2000], link or "",
-        source or "Samuga Media", safe_cat, lang or "en", score or 0,
-        reliability or 0, bool(is_breaking), _caption_match_key(title or "")
+        article_id, public_title, public_summary, public_link,
+        public_source, safe_cat, lang or "en", score or 0,
+        reliability or 0, bool(is_breaking), _caption_match_key(public_title or "")
     ))
 
 # ── Phase 2: bot_kv helpers + learning logger ────────────────────────────────
@@ -2325,7 +2370,7 @@ def send_to_telegram(buf, caption):
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-            data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": caption, "parse_mode": "HTML"},
+            data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": samuga_public_caption(caption), "parse_mode": "HTML"},
             files={"photo": ("card.png", buf, "image/png")}, timeout=30)
         resp.raise_for_status()
         mid = resp.json().get("result", {}).get("message_id")
@@ -2740,7 +2785,7 @@ def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=Non
         try:
             db_publish_article_for_website(
                 article_id=article_id, title=title, summary=summary, category=cat,
-                source=source, link=link, lang=lang, is_breaking=is_breaking
+                source=SAMUGA_PUBLIC_SOURCE, link=SAMUGA_PUBLIC_LINK, lang=lang, is_breaking=is_breaking
             )
         except Exception as e:
             log.error(f"[WEBSITE] publish sync before queue failed: {e}")
@@ -2810,22 +2855,22 @@ def _post_to_social_now(img_buf, caption):
         clean = re.sub(r'<[^>]+>', '', caption)
         clean = clean.replace('&amp;', '&').replace('&#039;', "'").replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>').strip()
 
-        # Extract and resolve article URL (fixes Google News redirects)
-        link_match = re.search(r"href='([^']+)'", caption)
-        raw_url = link_match.group(1) if link_match else ""
-        article_url = resolve_url(raw_url) if raw_url else ""
+        # Public Samuga posts must never expose original source links.
+        # Send viewers to Samuga Community only.
+        clean = strip_source_links(clean)
+        community_link = SAMUGA_PUBLIC_LINK
 
-        # FB/IG: full text + real link
+        # FB/IG: full text + Samuga community link only
         fb_ig = clean
-        if article_url and article_url not in fb_ig:
-            fb_ig = fb_ig + "\n\n" + article_url
+        if community_link and community_link not in fb_ig:
+            fb_ig = fb_ig + "\n\n" + community_link
         fb_ig = fb_ig[:2200]
 
-        # Twitter: first line + link (280 char hard limit)
+        # Twitter/X: first line + Samuga community link only
         lines = [l.strip() for l in clean.split('\n') if l.strip()]
         tw = (lines[0] if lines else clean)[:220]
-        if article_url:
-            tw = tw + "\n\n" + article_url
+        if community_link:
+            tw = tw + "\n\n" + community_link
         tw = tw[:280]
 
         for cid, cap, name, meta in [
@@ -2869,22 +2914,22 @@ def post_to_social(img_buf, caption):
         clean = re.sub(r'<[^>]+>', '', caption)
         clean = clean.replace('&amp;', '&').replace('&#039;', "'").replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>').strip()
 
-        # Extract and resolve article URL (fixes Google News redirects)
-        link_match = re.search(r"href='([^']+)'", caption)
-        raw_url = link_match.group(1) if link_match else ""
-        article_url = resolve_url(raw_url) if raw_url else ""
+        # Public Samuga posts must never expose original source links.
+        # Send viewers to Samuga Community only.
+        clean = strip_source_links(clean)
+        community_link = SAMUGA_PUBLIC_LINK
 
-        # FB/IG: full text + real link
+        # FB/IG: full text + Samuga community link only
         fb_ig = clean
-        if article_url and article_url not in fb_ig:
-            fb_ig = fb_ig + "\n\n" + article_url
+        if community_link and community_link not in fb_ig:
+            fb_ig = fb_ig + "\n\n" + community_link
         fb_ig = fb_ig[:2200]
 
-        # Twitter: first line + link (280 char hard limit)
+        # Twitter/X: first line + Samuga community link only
         lines = [l.strip() for l in clean.split('\n') if l.strip()]
         tw = (lines[0] if lines else clean)[:220]
-        if article_url:
-            tw = tw + "\n\n" + article_url
+        if community_link:
+            tw = tw + "\n\n" + community_link
         tw = tw[:280]
 
         results = {}
@@ -2924,7 +2969,7 @@ def _build_card_and_caption(article):
     rewritten, keyword = rewrite_news(article["title"], article["summary"], raw_cat)
     bg = fetch_background_image(keyword, cat=display_cat, title=article["title"])
     ts = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
-    card = generate_card(rewritten, article["source"], ts, display_cat, bg)
+    card = generate_card(rewritten, SAMUGA_PUBLIC_SOURCE, ts, display_cat, bg)
     card_bytes = card.getvalue()
 
     cat_emoji = {"BREAKING":"🚨","LOCAL":"🇲🇻","POLITICAL":"🏛️","LIFESTYLE":"🌴","SPORTS":"🏅"}.get(display_cat,"📰")
@@ -2960,7 +3005,7 @@ def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_
         if article_id:
             db_publish_article_for_website(
                 article_id=article_id, title=title, summary=summary, category=cat,
-                source="Samuga Media", link=link, lang=("dv" if is_dhivehi(title + " " + summary) else "en"),
+                source=SAMUGA_PUBLIC_SOURCE, link=SAMUGA_PUBLIC_LINK, lang=("dv" if is_dhivehi(title + " " + summary) else "en"),
                 is_breaking=is_breaking_flag
             )
         if isinstance(tg_ok, int) and article_id:        # Phase 2: store msg id
@@ -3150,9 +3195,9 @@ def post_article(article, seen, social_only=False, allow_social=True):
                 try:
                     db_publish_article_for_website(
                         article_id=article["id"], title=article["title"],
-                        summary=article.get("summary", ""), category=cat,
-                        source=article.get("source", "Samuga Media"),
-                        link=article.get("link", ""), lang="en",
+                        summary=samuga_public_summary(article.get("title", ""), article.get("summary", ""), rewritten), category=cat,
+                        source=SAMUGA_PUBLIC_SOURCE,
+                        link=SAMUGA_PUBLIC_LINK, lang="en",
                         score=article.get("_priority", 0),
                         reliability=source_reliability(article.get("source", "")),
                         is_breaking=True
@@ -3280,10 +3325,10 @@ def post_article(article, seen, social_only=False, allow_social=True):
             db_publish_article_for_website(
                 article_id=article["id"],
                 title=article["title"],
-                summary=article.get("summary", ""),
+                summary=samuga_public_summary(article.get("title", ""), article.get("summary", ""), rewritten),
                 category=cat,
-                source=article.get("source", "Samuga Media"),
-                link=article.get("link", ""),
+                source=SAMUGA_PUBLIC_SOURCE,
+                link=SAMUGA_PUBLIC_LINK,
                 lang="en",
                 score=article.get("_priority", 0),
                 reliability=source_reliability(article.get("source", "")),
@@ -6523,7 +6568,7 @@ def handle_updates():
                                                 # Use pre-fetched bg if available, else fetch now
                                                 bg = _item.get("_bg_image") or fetch_background_image(kw)
                                                 ts_now = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
-                                                card = generate_card(final_dv, _item["source"], ts_now, _item["cat"], bg)
+                                                card = generate_card(final_dv, SAMUGA_PUBLIC_SOURCE, ts_now, _item["cat"], bg)
                                                 full_caption = (
                                                     f"🇲🇻 <b>{_item['title']}</b>\n\n"
                                                     f"{final_dv}\n\n"
@@ -7584,6 +7629,7 @@ def _api_clean_text(value, limit=900):
     """Clean DB text for website/API rendering."""
     value = str(value or "")
     value = _html.unescape(value)
+    value = strip_source_links(value)
     value = _api_re.sub(r"<[^>]+>", " ", value)
     value = _api_re.sub(r"https?://\S+", "", value)
     value = _api_re.sub(r"\s+", " ", value).strip()
@@ -7679,8 +7725,8 @@ def api_stories():
         for row in rows:
             article_id, title, summary, category, source, link, posted_at, found_at, lang, status = row
             dt = posted_at or found_at
-            safe_title = _api_clean_text(title, 500)
-            safe_summary = _api_clean_text(summary, 1200)
+            safe_title = _api_clean_text(strip_source_links(title), 500)
+            safe_summary = _api_clean_text(strip_source_links(summary), 1800)
             if not safe_title:
                 continue
 
@@ -7695,8 +7741,8 @@ def api_stories():
                 "title": safe_title,
                 "summary": safe_summary,
                 "category": _api_category(category, safe_title, safe_summary),
-                "source": source or "Samuga Media",
-                "url": link or "#",
+                "source": SAMUGA_PUBLIC_SOURCE,
+                "url": SAMUGA_PUBLIC_LINK,
                 "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent",
                 "lang": _api_lang(safe_title, safe_summary, lang),
                 "status": status or "posted"
@@ -7796,8 +7842,8 @@ def _public_chat_latest_rows(lang=None, limit=8, hours=30):
         clean = []
         seen = set()
         for title, summary, category, source, link, posted_at, found_at, row_lang, status in rows:
-            safe_title = _api_clean_text(title, 260)
-            safe_summary = _api_clean_text(summary, 380)
+            safe_title = _api_clean_text(strip_source_links(title), 260)
+            safe_summary = _api_clean_text(strip_source_links(summary), 520)
             if not safe_title:
                 continue
             detected = _api_lang(safe_title, safe_summary, row_lang)
@@ -7812,8 +7858,8 @@ def _public_chat_latest_rows(lang=None, limit=8, hours=30):
                 "title": safe_title,
                 "summary": safe_summary,
                 "category": _api_category(category, safe_title, safe_summary),
-                "source": source or "Samuga Media",
-                "url": link or "#",
+                "source": SAMUGA_PUBLIC_SOURCE,
+                "url": SAMUGA_PUBLIC_LINK,
                 "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent",
                 "lang": detected
             })
@@ -7846,8 +7892,8 @@ def _public_chat_search_rows(message, lang=None, limit=6):
         clean = []
         seen = set()
         for title, summary, category, source, link, posted_at, found_at, row_lang, status in rows:
-            safe_title = _api_clean_text(title, 260)
-            safe_summary = _api_clean_text(summary, 380)
+            safe_title = _api_clean_text(strip_source_links(title), 260)
+            safe_summary = _api_clean_text(strip_source_links(summary), 520)
             detected = _api_lang(safe_title, safe_summary, row_lang)
             if lang in ("en", "dv") and detected != lang:
                 continue
@@ -7860,8 +7906,8 @@ def _public_chat_search_rows(message, lang=None, limit=6):
                 "title": safe_title,
                 "summary": safe_summary,
                 "category": _api_category(category, safe_title, safe_summary),
-                "source": source or "Samuga Media",
-                "url": link or "#",
+                "source": SAMUGA_PUBLIC_SOURCE,
+                "url": SAMUGA_PUBLIC_LINK,
                 "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent",
                 "lang": detected
             })
@@ -7894,15 +7940,27 @@ def _public_chat_format_news(rows, lang="en", searched=False):
         line = f"{i}. {r['title']}"
         if r.get("summary"):
             line += f" — {r['summary'][:190]}"
-        line += f"\nSource: {r.get('source','Samuga Media')} • {r.get('time','Recent')}"
+        line += f"\nSamuga Media • {r.get('time','Recent')}"
         parts.append(line)
     parts.append("Ask me about any one of these and I’ll explain it clearly.")
     return "\n\n".join(parts)
 
+def _public_chat_tavily_context(message, lang="en"):
+    """Live search context for website chat, sanitized so no source URLs leak."""
+    try:
+        if not TAVILY_API_KEY:
+            return ""
+        q = f"Maldives latest news {message}" if lang != "dv" else f"Maldives news {message}"
+        ctx = tavily_search(q)
+        return strip_source_links(_api_clean_text(ctx, 1200))
+    except Exception as e:
+        log.warning(f"Website chat Tavily context failed: {e}")
+        return ""
+
 def _public_chat_context(rows):
     lines = []
     for r in rows[:8]:
-        lines.append(f"- {r['title']} | {r.get('summary','')} | {r.get('source','')} | {r.get('time','')}")
+        lines.append(f"- {r['title']} | {r.get('summary','')} | Samuga Media | {r.get('time','')}")
     return "\n".join(lines)
 
 
@@ -7974,6 +8032,7 @@ def api_chat():
                 context_rows = breaking_rows or latest_rows[:4]
 
             context = _public_chat_context(context_rows[:6])
+            tavily_context = _public_chat_tavily_context(message, lang=lang) if is_news_question else ""
 
             # For public website chat, use the public Samuga AI style — not core-team brain.
             # The prompt keeps answers short and human, while fresh context prevents old memory headlines.
@@ -7982,12 +8041,12 @@ def api_chat():
                     safe_prompt = (
                         "You are Samuga AI, the public SamugaNewsBot style assistant. "
                         "Answer in natural Dhivehi if the user used Dhivehi, otherwise simple English. "
-                        "Use ONLY the fresh Samuga context below for news facts. "
+                        "Use fresh Samuga context first, and Tavily live search context only to add current facts. "
                         "Do not mention old stories from memory. Do not use markdown symbols like ** or ###. "
-                        "Keep it short. For latest news, give maximum 3 items. "
+                        "Keep it short. For latest news, give maximum 3 items. Do not include external source links; direct users to @samugacommunity. "
                         "For breaking, only say breaking if context actually looks breaking. "
                         "Be friendly like a chat, not a formal article.\n\n"
-                        f"Fresh Samuga context:\n{context}\n\n"
+                        f"Fresh Samuga context:\n{context}\n\nTavily live search context:\n{tavily_context}\n\n"
                         f"User asked: {message}"
                     )
                 else:
@@ -8000,13 +8059,13 @@ def api_chat():
                     safe_prompt = (
                         "You are Samuga AI, the public @SamugaNewsBot style assistant. "
                         "Reply naturally, friendly, and human — like a helpful Maldivian news buddy. "
-                        "Use ONLY the fresh Samuga context below for news facts. "
+                        "Use fresh Samuga context first, and Tavily live search context only to add current facts. "
                         "Do not use old headlines from memory. Do not use markdown symbols like **, ###, or long separators. "
                         "Do not dump a long list. Maximum 3 short items unless the user asks for more. "
                         "Avoid repeating the title and summary. Keep each item to one short sentence. "
-                        "End with one natural follow-up question.\n\n"
+                        "Do not include external source links or tell users to visit source websites; send them to @samugacommunity for full updates. End with one natural follow-up question.\n\n"
                         f"Mode: {mode}\n"
-                        f"Fresh Samuga context:\n{context}\n\n"
+                        f"Fresh Samuga context:\n{context}\n\nTavily live search context:\n{tavily_context}\n\n"
                         f"User asked: {message}"
                     )
             else:
@@ -8015,7 +8074,7 @@ def api_chat():
                     "Chat naturally and friendly. You can answer normal questions too. "
                     "If the question is about news, use the fresh Samuga context below. "
                     "Do not reveal private newsroom/admin details. Do not approve/reject/post anything. "
-                    "Keep the answer short and conversational. No markdown symbols like **.\n\n"
+                    "Keep the answer short and conversational. No markdown symbols like **. Do not include external source links; direct users to @samugacommunity when needed.\n\n"
                     f"Fresh Samuga context if needed:\n{context}\n\n"
                     f"User message: {message}"
                 )
