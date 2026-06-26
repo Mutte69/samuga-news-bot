@@ -171,6 +171,14 @@ DHIVEHI_EXPIRY_SECONDS   = 7200   # Dhivehi: expire (delete) after 2h if not app
 approval_queue = {}  # key -> {card_bytes, caption, title, link, cat, lang, dv_text, created_at, ...}
 _approval_counter = [0]
 
+# ── Global state variables (removed from db block, restored here) ──────────────
+analytics           = {"posts_by_cat": {}, "breaking_count": 0, "social_success": 0, "social_fail": 0, "week_start": None}
+last_regular_post_time = None
+daily_sports_count  = {"date": None, "count": 0}
+daily_world_count   = {"date": None, "count": 0}
+daily_tourism_count = {"date": None, "count": 0}
+
+
 # ── Content Lab flood control ────────────────────────────────────────────────
 # Goal: normal newsroom flow = max 4 approval cards/hour.
 # Exception: very high priority stories can use up to 6/hour.
@@ -4872,7 +4880,7 @@ if __name__ == "__main__":
     log.info("📲 Social queue worker started (10-min gap between posts)")
 
     init_database()  # connect to Postgres (falls back to JSON if unavailable)
-    pass  # restore_state()  # temporarily disabled  # bring back dedup memory, daily counters, pending cards, analytics
+    restore_state()  # bring back dedup memory, daily counters, pending cards, analytics
 
 
 # ── State Persistence (JSON fallback — survives Railway restarts) ─────────────
