@@ -39,6 +39,11 @@ from weather import (
     MMS_ALERT_LEVELS, weather_alerts_today, ISLAND_LOCATIONS,
     HIJRI_SPECIAL_DAYS, SPECIAL_DAY_DETAILS, ISLAMIC_REMINDERS
 )
+from fetchers import (
+    fetch_news, fetch_mvcrisis, fetch_all_dv_channels, fetch_dv_telegram,
+    get_local_headlines, rewrite_news, gemini_translate,
+    RSS_FEEDS, LOCAL_FEEDS, DV_TELEGRAM_CHANNELS, DEFAULT_KEYWORDS
+)
 
 # ── Structured logging: tags make Railway logs readable ──────────────────────
 # Usage: log.info("[FETCH] pulled 12 articles")  →  easy to filter in Railway
@@ -161,48 +166,6 @@ class Article:
 # ═══════════════════════════════════════════════════════════════════════════
 # ── RSS Feeds (v4 Strategy) ───────────────────────────────────────────────────
 # LOCAL (70%) — Maldivian sources, priority order
-LOCAL_FEEDS = [
-    # Tier 1 - Breaking/Crisis
-    {"url": "https://news.google.com/rss/search?q=maldives+breaking+incident+accident+arrest&hl=en-MV&gl=MV&ceid=MV:en", "cat": "DISASTER", "lang": "en"},
-    # Tier 2 - English sources
-    {"url": "https://see.mv/feed",                   "cat": "LOCAL",   "lang": "en"},
-    {"url": "https://english.sun.mv/feed",            "cat": "LOCAL",   "lang": "en"},  # already present
-    {"url": "https://edition.mv/feed",                "cat": "LOCAL",   "lang": "en"},  # already present (editon)
-    {"url": "https://maldivesindependent.com/feed",   "cat": "LOCAL",   "lang": "en"},
-    {"url": "https://oneonline.mv/en/feed",           "cat": "LOCAL",   "lang": "en"},
-    {"url": "https://psmnews.mv/en/feed",             "cat": "LOCAL",   "lang": "en"},  # already present (PSM News)
-    {"url": "https://maldivesvoice.com/feed",         "cat": "LOCAL",   "lang": "en"},  # NEW: Maldives Voice
-    {"url": "https://presidency.gov.mv/feed",         "cat": "LOCAL",   "lang": "en"},  # NEW: Presidency
-    # Tier 3 - Dhivehi sources
-    {"url": "https://sunonline.mv/feed",              "cat": "LOCAL",   "lang": "dv"},  # NEW: SunOnline (Dhivehi)
-    {"url": "https://mihaaru.com/rss",                "cat": "LOCAL",   "lang": "dv"},
-    {"url": "https://avas.mv/feed",                   "cat": "LOCAL",   "lang": "dv"},
-    {"url": "https://news.google.com/rss/search?q=maldives+politics+parliament+government&hl=en-MV&gl=MV&ceid=MV:en", "cat": "LOCAL", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=maldives+economy+finance+business&hl=en-MV&gl=MV&ceid=MV:en",       "cat": "LOCAL", "lang": "en"},
-]
-
-# SPORTS (10%) — Maldives sports first, then major international
-SPORTS_FEEDS = [
-    {"url": "https://news.google.com/rss/search?q=maldives+football+sports&hl=en-MV&gl=MV&ceid=MV:en", "cat": "SPORTS", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=world+cup+2026+results&hl=en&gl=US&ceid=US:en",       "cat": "SPORTS", "lang": "en"},
-]
-
-# WORLD (10%) — Only major international that affects Maldives or region
-WORLD_FEEDS = [
-    {"url": "https://news.google.com/rss/search?q=war+conflict+crisis+2026&hl=en&gl=US&ceid=US:en",     "cat": "WORLD", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=earthquake+tsunami+disaster&hl=en&gl=US&ceid=US:en",  "cat": "DISASTER", "lang": "en"},
-]
-
-# LIFESTYLE (10%)
-LIFESTYLE_FEEDS = [
-    {"url": "https://visitmaldives.com/feed",                                                                   "cat": "TOURISM", "lang": "en"},  # NEW: Visit Maldives official
-    {"url": "https://news.google.com/rss/search?q=maldives+tourism+travel+resort&hl=en-MV&gl=MV&ceid=MV:en", "cat": "TOURISM", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=maldives+weather+storm&hl=en-MV&gl=MV&ceid=MV:en",         "cat": "WEATHER", "lang": "en"},
-    # AccuWeather RSS removed — weather handled by 8AM/8PM weather cards instead
-]
-
-RSS_FEEDS = LOCAL_FEEDS + SPORTS_FEEDS + WORLD_FEEDS + LIFESTYLE_FEEDS
-
 CAT_CONFIG = {
     "BREAKING":  {"label": "🚨  BREAKING NEWS", "color": (220,50,50)},
     "LOCAL":     {"label": "🇲🇻  LOCAL NEWS",    "color": (41,171,226)},
@@ -1977,244 +1940,6 @@ def increment_social_count():
     social_post_counts["count"] += 1
     persist_state()
     log.info(f"📊 Social posts today: {social_post_counts['count']} ({'day' if is_day_social() else 'night'} limit: {20 if is_day_social() else 3})")
-
-# ── Gemini Translate ──────────────────────────────────────────────────────────
-def gemini_translate(text):
-    """Translate Dhivehi to English using Gemini (with model fallback)."""
-    if not GEMINI_API_KEY: return text
-    result = _gemini_post(f"Translate this Dhivehi text to English. Return ONLY the English translation:\n\n{text}")
-    return result if result else text
-
-# ── Fetch News ────────────────────────────────────────────────────────────────
-# Words that signal an ad/promo/spam — never treat these as news
-MVCRISIS_AD_MARKERS = [
-    "hire","rent","for sale","available","booking","book now","contact","call now",
-    "whatsapp","viber","discount","offer","promo","cheap","price","mvr ","rufiyaa ",
-    "delivery","order now","dm ","inbox","trip","package","tour","charter","ferry service",
-    "submarine","speed boat hire","speedboat hire","private trips","advertise","sponsored",
-    "sale!","%","https://sauvees","buy ","sell ","service available","we offer"
-]
-
-def _looks_like_ad(text):
-    """Heuristic: is this MvCrisis post an ad/promo rather than news?"""
-    t = text.lower()
-    hits = sum(1 for m in MVCRISIS_AD_MARKERS if m in t)
-    # Multiple ad markers, or a phone number pattern, or a price = likely ad
-    import re as _re
-    has_phone = bool(_re.search(r"\b[79]\d{6}\b", t))  # Maldivian mobile pattern
-    has_price = bool(_re.search(r"\b\d+\s*(mvr|rf|rufiyaa|usd|\$)\b", t))
-    return hits >= 2 or (hits >= 1 and (has_phone or has_price))
-
-def fetch_mvcrisis():
-    """Scrape MvCrisis public Telegram channel — filters ads, only keeps real news."""
-    try:
-        resp = requests.get("https://t.me/s/mvcrisis", timeout=10,
-                           headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code != 200: return []
-        import re as _re, hashlib
-        texts = _re.findall(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', resp.text, _re.DOTALL)
-        articles = []
-        skipped_ads = 0
-        for raw in texts[:15]:
-            text = _re.sub(r"<[^>]+>", "", raw).strip()
-            text = text.replace("&amp;","&").replace("&#39;","'").replace("&quot;",'"')
-            if len(text) < 25: continue
-            if _looks_like_ad(text):
-                skipped_ads += 1
-                continue
-            art_id = "mvc_" + hashlib.md5(text[:60].encode()).hexdigest()[:8]
-            lang = "dv" if any("ހ" <= ch <= "޿" for ch in text) else "en"
-            articles.append({
-                "id": art_id,
-                "title": text[:150],
-                "summary": text,
-                "link": "https://t.me/mvcrisis",
-                "source": "MvCrisis",
-                "cat": "LOCAL",
-                "lang": lang,
-                "published": utcnow()
-            })
-        log.info(f"📡 MvCrisis: {len(articles)} news kept, {skipped_ads} ads skipped")
-        return articles
-    except Exception as e:
-        log.error(f"MvCrisis fetch: {e}")
-        return []
-
-# ── Dhivehi Telegram channel scrapers ────────────────────────────────────────
-# Maldivian news sites block RSS with 403. Their Telegram channels are public
-# and scrapeable — same technique as MvCrisis. Each returns native Dhivehi text.
-
-DV_TELEGRAM_CHANNELS = [
-    {"handle": "mihaarulive",  "source": "Mihaaru",   "reliability": 95},
-    {"handle": "avasonline",   "source": "Avas",      "reliability": 88},
-    {"handle": "raajjemvlive", "source": "Raajje",    "reliability": 85},
-    {"handle": "voicemaldives","source": "VoiceMV",   "reliability": 80},
-    {"handle": "mvplusmedia",  "source": "MV+",       "reliability": 82},
-]
-
-def fetch_dv_telegram(handle, source, reliability=80):
-    """
-    Scrape a public Telegram channel for Dhivehi news.
-    Returns articles with lang='dv' where Thaana script is detected,
-    or lang='en' for mixed-language posts.
-    """
-    try:
-        url = f"https://t.me/s/{handle}"
-        resp = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code != 200:
-            log.debug(f"[FETCH] {source} Telegram: HTTP {resp.status_code}")
-            return []
-        import re as _re
-        texts = _re.findall(
-            r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
-            resp.text, _re.DOTALL)
-        articles = []
-        for raw in texts[:12]:
-            text = _re.sub(r"<[^>]+>", "", raw).strip()
-            text = (text.replace("&amp;","&").replace("&#39;","'")
-                    .replace("&quot;",'"').replace("&lt;","<").replace("&gt;",">"))
-            if len(text) < 20: continue
-            if _looks_like_ad(text): continue
-            # Detect language from Thaana script presence
-            dv_chars = sum(1 for ch in text if "ހ" <= ch <= "޿")
-            # Lower threshold — even 1-2 Thaana chars in a mixed post = Dhivehi
-            lang = "dv" if dv_chars >= 1 else "en"
-            art_id = f"tg_{handle}_" + hashlib.md5(text[:60].encode()).hexdigest()[:8]
-            articles.append({
-                "id":          art_id,
-                "title":       text[:150],
-                "summary":     text,
-                "link":        f"https://t.me/{handle}",
-                "source":      source,
-                "cat":         "LOCAL",
-                "lang":        lang,
-                "reliability": reliability,
-                "published":   utcnow()
-            })
-        log.info(f"[FETCH] {source} Telegram: {len(articles)} items")
-        return articles
-    except Exception as e:
-        log.error(f"[FETCH] {source} Telegram: {e}")
-        return []
-
-def fetch_all_dv_channels():
-    """Fetch all Dhivehi Telegram channels in parallel threads."""
-    results = []
-    lock = threading.Lock()
-
-    def _fetch(ch):
-        arts = fetch_dv_telegram(ch["handle"], ch["source"], ch["reliability"])
-        with lock:
-            results.extend(arts)
-
-    threads = [threading.Thread(target=_fetch, args=(ch,), daemon=True)
-               for ch in DV_TELEGRAM_CHANNELS]
-    for t in threads: t.start()
-    for t in threads: t.join(timeout=15)
-    return results
-
-def _feed_source_name(url):
-    """Map a feed URL to a clean source name for reliability scoring + display."""
-    u = url.lower()
-    if "news.google.com" in u: return "Google News"
-    if "mihaaru" in u:         return "Mihaaru"
-    if "sunonline" in u:       return "SunOnline"
-    if "sun.mv" in u:          return "Sun"
-    if "psmnews" in u:         return "PSM News"
-    if "presidency" in u:      return "Presidency"
-    if "edition" in u:         return "Edition"
-    if "avas" in u:            return "Avas"
-    if "see.mv" in u:          return "See"
-    if "maldivesindependent" in u: return "Maldives Independent"
-    if "oneonline" in u:       return "One Online"
-    if "maldivesvoice" in u:   return "Maldives Voice"
-    if "visitmaldives" in u:   return "Visit Maldives"
-    if "vnewsmv" in u:         return "VNews"
-    if "raajjemv" in u:        return "Raajje"
-    if "thepress_mv" in u:     return "ThePress"
-    return ""
-
-def fetch_news():
-    articles, seen_titles = [], set()
-    # MvCrisis first — #1 Maldives breaking news source
-    for a in fetch_mvcrisis():
-        if a["title"] not in seen_titles:
-            seen_titles.add(a["title"])
-            articles.append(a)
-    # Dhivehi Telegram channels — native Dhivehi content from Mihaaru, Avas, VNews etc
-    for a in fetch_all_dv_channels():
-        if a["title"] not in seen_titles:
-            seen_titles.add(a["title"])
-            articles.append(a)
-    for fc in RSS_FEEDS:
-        try:
-            feed = feedparser.parse(fc["url"])
-            for entry in feed.entries[:10]:
-                title   = entry.get("title","")
-                summary = entry.get("summary", title)
-                if fc["lang"] == "dv":
-                    title   = gemini_translate(title)
-                    summary = gemini_translate(summary[:300])
-                key = title.lower()[:50]
-                if key in seen_titles or not is_fresh(entry): continue
-                seen_titles.add(key)
-                # Derive a clean source name: prefer RSS entry source, else feed domain
-                entry_src = entry.get("source",{}).get("title", "") if isinstance(entry.get("source"), dict) else ""
-                feed_src = _feed_source_name(fc["url"])
-                src_name = entry_src or feed_src or fc["cat"]
-                articles.append({
-                    "id": hashlib.md5(entry.get("link",title).encode()).hexdigest(),
-                    "title": title, "summary": summary,
-                    "link": entry.get("link",""), "cat": fc["cat"],
-                    "lang": fc["lang"],
-                    "source": src_name,
-                })
-        except Exception as e: log.error(f"Feed error: {e}")
-    log.info(f"Found {len(articles)} fresh articles")
-    return articles
-
-def get_local_headlines():
-    headlines = []
-    try:
-        for fc in RSS_FEEDS[:5]:
-            feed = feedparser.parse(fc["url"])
-            for entry in feed.entries[:3]:
-                title = entry.get("title","")
-                if title and is_fresh(entry, hours=12):
-                    headlines.append(f"• [{fc['cat']}] {title}")
-            if len(headlines) >= 10: break
-    except Exception as e: log.debug(f"get_local_headlines: {e}")
-    return headlines[:10]
-
-# ── Rewrite with Claude ───────────────────────────────────────────────────────
-DEFAULT_KEYWORDS = {"LOCAL":"maldives government","FOOTBALL":"football stadium","WORLD":"world politics","DISASTER":"emergency rescue","WEATHER":"tropical weather","TOURISM":"maldives resort beach"}
-
-def rewrite_news(title, summary, cat):
-    cat_ctx = {"LOCAL":"local Maldivian news","FOOTBALL":"football news","WORLD":"world news","DISASTER":"disaster/emergency","WEATHER":"weather news","TOURISM":"tourism news"}.get(cat,"news")
-    extra = "Note: Only headline available. Expand with relevant context." if not summary or summary.strip()==title.strip() or len(summary)<30 else ""
-    prompt = f"""You are a news writer for Samuga Media, a Maldivian digital media outlet.
-Rewrite this {cat_ctx} into a short punchy engaging English Telegram post.
-- Max 3 sentences, clear and direct, no hashtags, no emojis, professional
-- IMPORTANT: Use gender-neutral terms (they/their, "the accused", "the suspect", "the individual") unless the original text explicitly states gender. Do not assume gender from names.
-{extra}
-Also give a specific 2-3 word Pexels image keyword for this topic.
-
-Title: {title}
-Summary: {summary}
-
-Respond EXACTLY:
-TEXT: [rewritten news]
-IMAGE: [specific keyword]"""
-    try:
-        msg = ai.messages.create(model="claude-haiku-4-5-20251001", max_tokens=400, messages=[{"role":"user","content":prompt}])
-        text, kw = "", DEFAULT_KEYWORDS.get(cat,"maldives")
-        for line in msg.content[0].text.strip().split('\n'):
-            if line.startswith("TEXT:"): text = line[5:].strip()
-            elif line.startswith("IMAGE:"): kw = line[6:].strip()
-        return (text or title), kw
-    except Exception as e:
-        log.error(f"Claude rewrite: {e}")
-        return title, DEFAULT_KEYWORDS.get(cat,"maldives")
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def send_to_telegram(buf, caption):
     """Post a photo to the community channel. Returns message_id (int) or False."""
@@ -6923,6 +6648,12 @@ if __name__ == "__main__":
 
     init_database()  # connect to Postgres (falls back to JSON if unavailable)
     restore_state()  # bring back dedup memory, daily counters, pending cards, analytics
+
+    # Wire fetchers module with shared AI client
+    import fetchers as _ft
+    _ft.ai             = ai
+    _ft._gemini_post   = _gemini_post
+    _ft.GEMINI_API_KEY = GEMINI_API_KEY
 
     # Wire weather module with shared functions (avoids circular imports)
     import weather as _wx
