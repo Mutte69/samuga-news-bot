@@ -4874,6 +4874,184 @@ if __name__ == "__main__":
     init_database()  # connect to Postgres (falls back to JSON if unavailable)
     restore_state()  # bring back dedup memory, daily counters, pending cards, analytics
 
+
+# ── State Persistence (JSON fallback — survives Railway restarts) ─────────────
+import os as _os, json as _json, threading as _threading
+DATA_DIR   = "/data"
+_os.makedirs(DATA_DIR, exist_ok=True)
+SEEN_FILE  = _os.path.join(DATA_DIR, "seen_articles.json")
+STATE_FILE = _os.path.join(DATA_DIR, "bot_state.json")
+_state_lock = _threading.Lock()
+_poll_offset = [0]
+
+def load_seen():
+    try:
+        if _os.path.exists(SEEN_FILE):
+            with open(SEEN_FILE) as f: return set(_json.load(f))
+    except Exception as e: log.error(f"load_seen: {e}")
+    return set()
+
+def save_seen(seen):
+    try:
+        with open(SEEN_FILE,"w") as f: _json.dump(list(seen)[-1000:], f)
+    except Exception as e: log.error(f"save_seen: {e}")
+
+def _load_state():
+    try:
+        if _os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f: return _json.load(f)
+    except Exception as e: log.error(f"load_state: {e}")
+    return {}
+
+def _save_state(state):
+    try:
+        with _state_lock:
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as f: _json.dump(state, f)
+            _os.replace(tmp, STATE_FILE)
+    except Exception as e: log.error(f"save_state: {e}")
+
+def _serialize_social_counts():
+    sc = dict(social_post_counts)
+    if sc.get("date") and not isinstance(sc["date"], str):
+        sc["date"] = sc["date"].isoformat()
+    return sc
+
+def _serialize_approval_queue():
+    import base64
+    out = {}
+    for k, v in approval_queue.items():
+        item = dict(v)
+        if item.get("card_bytes"):
+            try:
+                item["card_bytes"] = base64.b64encode(item["card_bytes"]).decode()
+                item["_card_b64"] = True
+            except Exception:
+                item["card_bytes"] = None
+                item["_card_b64"] = False
+        item["created_at"] = item["created_at"].isoformat() if item.get("created_at") else None
+        out[k] = item
+    return out
+
+def persist_state():
+    """Snapshot all volatile state to disk."""
+    try:
+        sq_serialized = []
+        with _social_queue_lock:
+            for item in _social_queue:
+                sq_serialized.append({
+                    "img_bytes_b64": __import__("base64").b64encode(item["img_bytes"]).decode(),
+                    "caption": item["caption"],
+                    "queued_at": item["queued_at"].isoformat(),
+                    "article_id": item.get("article_id"),
+                    "title": item.get("title",""),
+                    "summary": item.get("summary",""),
+                    "cat": item.get("cat","LOCAL"),
+                    "source": item.get("source","Samuga Media"),
+                    "link": item.get("link",""),
+                    "lang": item.get("lang","en"),
+                    "is_breaking": item.get("is_breaking", False),
+                    "key_label": item.get("key_label","Post"),
+                    "tg_ok": item.get("tg_ok", False),
+                    "post_telegram": item.get("post_telegram", True),
+                    "notify_chat_id": item.get("notify_chat_id"),
+                    "notify_thread_id": item.get("notify_thread_id"),
+                })
+        state = {
+            "recent_story_titles": [(t, ts.isoformat()) for (t, ts) in recent_story_titles],
+            "recent_posts": recent_posts[-50:],
+            "analytics": analytics,
+            "daily_sports_count": daily_sports_count,
+            "daily_world_count": daily_world_count,
+            "daily_tourism_count": daily_tourism_count,
+            "social_post_counts": _serialize_social_counts(),
+            "polls_today": polls_today,
+            "last_regular_post_time": last_regular_post_time.isoformat() if last_regular_post_time else None,
+            "last_social_post_time": _last_social_post_time.isoformat() if _last_social_post_time else None,
+            "approval_counter": _approval_counter[0],
+            "approval_queue": _serialize_approval_queue(),
+            "poll_offset": _poll_offset[0],
+            "social_queue": sq_serialized,
+        }
+        _save_state(state)
+    except Exception as e:
+        log.error(f"persist_state: {e}")
+
+def restore_state():
+    """Load persisted state back into memory on startup."""
+    global recent_story_titles, recent_posts, analytics
+    global daily_sports_count, daily_world_count, daily_tourism_count
+    global social_post_counts, polls_today, last_regular_post_time
+    state = _load_state()
+    if not state:
+        log.info("📦 No saved state — starting fresh")
+        return
+    import base64
+    try:
+        recent_story_titles.clear()
+        for (t, ts) in state.get("recent_story_titles", []):
+            try: recent_story_titles.append((t, datetime.fromisoformat(ts)))
+            except Exception: pass
+        recent_posts.clear()
+        recent_posts.extend(state.get("recent_posts", []))
+        analytics.update(state.get("analytics", {}))
+        daily_sports_count.update(state.get("daily_sports_count", {}))
+        daily_world_count.update(state.get("daily_world_count", {}))
+        daily_tourism_count.update(state.get("daily_tourism_count", {}))
+        social_post_counts.update(state.get("social_post_counts", {}))
+        polls_today.update(state.get("polls_today", {}))
+        lrt = state.get("last_regular_post_time")
+        if lrt:
+            try: last_regular_post_time = datetime.fromisoformat(lrt)
+            except Exception: pass
+        _approval_counter[0] = state.get("approval_counter", 0)
+        _poll_offset[0] = state.get("poll_offset", 0)
+        global _last_social_post_time
+        lspt = state.get("last_social_post_time")
+        if lspt:
+            try: _last_social_post_time = datetime.fromisoformat(lspt)
+            except Exception: pass
+        sq = state.get("social_queue", [])
+        if sq:
+            import base64 as _b64
+            with _social_queue_lock:
+                for item in sq:
+                    try:
+                        _social_queue.append({
+                            "img_bytes": _b64.b64decode(item["img_bytes_b64"]),
+                            "caption": item["caption"],
+                            "queued_at": datetime.fromisoformat(item["queued_at"]),
+                            "article_id": item.get("article_id"),
+                            "title": item.get("title",""),
+                            "summary": item.get("summary",""),
+                            "cat": item.get("cat","LOCAL"),
+                            "source": item.get("source","Samuga Media"),
+                            "link": item.get("link",""),
+                            "lang": item.get("lang","en"),
+                            "is_breaking": item.get("is_breaking", False),
+                            "key_label": item.get("key_label","Post"),
+                            "tg_ok": item.get("tg_ok", False),
+                            "post_telegram": item.get("post_telegram", True),
+                            "notify_chat_id": item.get("notify_chat_id"),
+                            "notify_thread_id": item.get("notify_thread_id"),
+                        })
+                    except Exception: pass
+            log.info(f"📲 Social queue restored: {len(_social_queue)} post(s) waiting")
+        for k, item in state.get("approval_queue", {}).items():
+            try:
+                if item.get("_card_b64") and item.get("card_bytes"):
+                    item["card_bytes"] = base64.b64decode(item["card_bytes"])
+                item.pop("_card_b64", None)
+                item["created_at"] = datetime.fromisoformat(item["created_at"]) if item.get("created_at") else utcnow()
+                approval_queue[k] = item
+            except Exception as e:
+                log.error(f"restore approval {k}: {e}")
+        log.info(f"📦 State restored: {len(recent_story_titles)} dedup titles, "
+                 f"{len(approval_queue)} pending cards, {len(recent_posts)} recent posts")
+    except Exception as e:
+        log.error(f"restore_state: {e}")
+
+
     # Wire db module with shared functions
     import db as _db
     _db.utcnow       = utcnow
