@@ -612,6 +612,15 @@ def db_publish_article_for_website(article_id, title="", summary="", category="L
     """
     if not DB_ENABLED or not article_id:
         return
+
+    # Website is now a real publishing destination.
+    # English and Dhivehi versions must not fight over the same DB row.
+    # So Dhivehi public posts are stored as <article_id>_dv.
+    lang = (lang or "en").lower()
+    article_id = str(article_id)
+    if lang in ("dv", "dhivehi") and not article_id.endswith("_dv"):
+        article_id = f"{article_id}_dv"
+
     safe_cat = canonical_category(category or "LOCAL", title or "", summary or "")
     db_execute("""
         INSERT INTO articles
@@ -3036,6 +3045,19 @@ def post_article(article, seen, social_only=False, allow_social=True):
                 approval_queue[key]["rewritten"] = rewritten
                 approval_queue[key]["summary"] = article.get("summary","")
                 approval_queue[key]["article_id"] = article["id"]
+                try:
+                    db_publish_article_for_website(
+                        article_id=article["id"], title=article["title"],
+                        summary=article.get("summary", ""), category=cat,
+                        source=article.get("source", "Samuga Media"),
+                        link=article.get("link", ""), lang="en",
+                        score=article.get("_priority", 0),
+                        reliability=source_reliability(article.get("source", "")),
+                        is_breaking=True
+                    )
+                    log.info(f"🌐 Website published held EN breaking story: {article['title'][:60]}")
+                except Exception as e:
+                    log.error(f"[WEBSITE] held breaking publish failed: {e}")
                 approval_queue[key]["_cluster_size"] = article.get("_cluster_size", 1)
                 approval_queue[key]["_confidence"] = confidence
                 approval_queue[key]["_hold_reason"] = hold_reason
@@ -3076,7 +3098,7 @@ def post_article(article, seen, social_only=False, allow_social=True):
                         dv_text=dv_text, keyword=_kw, source=_source,
                         is_breaking=True, allow_social=True
                     )
-                    approval_queue[key]["article_id"] = _aid
+                    approval_queue[key]["article_id"] = f"{_aid}_dv"
                     approval_queue[key]["_auto_post_breaking"] = True   # 2hr auto-post flag
                     approval_queue[key]["summary"] = article.get("summary","")
                     # Pre-fetch bg
@@ -3143,6 +3165,27 @@ def post_article(article, seen, social_only=False, allow_social=True):
         approval_queue[key]["rewritten"] = rewritten
         approval_queue[key]["summary"] = article.get("summary","")
         approval_queue[key]["article_id"] = article["id"]
+
+        # Website-first publishing: every English story selected by the bot
+        # goes to the website immediately, even while Telegram/socials wait for
+        # approval or the queue. Dhivehi stays private until approved/posted.
+        try:
+            db_publish_article_for_website(
+                article_id=article["id"],
+                title=article["title"],
+                summary=article.get("summary", ""),
+                category=cat,
+                source=article.get("source", "Samuga Media"),
+                link=article.get("link", ""),
+                lang="en",
+                score=article.get("_priority", 0),
+                reliability=source_reliability(article.get("source", "")),
+                is_breaking=breaking
+            )
+            log.info(f"🌐 Website published EN story immediately: {article['title'][:60]}")
+        except Exception as e:
+            log.error(f"[WEBSITE] EN immediate publish failed: {e}")
+
         approval_queue[key]["_cluster_size"] = article.get("_cluster_size", 1)
         approval_queue[key]["_trend_theme"] = article.get("_trend_theme", "")
         _send_approval_card(key, approval_queue[key])
@@ -3154,7 +3197,8 @@ def post_article(article, seen, social_only=False, allow_social=True):
         if GEMINI_API_KEY:
             def _auto_dv(_rewritten=rewritten, _title=article["title"],
                          _link=article["link"], _cat=cat, _keyword=keyword,
-                         _source=article.get("source","LOCAL")):
+                         _source=article.get("source","LOCAL"), _aid=article["id"],
+                         _summary=article.get("summary", "")):
                 try:
                     dv_text = make_dhivehi_caption(_rewritten, _title)
                     if not dv_text:
@@ -3165,6 +3209,8 @@ def post_article(article, seen, social_only=False, allow_social=True):
                         dv_text=dv_text, keyword=_keyword, source=_source,
                         is_breaking=breaking, allow_social=allow_social
                     )
+                    approval_queue[dv_key]["article_id"] = f"{_aid}_dv"
+                    approval_queue[dv_key]["summary"] = _summary
                     _send_approval_card(dv_key, approval_queue[dv_key])
                     log.info(f"[AI] Auto-Dhivehi queued: {_title[:50]}")
                 except Exception as e:
