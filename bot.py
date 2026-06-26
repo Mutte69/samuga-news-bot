@@ -548,7 +548,11 @@ def init_database():
                         tg_message_id   BIGINT,
                         tg_views        INTEGER DEFAULT 0,
                         meta_engagement INTEGER DEFAULT 0,   -- FB+IG reactions/comments/shares/likes
-                        match_key       TEXT                 -- normalized headline for caption matching
+                        match_key       TEXT,                -- normalized headline for caption matching
+                        article_slug    TEXT,
+                        article_excerpt TEXT,
+                        article_body    TEXT,
+                        article_generated_at TIMESTAMPTZ
                     );
                 """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_found_at ON articles(found_at);")
@@ -587,7 +591,13 @@ def init_database():
                 # Phase 2.5: add Meta columns to an already-existing articles table (no-op if present)
                 cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS meta_engagement INTEGER DEFAULT 0;")
                 cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS match_key TEXT;")
+                # Website Article Engine columns — detailed website-first articles
+                cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS article_slug TEXT;")
+                cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS article_excerpt TEXT;")
+                cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS article_body TEXT;")
+                cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS article_generated_at TIMESTAMPTZ;")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_matchkey ON articles(match_key);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_slug ON articles(article_slug);")
                 # Phase 3: team memory — persistent facts/preferences the bot learns
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS team_memory (
@@ -731,16 +741,18 @@ def db_publish_article_for_website(article_id, title="", summary="", category="L
                                    source="Samuga Media", link="", lang="en",
                                    score=0, reliability=0, is_breaking=False):
     """
-    Make sure any publicly posted/queued-to-post story is visible on the website.
-    This fixes the issue where Telegram/FB/IG/X get posts but /api/stories stays old.
-    Safe no-op if DB is disabled.
+    Make sure any public story is visible on the website.
+
+    Samuga Article Engine:
+    - Social captions stay short.
+    - Website gets article_excerpt + article_body for full article pages.
+    - English articles are generated immediately.
+    - Dhivehi public posts remain visible, but Article Engine focuses on English first.
+    - No external source links are exposed; public link remains Samuga Community.
     """
     if not DB_ENABLED or not article_id:
         return
 
-    # Website is now a real publishing destination.
-    # English and Dhivehi versions must not fight over the same DB row.
-    # So Dhivehi public posts are stored as <article_id>_dv.
     lang = (lang or "en").lower()
     article_id = str(article_id)
     if lang in ("dv", "dhivehi") and not article_id.endswith("_dv"):
@@ -750,14 +762,30 @@ def db_publish_article_for_website(article_id, title="", summary="", category="L
     public_summary = samuga_public_summary(public_title, summary or "")[:2600]
     public_link = SAMUGA_PUBLIC_LINK
     public_source = SAMUGA_PUBLIC_SOURCE
-
     safe_cat = canonical_category(category or "LOCAL", public_title, public_summary)
+    slug = make_article_slug(public_title, article_id)
+
+    article_excerpt = make_article_excerpt(public_title, public_summary, lang=lang)
+    article_body = ""
+    if lang == "en":
+        article_body = generate_website_article_body(
+            title=public_title,
+            summary=public_summary,
+            category=safe_cat,
+            source=public_source,
+            is_breaking=is_breaking
+        )
+    else:
+        # Dhivehi body can be improved later with a dedicated Thaana article engine.
+        article_body = public_summary or public_title
+
     db_execute("""
         INSERT INTO articles
             (id, title, summary, link, source, category, lang, score, reliability,
-             is_breaking, status, posted_at, match_key)
+             is_breaking, status, posted_at, match_key, article_slug, article_excerpt,
+             article_body, article_generated_at)
         VALUES
-            (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'posted',NOW(),%s)
+            (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'posted',NOW(),%s,%s,%s,%s,NOW())
         ON CONFLICT (id) DO UPDATE SET
             title=COALESCE(NULLIF(EXCLUDED.title,''), articles.title),
             summary=COALESCE(NULLIF(EXCLUDED.summary,''), articles.summary),
@@ -770,12 +798,187 @@ def db_publish_article_for_website(article_id, title="", summary="", category="L
             is_breaking=COALESCE(EXCLUDED.is_breaking, articles.is_breaking),
             status='posted',
             posted_at=COALESCE(articles.posted_at, NOW()),
-            match_key=COALESCE(NULLIF(EXCLUDED.match_key,''), articles.match_key)
+            match_key=COALESCE(NULLIF(EXCLUDED.match_key,''), articles.match_key),
+            article_slug=COALESCE(NULLIF(EXCLUDED.article_slug,''), articles.article_slug),
+            article_excerpt=COALESCE(NULLIF(EXCLUDED.article_excerpt,''), articles.article_excerpt),
+            article_body=COALESCE(NULLIF(EXCLUDED.article_body,''), articles.article_body),
+            article_generated_at=COALESCE(articles.article_generated_at, EXCLUDED.article_generated_at)
     """, (
         article_id, public_title, public_summary, public_link,
         public_source, safe_cat, lang or "en", score or 0,
-        reliability or 0, bool(is_breaking), _caption_match_key(public_title or "")
+        reliability or 0, bool(is_breaking), _caption_match_key(public_title or ""),
+        slug, article_excerpt, article_body
     ))
+
+# ── Samuga Article Engine helpers ─────────────────────────────────────────────
+
+def make_article_slug(title, article_id=""):
+    """Create a clean URL slug for website article pages."""
+    try:
+        import unicodedata
+        t = strip_source_links(title or "").lower()
+        t = unicodedata.normalize("NFKD", t).encode("ascii", "ignore").decode("ascii")
+        t = re.sub(r"[^a-z0-9]+", "-", t).strip("-")
+        t = re.sub(r"-{2,}", "-", t)
+        if not t:
+            t = "samuga-story"
+        suffix = str(article_id or "")[:10].replace("_", "-")
+        return f"{t[:70]}-{suffix}" if suffix else t[:80]
+    except Exception:
+        return f"samuga-story-{str(article_id or '')[:10]}"
+
+
+def make_article_excerpt(title="", summary="", lang="en"):
+    """Short homepage excerpt separate from full article body."""
+    text = strip_source_links(summary or title or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return strip_source_links(title or "")[:220]
+    max_len = 280 if lang == "en" else 220
+    if len(text) > max_len:
+        text = text[:max_len].rsplit(" ", 1)[0] + "..."
+    return text
+
+
+def _clean_article_engine_output(text, title=""):
+    """Clean AI output into readable website article paragraphs."""
+    text = strip_source_links(text or "")
+    text = text.replace("**", "").replace("__", "")
+    text = re.sub(r"^#+\s*", "", text, flags=re.M)
+    text = re.sub(r"\n\s*[-*]\s+", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = text.strip()
+    # Avoid the model repeating headline as first paragraph only.
+    if title and text.lower().startswith(title.lower()[:60]):
+        parts = text.split("\n\n", 1)
+        if len(parts) > 1:
+            text = parts[1].strip()
+    return text[:4200]
+
+
+def fallback_website_article_body(title="", summary="", category="LOCAL"):
+    """Fallback article when AI call fails."""
+    title = strip_source_links(title or "Samuga Media update")
+    summary = strip_source_links(summary or title)
+    cat = (category or "LOCAL").title()
+    paragraphs = [
+        summary,
+        f"This is a developing {cat.lower()} update carried by Samuga Media as part of its live Maldives news coverage.",
+        "The story is being followed for its public relevance, and further confirmed updates will be reflected through Samuga Media channels.",
+        "Readers can follow Samuga Community for live discussion, updates and context around this story."
+    ]
+    return "\n\n".join(p for p in paragraphs if p)
+
+
+def generate_website_article_body(title="", summary="", category="LOCAL", source="Samuga Media", is_breaking=False):
+    """
+    Generate a website-first article, not a social caption.
+    3–5 paragraphs, context, why it matters, Samuga voice, no external links.
+    """
+    title = strip_source_links(title or "")
+    summary = strip_source_links(summary or "")
+    if not title and not summary:
+        return ""
+
+    prompt = f"""You are writing for Samuga Media's website.
+Turn the information below into a short news article, not a social media caption.
+
+Rules:
+- Write in clean English.
+- 4 to 6 short paragraphs.
+- First paragraph: what happened, clearly.
+- Middle paragraphs: context/background and why it matters to people in Maldives.
+- Final paragraph: what Samuga Media will continue to watch.
+- Do not mention original source websites.
+- Do not include external links.
+- Do not invent names, numbers, quotes, locations or allegations not present in the input.
+- If details are limited, say the story is developing and keep it careful.
+- No markdown symbols, no hashtags, no bullet points.
+- Voice: professional, direct, people-first.
+
+Category: {category}
+Breaking: {bool(is_breaking)}
+Headline: {title}
+Known details: {summary}
+"""
+    try:
+        msg = ai.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=900,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        body = msg.content[0].text.strip()
+        body = _clean_article_engine_output(body, title=title)
+        if len(body.split()) < 45:
+            return fallback_website_article_body(title, summary, category)
+        return body
+    except Exception as e:
+        log.error(f"Website Article Engine failed: {e}")
+        return fallback_website_article_body(title, summary, category)
+
+
+def ensure_article_engine_body(article_id, title="", summary="", category="LOCAL", lang="en", is_breaking=False):
+    """Generate and save article_body if an old website row does not have one yet."""
+    if not DB_ENABLED or not article_id:
+        return fallback_website_article_body(title, summary, category)
+    try:
+        row = db_execute("SELECT article_body FROM articles WHERE id=%s", (article_id,), fetch="one")
+        if row and row[0] and len(str(row[0]).strip()) > 80:
+            return str(row[0]).strip()
+    except Exception:
+        pass
+
+    if (lang or "en").lower() == "en":
+        body = generate_website_article_body(title, summary, category, is_breaking=is_breaking)
+    else:
+        body = strip_source_links(summary or title or "")
+    excerpt = make_article_excerpt(title, summary, lang=lang)
+    slug = make_article_slug(title, article_id)
+    try:
+        db_execute("""
+            UPDATE articles
+            SET article_body=%s,
+                article_excerpt=COALESCE(NULLIF(article_excerpt,''), %s),
+                article_slug=COALESCE(NULLIF(article_slug,''), %s),
+                article_generated_at=NOW()
+            WHERE id=%s
+        """, (body, excerpt, slug, article_id))
+    except Exception as e:
+        log.error(f"Article Engine save failed: {e}")
+    return body
+
+
+def related_articles_for_api(article_id, category="LOCAL", limit=4):
+    """Related stories for article pages: same category, recent, no external links."""
+    try:
+        rows = db_execute("""
+            SELECT id, title, summary, category, posted_at, found_at, lang
+            FROM articles
+            WHERE id <> %s
+              AND status IN ('posted','published','social_posted')
+              AND category = %s
+            ORDER BY COALESCE(posted_at, found_at) DESC NULLS LAST
+            LIMIT %s
+        """, (article_id, category, limit), fetch="all") or []
+        out = []
+        for rid, title, summary, cat, posted_at, found_at, lang in rows:
+            dt = posted_at or found_at
+            safe_title = strip_source_links(title or "")[:220]
+            if not safe_title:
+                continue
+            out.append({
+                "id": rid,
+                "title": safe_title,
+                "summary": make_article_excerpt(safe_title, summary or "", lang=lang or "en"),
+                "category": cat or "LOCAL",
+                "url": f"article.html?id={rid}",
+                "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent"
+            })
+        return out
+    except Exception as e:
+        log.error(f"Related articles API failed: {e}")
+        return []
 
 # ── Phase 2: bot_kv helpers + learning logger ────────────────────────────────
 def kv_get(key, default=None):
@@ -7669,7 +7872,7 @@ def api_home():
         "status": "online",
         "name": "Samuga News Bot API",
         "version": SAMUGA_VERSION,
-        "endpoints": ["/api/stories", "/api/health", "/api/chat"]
+        "endpoints": ["/api/stories", "/api/article?id=ARTICLE_ID", "/api/health", "/api/chat"]
     })
 
 @api_app.get("/api/health")
@@ -7712,7 +7915,7 @@ def api_stories():
     """
     try:
         rows = db_execute("""
-            SELECT id, title, summary, category, source, link, posted_at, found_at, lang, status
+            SELECT id, title, summary, category, source, link, posted_at, found_at, lang, status, article_excerpt, article_slug
             FROM articles
             WHERE (status IN ('posted','published','social_posted') OR (status='queued' AND lang='en'))
             ORDER BY COALESCE(posted_at, found_at) DESC NULLS LAST
@@ -7723,10 +7926,10 @@ def api_stories():
         seen_titles = set()
 
         for row in rows:
-            article_id, title, summary, category, source, link, posted_at, found_at, lang, status = row
+            article_id, title, summary, category, source, link, posted_at, found_at, lang, status, article_excerpt, article_slug = row
             dt = posted_at or found_at
             safe_title = _api_clean_text(strip_source_links(title), 500)
-            safe_summary = _api_clean_text(strip_source_links(summary), 1800)
+            safe_summary = _api_clean_text(strip_source_links(article_excerpt or summary), 420)
             if not safe_title:
                 continue
 
@@ -7742,7 +7945,10 @@ def api_stories():
                 "summary": safe_summary,
                 "category": _api_category(category, safe_title, safe_summary),
                 "source": SAMUGA_PUBLIC_SOURCE,
-                "url": SAMUGA_PUBLIC_LINK,
+                "url": f"article.html?id={article_id}",
+                "community_url": SAMUGA_PUBLIC_LINK,
+                "article_api": _absolute_api_url(f"/api/article?id={article_id}"),
+                "slug": article_slug or make_article_slug(safe_title, article_id),
                 "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent",
                 "lang": _api_lang(safe_title, safe_summary, lang),
                 "status": status or "posted"
@@ -7753,6 +7959,63 @@ def api_stories():
     except Exception as e:
         log.error(f"Website API /api/stories error: {e}")
         return jsonify([])
+
+
+@api_app.get("/api/article")
+def api_article():
+    """Full website article page data for GitHub Pages article.html?id=..."""
+    try:
+        article_id = (request.args.get("id") or "").strip()
+        if not article_id:
+            return jsonify({"error": "missing article id"}), 400
+
+        row = db_execute("""
+            SELECT id, title, summary, category, source, link, posted_at, found_at, lang, status,
+                   article_excerpt, article_body, article_slug, is_breaking
+            FROM articles
+            WHERE id=%s
+              AND (status IN ('posted','published','social_posted') OR (status='queued' AND lang='en'))
+            LIMIT 1
+        """, (article_id,), fetch="one")
+
+        if not row:
+            return jsonify({"error": "article not found"}), 404
+
+        (rid, title, summary, category, source, link, posted_at, found_at, lang, status,
+         article_excerpt, article_body, article_slug, is_breaking) = row
+
+        safe_title = _api_clean_text(strip_source_links(title), 500)
+        safe_summary = _api_clean_text(strip_source_links(summary), 1800)
+        safe_category = _api_category(category, safe_title, safe_summary)
+        safe_lang = _api_lang(safe_title, safe_summary, lang)
+        body = article_body
+        if not body or len(str(body).strip()) < 80:
+            body = ensure_article_engine_body(
+                rid, safe_title, safe_summary, safe_category,
+                lang=safe_lang, is_breaking=bool(is_breaking)
+            )
+        body = _clean_article_engine_output(body, title=safe_title) if safe_lang == "en" else _api_clean_text(body, 4000)
+        dt = posted_at or found_at
+
+        return jsonify({
+            "id": rid,
+            "title": safe_title,
+            "excerpt": _api_clean_text(article_excerpt or safe_summary, 360),
+            "body": body,
+            "paragraphs": [p.strip() for p in str(body or "").split("\n\n") if p.strip()],
+            "category": safe_category,
+            "source": SAMUGA_PUBLIC_SOURCE,
+            "source_url": SAMUGA_PUBLIC_LINK,
+            "community_url": SAMUGA_PUBLIC_LINK,
+            "url": SAMUGA_PUBLIC_LINK,
+            "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent",
+            "lang": safe_lang,
+            "slug": article_slug or make_article_slug(safe_title, rid),
+            "related": related_articles_for_api(rid, safe_category, limit=4)
+        })
+    except Exception as e:
+        log.error(f"Website API /api/article error: {e}")
+        return jsonify({"error": "article unavailable"}), 200
 
 
 # ── Public Website Chat API ───────────────────────────────────────────────────
