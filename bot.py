@@ -63,7 +63,8 @@ from db import (
     normalize_article_language_for_public, _caption_match_key,
     make_article_slug, generate_website_article_body,
     TREND_THEMES, DB_ENABLED, is_dhivehi, looks_latin_thaana,
-    gemini_latin_thaana_to_thaana, gemini_latin_thaana_to_english
+    gemini_latin_thaana_to_thaana, gemini_latin_thaana_to_english,
+    _detect_themes
 )
 
 # ── Structured logging: tags make Railway logs readable ──────────────────────
@@ -73,9 +74,26 @@ log = logging.getLogger(__name__)
 
 SAMUGA_VERSION = "7.0"
 
+# Module-level timezone alias (used by utcnow() below and elsewhere).
+from datetime import timezone as _tz
 
 # Public destination shown to readers. We never expose competitor/source links on
 # Samuga public platforms; readers are directed back to Samuga Community.
+SAMUGA_PUBLIC_SOURCE = os.environ.get("SAMUGA_PUBLIC_SOURCE", "Samuga Media")
+SAMUGA_PUBLIC_LINK   = os.environ.get("SAMUGA_PUBLIC_LINK", "https://t.me/samugacommunity")
+
+
+def samuga_public_caption(caption):
+    """Sanitize a caption for public posting: strip competitor/source links so
+    Samuga public platforms never expose external source URLs."""
+    if not caption:
+        return caption
+    try:
+        return strip_source_links(caption)
+    except Exception:
+        return caption
+
+
 def utcnow():
     """Naive UTC datetime — same value as the old utcnow() but not deprecated."""
     return datetime.now(_tz.utc).replace(tzinfo=None)
@@ -177,6 +195,24 @@ last_regular_post_time = None
 daily_sports_count  = {"date": None, "count": 0}
 daily_world_count   = {"date": None, "count": 0}
 daily_tourism_count = {"date": None, "count": 0}
+
+
+def can_post_cat_today(counter, max_per_day):
+    """Check a per-category daily counter against its cap. Resets on a new MVT
+    day and increments the counter when posting is allowed. Returns True if a
+    post in this category is still within today's budget."""
+    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+    if counter.get("date") != today:
+        counter["date"] = today
+        counter["count"] = 0
+    if counter["count"] >= max_per_day:
+        return False
+    counter["count"] += 1
+    try:
+        persist_state()
+    except Exception:
+        pass
+    return True
 
 
 # ── Content Lab flood control ────────────────────────────────────────────────
@@ -656,7 +692,7 @@ Summary:
 
 
 # ── Dhivehi Quality Layer: Latin Thaana → Proper Thaana / English ─────────────
-    return title, summary, "en", True
+# (Implemented in db.normalize_article_language_for_public — imported above.)
 
 # ── Auto Poll ─────────────────────────────────────────────────────────────────
 POLL_KEYWORDS = [
@@ -2869,6 +2905,26 @@ SAMUGA'S VOICE: Real stories, no filter, people first. The compass for the peopl
             return None
 
 # ── Chat Handler ──────────────────────────────────────────────────────────────
+# Per-user daily DM/search limit (resets at MVT midnight).
+DM_DAILY_LIMIT = int(os.environ.get("DM_DAILY_LIMIT", "20"))
+_dm_usage = {}  # user_id -> {"date": "YYYY-MM-DD", "count": int}
+
+
+def dm_check_and_increment(user_id):
+    """Check and increment a user's daily DM/search usage.
+    Returns (allowed, count, limit). When not allowed, the count is left at the
+    limit and not incremented further."""
+    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+    rec = _dm_usage.get(user_id)
+    if not rec or rec.get("date") != today:
+        rec = {"date": today, "count": 0}
+        _dm_usage[user_id] = rec
+    if rec["count"] >= DM_DAILY_LIMIT:
+        return False, rec["count"], DM_DAILY_LIMIT
+    rec["count"] += 1
+    return True, rec["count"], DM_DAILY_LIMIT
+
+
 def handle_updates():
     # Use persisted offset so we never miss messages across restarts
     offset = _poll_offset[0]
@@ -4125,6 +4181,84 @@ def _api_category(cat, title="", summary=""):
     except Exception:
         return (cat or "LOCAL").upper()
 
+
+def ensure_article_engine_body(article_id, title, summary, category,
+                               lang="en", is_breaking=False):
+    """Return a full website article body for an article, generating and
+    persisting one via Claude if the stored body is missing/too short."""
+    try:
+        body = generate_website_article_body(
+            title=title, summary=summary, category=category,
+            source=SAMUGA_PUBLIC_SOURCE, is_breaking=is_breaking
+        )
+    except Exception as e:
+        log.error(f"ensure_article_engine_body generate error: {e}")
+        body = ""
+    body = (body or "").strip()
+    if not body:
+        body = summary or title or ""
+    # Persist so we don't regenerate on every request.
+    try:
+        if article_id and body:
+            db_execute(
+                "UPDATE articles SET article_body=%s WHERE id=%s",
+                (body, article_id),
+            )
+    except Exception as e:
+        log.warning(f"ensure_article_engine_body persist skipped: {e}")
+    return body
+
+
+def _clean_article_engine_output(body, title=""):
+    """Clean a generated English article body for website/API rendering:
+    strip HTML/source links/stray title echo and normalize whitespace per
+    paragraph (preserving paragraph breaks)."""
+    body = str(body or "")
+    body = _html.unescape(body)
+    body = strip_source_links(body)
+    body = _api_re.sub(r"<[^>]+>", " ", body)
+    body = _api_re.sub(r"https?://\S+", "", body)
+    paras = []
+    for para in _api_re.split(r"\n\s*\n", body):
+        para = _api_re.sub(r"\s+", " ", para).strip()
+        if not para:
+            continue
+        # Drop a leading line that just repeats the title.
+        if title and para.lower() == title.strip().lower():
+            continue
+        paras.append(para)
+    return "\n\n".join(paras)[:6000]
+
+
+def related_articles_for_api(article_id, category, limit=4):
+    """Return a small list of related published articles in the same category
+    (excluding the current article) for the website 'related' rail."""
+    try:
+        rows = db_execute("""
+            SELECT id, title, category, posted_at, found_at, article_slug
+            FROM articles
+            WHERE category=%s
+              AND id<>%s
+              AND (status IN ('posted','published','social_posted') OR (status='queued' AND lang='en'))
+            ORDER BY COALESCE(posted_at, found_at) DESC NULLS LAST
+            LIMIT %s
+        """, (category, article_id, limit), fetch="all") or []
+    except Exception as e:
+        log.error(f"related_articles_for_api error: {e}")
+        return []
+    related = []
+    for r in rows:
+        rid, title, cat, posted_at, found_at, slug = r
+        dt = posted_at or found_at
+        related.append({
+            "id": rid,
+            "title": _api_clean_text(strip_source_links(title), 160),
+            "category": _api_category(cat),
+            "slug": slug or "",
+            "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent",
+        })
+    return related
+
 def _absolute_api_url(path):
     """Build full Railway URL for GitHub Pages."""
     return request.url_root.rstrip("/") + path
@@ -4838,49 +4972,6 @@ def start_api_server():
     log.info(f"🌐 Website API starting on port {port}")
     api_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
-# ── Entry ─────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    import signal, atexit
-
-    def _graceful_shutdown(signum=None, frame=None):
-        """Save all state before Railway kills the process on redeploy."""
-        log.info("🛑 Shutdown signal received — saving state before exit...")
-        try:
-            persist_state()
-            log.info("✅ State saved — approval queue, social queue, counters all persisted")
-        except Exception as e:
-            log.error(f"State save on shutdown: {e}")
-
-    # Railway sends SIGTERM before killing the container on redeploy
-    signal.signal(signal.SIGTERM, _graceful_shutdown)
-    signal.signal(signal.SIGINT,  _graceful_shutdown)
-    # Also register with atexit as a backup (catches normal Python exit)
-    atexit.register(_graceful_shutdown)
-
-    log.info(f"🚀 Samuga AI v{SAMUGA_VERSION} starting (newsroom intelligence + story timelines + live brain)...")
-    # Install Noto fonts for Thaana/Dhivehi support
-    if not os.path.exists("/usr/share/fonts/truetype/noto/NotoSansThaana-Bold.ttf") and not os.path.exists("/app/NotoSansThaana-Bold.ttf"):
-        try:
-            import subprocess
-            subprocess.run(["apt-get", "install", "-y", "fonts-noto"], capture_output=True, timeout=60)
-            log.info("✅ Noto fonts installed via apt")
-        except Exception as e:
-            log.warning(f"Noto font install failed: {e}")
-    else:
-        log.info("✅ Thaana fonts available")
-    log.info("📅 News: 6AM-10PM every 15min | Night: breaking only")
-    log.info("🌤️ Weather: 8AM, 2PM, 10:30PM → all platforms | MMS alerts auto")
-    log.info("🌅 7AM Brief | 🌙 12AM Summary | 📊 Friday Digest | 🕌 Prayer times + Hijri")
-    log.info("📚 Story Intelligence: timeline threads active")
-    log.info("🧠 Core team brain: live newsroom awareness + persistent memory")
-    log.info("💬 Smart chat: history, web search, Dhivehi support, story queries")
-
-    # Start social queue worker — drains one post every 10 minutes
-    threading.Thread(target=_social_queue_worker, daemon=True).start()
-    log.info("📲 Social queue worker started (10-min gap between posts)")
-
-    init_database()  # connect to Postgres (falls back to JSON if unavailable)
-    restore_state()  # bring back dedup memory, daily counters, pending cards, analytics
 
 
 # ── State Persistence (JSON fallback — survives Railway restarts) ─────────────
@@ -5058,6 +5149,50 @@ def restore_state():
                  f"{len(approval_queue)} pending cards, {len(recent_posts)} recent posts")
     except Exception as e:
         log.error(f"restore_state: {e}")
+
+
+# ── Entry ─────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+
+    def _graceful_shutdown(signum=None, frame=None):
+        """Save all state before Railway kills the process on redeploy."""
+        log.info("🛑 Shutdown signal received — saving state before exit...")
+        try:
+            persist_state()
+            log.info("✅ State saved — approval queue, social queue, counters all persisted")
+        except Exception as e:
+            log.error(f"State save on shutdown: {e}")
+
+    # Railway sends SIGTERM before killing the container on redeploy
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    signal.signal(signal.SIGINT,  _graceful_shutdown)
+    # Also register with atexit as a backup (catches normal Python exit)
+    atexit.register(_graceful_shutdown)
+
+    log.info(f"🚀 Samuga AI v{SAMUGA_VERSION} starting (newsroom intelligence + story timelines + live brain)...")
+    # Install Noto fonts for Thaana/Dhivehi support
+    if not os.path.exists("/usr/share/fonts/truetype/noto/NotoSansThaana-Bold.ttf") and not os.path.exists("/app/NotoSansThaana-Bold.ttf"):
+        try:
+            import subprocess
+            subprocess.run(["apt-get", "install", "-y", "fonts-noto"], capture_output=True, timeout=60)
+            log.info("✅ Noto fonts installed via apt")
+        except Exception as e:
+            log.warning(f"Noto font install failed: {e}")
+    else:
+        log.info("✅ Thaana fonts available")
+    log.info("📅 News: 6AM-10PM every 15min | Night: breaking only")
+    log.info("🌤️ Weather: 8AM, 2PM, 10:30PM → all platforms | MMS alerts auto")
+    log.info("🌅 7AM Brief | 🌙 12AM Summary | 📊 Friday Digest | 🕌 Prayer times + Hijri")
+    log.info("📚 Story Intelligence: timeline threads active")
+    log.info("🧠 Core team brain: live newsroom awareness + persistent memory")
+    log.info("💬 Smart chat: history, web search, Dhivehi support, story queries")
+
+    # Start social queue worker — drains one post every 10 minutes
+    threading.Thread(target=_social_queue_worker, daemon=True).start()
+    log.info("📲 Social queue worker started (10-min gap between posts)")
+
+    init_database()  # connect to Postgres (falls back to JSON if unavailable)
+    restore_state()  # bring back dedup memory, daily counters, pending cards, analytics
 
 
     # Wire db module with shared functions
