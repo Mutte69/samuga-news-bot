@@ -7676,7 +7676,8 @@ def api_stories():
 
 # ── Public Website Chat API ───────────────────────────────────────────────────
 # Safe public chat endpoint for samugamedia.com.
-# This reuses the Telegram public-chat brain but blocks admin/posting commands.
+# IMPORTANT: Website chat should answer from TODAY'S Samuga archive first,
+# not from old model memory. It also cleans markdown so replies feel human.
 _PUBLIC_CHAT_RATE = {}  # ip -> [timestamps]
 _PUBLIC_CHAT_LIMIT = 12
 _PUBLIC_CHAT_WINDOW = 60 * 10  # 12 messages per 10 minutes per IP
@@ -7687,6 +7688,10 @@ _PUBLIC_CHAT_BLOCKED_COMMANDS = [
     "approve this", "reject this", "post this", "send to telegram", "send to facebook",
     "send to instagram", "content lab", "core team", "admin", "database", "token",
     "api key", "password", "environment variable"
+]
+_PUBLIC_CHAT_NEWS_WORDS = [
+    "latest", "news", "headline", "headlines", "today", "update", "updates", "breaking",
+    "current", "what happened", "briefing", "summary", "summarize", "ޚަބަރު", "އަޕްޑޭޓް", "މިއަދު"
 ]
 
 def _public_chat_client_id():
@@ -7706,7 +7711,6 @@ def _public_chat_allowed(client_id):
         return False, _PUBLIC_CHAT_LIMIT
     hits.append(now)
     _PUBLIC_CHAT_RATE[client_id] = hits
-    # Keep dict small
     if len(_PUBLIC_CHAT_RATE) > 1000:
         for k in list(_PUBLIC_CHAT_RATE.keys())[:200]:
             _PUBLIC_CHAT_RATE.pop(k, None)
@@ -7724,19 +7728,153 @@ def _public_chat_is_blocked(message):
         return True
     return any(term in low for term in _PUBLIC_CHAT_BLOCKED_COMMANDS)
 
+def _public_chat_is_news_query(message):
+    low = (message or "").lower()
+    return any(w in low for w in _PUBLIC_CHAT_NEWS_WORDS)
+
+def _public_chat_clean_reply(reply):
+    """Make AI replies feel like chat, not raw Markdown/bot formatting."""
+    txt = str(reply or "")
+    txt = txt.replace("**", "")
+    txt = txt.replace("__", "")
+    txt = txt.replace("###", "")
+    txt = txt.replace("##", "")
+    txt = txt.replace("#", "")
+    txt = re.sub(r"\n\s*[-*]\s+", "\n• ", txt)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)
+    txt = re.sub(r"[ \t]{2,}", " ", txt)
+    return _api_clean_text(txt.strip(), 1600)
+
+def _public_chat_latest_rows(lang=None, limit=8, hours=30):
+    """Read newest public website stories from DB. Default: recent/current only."""
+    try:
+        since = utcnow() - timedelta(hours=hours)
+        rows = db_execute("""
+            SELECT title, summary, category, source, link, posted_at, found_at, lang, status
+            FROM articles
+            WHERE status IN ('posted','published','social_posted')
+              AND COALESCE(posted_at, found_at) >= %s
+            ORDER BY COALESCE(posted_at, found_at) DESC NULLS LAST
+            LIMIT %s
+        """, (since, limit * 3), fetch="all") or []
+
+        clean = []
+        seen = set()
+        for title, summary, category, source, link, posted_at, found_at, row_lang, status in rows:
+            safe_title = _api_clean_text(title, 260)
+            safe_summary = _api_clean_text(summary, 380)
+            if not safe_title:
+                continue
+            detected = _api_lang(safe_title, safe_summary, row_lang)
+            if lang in ("en", "dv") and detected != lang:
+                continue
+            key = _caption_match_key(safe_title) or safe_title.lower()[:90]
+            if key in seen:
+                continue
+            seen.add(key)
+            dt = posted_at or found_at
+            clean.append({
+                "title": safe_title,
+                "summary": safe_summary,
+                "category": _api_category(category, safe_title, safe_summary),
+                "source": source or "Samuga Media",
+                "url": link or "#",
+                "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent",
+                "lang": detected
+            })
+            if len(clean) >= limit:
+                break
+        return clean
+    except Exception as e:
+        log.error(f"Website chat latest rows error: {e}")
+        return []
+
+def _public_chat_search_rows(message, lang=None, limit=6):
+    """Simple archive search from website DB for specific user topics."""
+    try:
+        terms = [w for w in re.findall(r"[\w\u0780-\u07BF]{3,}", message or "") if w.lower() not in {
+            "latest", "news", "today", "what", "about", "show", "give", "tell", "ޚަބަރު", "މިއަދު"
+        }]
+        if not terms:
+            return []
+        # Use up to 3 strong terms to avoid huge/slow search.
+        q = " ".join(terms[:3])
+        pattern = f"%{q}%"
+        rows = db_execute("""
+            SELECT title, summary, category, source, link, posted_at, found_at, lang, status
+            FROM articles
+            WHERE status IN ('posted','published','social_posted')
+              AND (title ILIKE %s OR summary ILIKE %s OR source ILIKE %s)
+            ORDER BY COALESCE(posted_at, found_at) DESC NULLS LAST
+            LIMIT %s
+        """, (pattern, pattern, pattern, limit * 3), fetch="all") or []
+        clean = []
+        seen = set()
+        for title, summary, category, source, link, posted_at, found_at, row_lang, status in rows:
+            safe_title = _api_clean_text(title, 260)
+            safe_summary = _api_clean_text(summary, 380)
+            detected = _api_lang(safe_title, safe_summary, row_lang)
+            if lang in ("en", "dv") and detected != lang:
+                continue
+            key = _caption_match_key(safe_title) or safe_title.lower()[:90]
+            if not safe_title or key in seen:
+                continue
+            seen.add(key)
+            dt = posted_at or found_at
+            clean.append({
+                "title": safe_title,
+                "summary": safe_summary,
+                "category": _api_category(category, safe_title, safe_summary),
+                "source": source or "Samuga Media",
+                "url": link or "#",
+                "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent",
+                "lang": detected
+            })
+            if len(clean) >= limit:
+                break
+        return clean
+    except Exception as e:
+        log.error(f"Website chat search rows error: {e}")
+        return []
+
+def _public_chat_format_news(rows, lang="en", searched=False):
+    """Friendly website chat answer from real Samuga DB rows."""
+    if not rows:
+        return "I don't see fresh public stories in the website archive yet bro. Try again in a few minutes." if lang != "dv" else "ވެބްސައިޓް އާކައިވްގައި އަދި އާ ޚަބަރެއް ނުފެނޭ. މަދުކޮށް ފަހުން އަހާލާ."
+
+    if lang == "dv":
+        intro = "މިއީ ސަމުގާގެ އެންމެ އާ ޚަބަރުތައް:" if not searched else "މިއީ ހޯދުމުން ފެނުނު ޚަބަރުތައް:"
+        parts = [intro]
+        for i, r in enumerate(rows[:6], 1):
+            line = f"{i}. {r['title']}"
+            if r.get("summary"):
+                line += f" — {r['summary'][:180]}"
+            parts.append(line)
+        parts.append("އެއް ޚަބަރެއް ތަފްސީލުން ބުނަން ބޭނުންތަ؟")
+        return "\n\n".join(parts)
+
+    intro = "Here are the latest stories on Samuga right now:" if not searched else "Here’s what I found in the Samuga archive:"
+    parts = [intro]
+    for i, r in enumerate(rows[:6], 1):
+        line = f"{i}. {r['title']}"
+        if r.get("summary"):
+            line += f" — {r['summary'][:190]}"
+        line += f"\nSource: {r.get('source','Samuga Media')} • {r.get('time','Recent')}"
+        parts.append(line)
+    parts.append("Ask me about any one of these and I’ll explain it clearly.")
+    return "\n\n".join(parts)
+
+def _public_chat_context(rows):
+    lines = []
+    for r in rows[:8]:
+        lines.append(f"- {r['title']} | {r.get('summary','')} | {r.get('source','')} | {r.get('time','')}")
+    return "\n".join(lines)
+
 @api_app.route("/api/chat", methods=["POST", "OPTIONS"])
 def api_chat():
     """
     Public website chat for Samuga AI.
-
-    Allowed:
-    - Ask latest Maldives news
-    - Ask about Samuga stories/archive
-    - Dhivehi or English public Q&A
-
-    Blocked:
-    - Any admin/posting/approval command
-    - Anything that tries to control Telegram/socials/Content Lab
+    It uses fresh Samuga DB rows first, then AI only with fresh context.
     """
     if request.method == "OPTIONS":
         return jsonify({"ok": True})
@@ -7754,6 +7892,8 @@ def api_chat():
         data = request.get_json(silent=True) or {}
         message = _public_chat_clean_message(data.get("message", ""))
         session_id = _api_clean_text(data.get("session_id", "web"), 80) or "web"
+        requested_lang = str(data.get("lang") or "").lower()
+        lang = "dv" if requested_lang == "dv" or is_dhivehi(message) else "en"
 
         if not message:
             return jsonify({
@@ -7768,39 +7908,49 @@ def api_chat():
                 "reply": "I can only answer public news questions here bro. For approvals, posting, or newsroom controls, use the private Samuga team Telegram."
             })
 
-        # Public sessions are separated from Telegram user IDs.
         user_id = f"web:{client_id}:{session_id}"
         log.info(f"🌐 Website chat {client_id}: {message[:80]}")
 
-        # Story timeline/archive questions get a deterministic answer first.
-        try:
-            story_answer = answer_story_query(message)
-        except Exception:
-            story_answer = None
-        if story_answer:
-            reply = story_answer
-        elif is_dhivehi(message):
-            try:
-                headlines = get_local_headlines()
-                context = "\n".join(headlines[:6]) if headlines else ""
-                history = get_conversation(user_id)
-                reply = chat_with_gemini_dhivehi(message, context, history)
-                if reply:
-                    add_to_conversation(user_id, "user", message)
-                    add_to_conversation(user_id, "assistant", reply)
-                else:
-                    reply = chat_with_claude(message, user_id)
-            except Exception as e:
-                log.error(f"Website Dhivehi chat fallback: {e}")
-                reply = chat_with_claude(message, user_id)
-        else:
-            reply = chat_with_claude(message, user_id)
+        latest_rows = _public_chat_latest_rows(lang=lang, limit=8, hours=30)
+        search_rows = _public_chat_search_rows(message, lang=lang, limit=6)
 
-        reply = _api_clean_text(reply, 1400) or "Sorry bro, I couldn't answer that right now."
+        # For latest/today/breaking/news questions: deterministic fresh answer only.
+        # This stops the website chat from using old model memory.
+        if _public_chat_is_news_query(message):
+            rows = search_rows or latest_rows
+            reply = _public_chat_format_news(rows, lang=lang, searched=bool(search_rows))
+        else:
+            # For specific questions, give the AI fresh Samuga context, not old memory.
+            context_rows = search_rows or latest_rows
+            context = _public_chat_context(context_rows)
+            safe_prompt = (
+                "You are Samuga AI public website assistant. Answer conversationally. "
+                "Use ONLY the fresh Samuga context below for news facts. "
+                "Do not use old headlines from memory. Do not use markdown bold symbols. "
+                "Keep it short and human.\n\n"
+                f"Fresh Samuga context:\n{context}\n\nUser question: {message}"
+            )
+            if lang == "dv":
+                try:
+                    history = get_conversation(user_id)
+                    reply = chat_with_gemini_dhivehi(safe_prompt, context, history)
+                    if reply:
+                        add_to_conversation(user_id, "user", message)
+                        add_to_conversation(user_id, "assistant", reply)
+                    else:
+                        reply = chat_with_claude(safe_prompt, user_id)
+                except Exception as e:
+                    log.error(f"Website Dhivehi chat fallback: {e}")
+                    reply = chat_with_claude(safe_prompt, user_id)
+            else:
+                reply = chat_with_claude(safe_prompt, user_id)
+
+        reply = _public_chat_clean_reply(reply) or "Sorry bro, I couldn't answer that right now."
         return jsonify({
             "ok": True,
             "reply": reply,
             "source": "Samuga AI",
+            "fresh_stories_used": len(latest_rows),
             "rate_limit": {"limit": limit, "window_seconds": _PUBLIC_CHAT_WINDOW}
         })
 
@@ -7811,6 +7961,7 @@ def api_chat():
             "error": "server_error",
             "reply": "Something went wrong bro 😅 Try again in a moment."
         }), 500
+
 
 def start_api_server():
     """Start the public website API on Railway's assigned PORT."""
