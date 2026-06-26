@@ -7277,6 +7277,69 @@ def handle_updates():
         except Exception as e:
             log.error(f"Update loop: {e}"); time.sleep(5)
 
+# ── Website API ───────────────────────────────────────────────────────────────
+from flask import Flask, jsonify
+
+api_app = Flask(__name__)
+
+@api_app.after_request
+def add_cors_headers(response):
+    """Allow GitHub Pages to read this API."""
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    return response
+
+@api_app.get("/")
+def api_home():
+    return jsonify({
+        "status": "online",
+        "name": "Samuga News Bot API",
+        "version": SAMUGA_VERSION,
+        "endpoints": ["/api/stories"]
+    })
+
+@api_app.get("/api/stories")
+def api_stories():
+    """
+    Public website feed for samugamedia.com / GitHub Pages.
+    Returns latest posted stories from PostgreSQL.
+    If DB is unavailable, returns an empty list instead of crashing.
+    """
+    try:
+        rows = db_execute("""
+            SELECT title, summary, category, source, link, posted_at, found_at
+            FROM articles
+            WHERE status = 'posted'
+            ORDER BY posted_at DESC NULLS LAST, found_at DESC NULLS LAST
+            LIMIT 30
+        """, fetch="all")
+
+        stories = []
+        for row in rows or []:
+            title, summary, category, source, link, posted_at, found_at = row
+            dt = posted_at or found_at
+            stories.append({
+                "title": title or "Untitled story",
+                "summary": summary or "",
+                "category": category or "Community",
+                "source": source or "Samuga Media",
+                "url": link or "#",
+                "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent"
+            })
+
+        return jsonify(stories)
+
+    except Exception as e:
+        log.error(f"Website API /api/stories error: {e}")
+        return jsonify([])
+
+def start_api_server():
+    """Start the public website API on Railway's assigned PORT."""
+    port = int(os.environ.get("PORT", 8080))
+    log.info(f"🌐 Website API starting on port {port}")
+    api_app.run(host="0.0.0.0", port=port, use_reloader=False)
+
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import signal, atexit
@@ -7324,6 +7387,7 @@ if __name__ == "__main__":
     log.info(f"📚 Loaded {len(seen_on_start)} seen articles")
 
     threading.Thread(target=handle_updates, daemon=True).start()
+    threading.Thread(target=start_api_server, daemon=True).start()
 
     scheduler=BlockingScheduler(timezone="UTC")
     scheduler.add_job(scheduled_check, "interval", minutes=15)
