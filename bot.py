@@ -222,6 +222,56 @@ DHIVEHI_EXPIRY_SECONDS   = 7200   # Dhivehi: expire (delete) after 2h if not app
 approval_queue = {}  # key -> {card_bytes, caption, title, link, cat, lang, dv_text, created_at, ...}
 _approval_counter = [0]
 
+# ── Content Lab flood control ────────────────────────────────────────────────
+# Goal: normal newsroom flow = max 4 approval cards/hour.
+# Exception: very high priority stories can use up to 6/hour.
+# Breaking with strong confidence posts automatically; breaking with weak confidence
+# goes to Alert Chat, not Content Lab, so Uly's workspace does not get flooded.
+CONTENT_LAB_NORMAL_MAX_PER_HOUR = int(os.environ.get("CONTENT_LAB_NORMAL_MAX_PER_HOUR", "4"))
+CONTENT_LAB_HIGH_MAX_PER_HOUR   = int(os.environ.get("CONTENT_LAB_HIGH_MAX_PER_HOUR", "6"))
+CONTENT_LAB_HIGH_SCORE          = int(os.environ.get("CONTENT_LAB_HIGH_SCORE", "180"))
+_content_lab_sent_log = []  # datetime stamps for approval previews actually sent
+
+def _prune_content_lab_log(now=None):
+    now = now or utcnow()
+    cutoff = now - timedelta(hours=1)
+    _content_lab_sent_log[:] = [t for t in _content_lab_sent_log if t > cutoff]
+
+def _content_lab_slots_available(item=None):
+    now = utcnow()
+    _prune_content_lab_log(now)
+    sent = len(_content_lab_sent_log)
+    priority = int((item or {}).get("_priority") or (item or {}).get("score") or 0)
+    high_priority = bool((item or {}).get("is_breaking")) or priority >= CONTENT_LAB_HIGH_SCORE
+    limit = CONTENT_LAB_HIGH_MAX_PER_HOUR if high_priority else CONTENT_LAB_NORMAL_MAX_PER_HOUR
+    return sent < limit, limit, sent, high_priority
+
+def _mark_content_lab_sent(item=None):
+    _prune_content_lab_log()
+    _content_lab_sent_log.append(utcnow())
+    if item is not None:
+        item["_content_lab_sent"] = True
+        item["_content_lab_sent_at"] = utcnow().isoformat()
+
+def release_content_lab_drip():
+    """Send delayed approval cards slowly so Content Lab gets max 4/hour, 6 if high priority."""
+    try:
+        pending = [
+            (k, v) for k, v in approval_queue.items()
+            if not v.get("_content_lab_sent") and not v.get("_content_lab_suppressed")
+        ]
+        pending.sort(key=lambda kv: kv[1].get("created_at") or utcnow())
+        if not pending:
+            return
+        for k, v in pending:
+            ok, limit, sent, high = _content_lab_slots_available(v)
+            if not ok:
+                log.info(f"🧯 Content Lab drip paused: {sent}/{limit} sent in last hour, {len(pending)} waiting")
+                return
+            _send_approval_card(k, v, force=True)
+    except Exception as e:
+        log.error(f"Content Lab drip: {e}")
+
 def store_pending_approval(card_bytes, caption, title, link, cat="LOCAL", lang="en",
                            dv_text=None, keyword="maldives news", source="LOCAL",
                            is_breaking=False, allow_social=True):
@@ -2936,8 +2986,21 @@ def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_
     return tg_ok, social_results
 
 
-def _send_approval_card(key, item):
-    """Send a card preview to Content Lab with approve/reject buttons."""
+def _send_approval_card(key, item, force=False):
+    """Send a card preview to Content Lab with approve/reject buttons, rate-limited."""
+    if item.get("_content_lab_suppressed"):
+        log.info(f"🧯 Content Lab suppressed for {key}")
+        return False
+    if item.get("_content_lab_sent") and not force:
+        return False
+    if not force:
+        ok, limit, sent, high = _content_lab_slots_available(item)
+        if not ok:
+            item["_content_lab_sent"] = False
+            item["_content_lab_delayed"] = True
+            log.info(f"🧯 Content Lab delayed {key}: {sent}/{limit} previews already sent in last hour")
+            persist_state()
+            return False
     cat = item["cat"]
     lang_tag = "🇲🇻 Dhivehi" if item["lang"] == "dv" else "🇬🇧 English"
     brk = "🚨 BREAKING " if item["is_breaking"] else ""
@@ -2972,7 +3035,9 @@ def _send_approval_card(key, item):
         send_photo(CORE_TEAM_CHAT_ID, buf, msg, thread_id=CONTENT_LAB_THREAD_ID)
     else:
         send_text(CORE_TEAM_CHAT_ID, msg, thread_id=CONTENT_LAB_THREAD_ID)
+    _mark_content_lab_sent(item)
     log.info(f"📨 Approval card sent to Content Lab: {key} ({item['lang']})")
+    return True
 
 
 def post_article(article, seen, social_only=False, allow_social=True):
@@ -3045,6 +3110,8 @@ def post_article(article, seen, social_only=False, allow_social=True):
                 approval_queue[key]["rewritten"] = rewritten
                 approval_queue[key]["summary"] = article.get("summary","")
                 approval_queue[key]["article_id"] = article["id"]
+                approval_queue[key]["_priority"] = article.get("_priority", priority)
+                approval_queue[key]["_confidence"] = confidence
                 try:
                     db_publish_article_for_website(
                         article_id=article["id"], title=article["title"],
@@ -3061,16 +3128,17 @@ def post_article(article, seen, social_only=False, allow_social=True):
                 approval_queue[key]["_cluster_size"] = article.get("_cluster_size", 1)
                 approval_queue[key]["_confidence"] = confidence
                 approval_queue[key]["_hold_reason"] = hold_reason
-                _send_approval_card(key, approval_queue[key])
+                approval_queue[key]["_content_lab_suppressed"] = True
                 db_mark_status(article["id"], "queued")
-                approval_queue[key]["_held_for_confidence"] = True
-                # Alert goes to Alert thread (not Content Lab — keeps approvals clean)
+                approval_queue[key]["_held_for_confidence"] = False
+                approval_queue[key]["_alert_only"] = True
+                # Low-confidence breaking goes to Alert thread only — not Content Lab.
                 send_text(CORE_TEAM_CHAT_ID,
                     f"⚠️ <b>BREAKING held for review</b>\n{hold_reason}\n\n"
                     f"<b>{article['title'][:90]}</b>\n"
                     f"Source: {article.get('source','?')} · Confidence: {confidence}%\n\n"
                     f"Approve with <code>/approved {key}</code> if verified.\n"
-                    f"<i>Auto-posts in 30 min if no action.</i>",
+                    f"<i>Not sent to Content Lab to prevent flooding.</i>",
                     thread_id=ALERT_THREAD_ID)
             except Exception as e:
                 log.error(f"Breaking hold queue: {e}")
@@ -3135,6 +3203,8 @@ def post_article(article, seen, social_only=False, allow_social=True):
                 is_breaking=breaking, allow_social=allow_social
             )
             approval_queue[key]["article_id"] = article["id"]
+            approval_queue[key]["_priority"] = article.get("_priority", priority)
+            approval_queue[key]["_confidence"] = confidence
             approval_queue[key]["_cluster_size"] = article.get("_cluster_size", 1)
             approval_queue[key]["_trend_theme"] = article.get("_trend_theme", "")
             approval_queue[key]["summary"] = article.get("summary", "")
@@ -3165,6 +3235,8 @@ def post_article(article, seen, social_only=False, allow_social=True):
         approval_queue[key]["rewritten"] = rewritten
         approval_queue[key]["summary"] = article.get("summary","")
         approval_queue[key]["article_id"] = article["id"]
+        approval_queue[key]["_priority"] = article.get("_priority", priority)
+        approval_queue[key]["_confidence"] = confidence
 
         # Website-first publishing: every English story selected by the bot
         # goes to the website immediately, even while Telegram/socials wait for
@@ -3210,6 +3282,7 @@ def post_article(article, seen, social_only=False, allow_social=True):
                         is_breaking=breaking, allow_social=allow_social
                     )
                     approval_queue[dv_key]["article_id"] = f"{_aid}_dv"
+                    approval_queue[dv_key]["_priority"] = 0
                     approval_queue[dv_key]["summary"] = _summary
                     _send_approval_card(dv_key, approval_queue[dv_key])
                     log.info(f"[AI] Auto-Dhivehi queued: {_title[:50]}")
@@ -7661,6 +7734,7 @@ if __name__ == "__main__":
     scheduler.add_job(breaking_news_check, "interval", minutes=5)
     # Approval lifecycle — English auto-posts at 15min, Dhivehi expires at 2h. Check every 5 min.
     scheduler.add_job(expire_old_approvals, "interval", minutes=5)
+    scheduler.add_job(release_content_lab_drip, "interval", minutes=10)
     # Morning brief 7AM MVT = 2AM UTC
     scheduler.add_job(send_morning_brief, "cron", hour=1, minute=0)  # 6AM MVT
     # AI Nightly Journalist brief 10:30PM MVT = 5:30PM UTC (before night summary)
