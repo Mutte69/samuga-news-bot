@@ -5153,6 +5153,7 @@ def restore_state():
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import signal, atexit
 
     def _graceful_shutdown(signum=None, frame=None):
         """Save all state before Railway kills the process on redeploy."""
