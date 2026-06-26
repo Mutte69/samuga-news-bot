@@ -7743,7 +7743,7 @@ def _public_chat_clean_reply(reply):
     txt = re.sub(r"\n\s*[-*]\s+", "\n• ", txt)
     txt = re.sub(r"\n{3,}", "\n\n", txt)
     txt = re.sub(r"[ \t]{2,}", " ", txt)
-    return _api_clean_text(txt.strip(), 1600)
+    return _api_clean_text(txt.strip(), 1000)
 
 def _public_chat_latest_rows(lang=None, limit=8, hours=30):
     """Read newest public website stories from DB. Default: recent/current only."""
@@ -7870,11 +7870,13 @@ def _public_chat_context(rows):
         lines.append(f"- {r['title']} | {r.get('summary','')} | {r.get('source','')} | {r.get('time','')}")
     return "\n".join(lines)
 
+
 @api_app.route("/api/chat", methods=["POST", "OPTIONS"])
 def api_chat():
     """
     Public website chat for Samuga AI.
-    It uses fresh Samuga DB rows first, then AI only with fresh context.
+    This mirrors the public @SamugaNewsBot chat style, NOT the private core-team brain.
+    It can chat normally, but when the user asks news/current questions it uses fresh Samuga DB context first.
     """
     if request.method == "OPTIONS":
         return jsonify({"ok": True})
@@ -7899,37 +7901,90 @@ def api_chat():
             return jsonify({
                 "ok": False,
                 "error": "empty_message",
-                "reply": "Ask me something about Maldives news bro."
+                "reply": "Ask me something bro. I can chat or help with latest Maldives news."
             }), 400
 
         if _public_chat_is_blocked(message):
             return jsonify({
                 "ok": True,
-                "reply": "I can only answer public news questions here bro. For approvals, posting, or newsroom controls, use the private Samuga team Telegram."
+                "reply": "I can only do public chat and public news here bro. Posting, approvals, and newsroom controls are only for the private Samuga team Telegram."
             })
 
         user_id = f"web:{client_id}:{session_id}"
         log.info(f"🌐 Website chat {client_id}: {message[:80]}")
 
-        latest_rows = _public_chat_latest_rows(lang=lang, limit=8, hours=30)
-        search_rows = _public_chat_search_rows(message, lang=lang, limit=6)
+        # Keep the same public Telegram bot feeling:
+        # 1) Story timeline/search answer if the bot already knows a direct story answer
+        # 2) Fresh Samuga website DB context for news/current questions
+        # 3) Normal friendly public Samuga AI chat for casual/general questions
+        story_answer = None
+        try:
+            story_answer = answer_story_query(message)
+        except Exception as e:
+            log.warning(f"Website story query fallback: {e}")
 
-        # For latest/today/breaking/news questions: deterministic fresh answer only.
-        # This stops the website chat from using old model memory.
-        if _public_chat_is_news_query(message):
-            rows = search_rows or latest_rows
-            reply = _public_chat_format_news(rows, lang=lang, searched=bool(search_rows))
+        if story_answer:
+            reply = story_answer
         else:
-            # For specific questions, give the AI fresh Samuga context, not old memory.
+            is_news_question = _public_chat_is_news_query(message)
+            is_breaking_question = any(w in message.lower() for w in ["breaking", "urgent", "ބްރޭކިންގ"])
+            is_briefing_question = any(w in message.lower() for w in ["briefing", "summarize", "summary", "today", "biggest", "މިއަދު"])
+
+            latest_rows = _public_chat_latest_rows(lang=lang, limit=8, hours=36)
+            search_rows = _public_chat_search_rows(message, lang=lang, limit=6)
+
             context_rows = search_rows or latest_rows
-            context = _public_chat_context(context_rows)
-            safe_prompt = (
-                "You are Samuga AI public website assistant. Answer conversationally. "
-                "Use ONLY the fresh Samuga context below for news facts. "
-                "Do not use old headlines from memory. Do not use markdown bold symbols. "
-                "Keep it short and human.\n\n"
-                f"Fresh Samuga context:\n{context}\n\nUser question: {message}"
-            )
+            if is_breaking_question:
+                breaking_rows = [r for r in latest_rows if str(r.get("category", "")).upper() == "BREAKING"]
+                context_rows = breaking_rows or latest_rows[:4]
+
+            context = _public_chat_context(context_rows[:6])
+
+            # For public website chat, use the public Samuga AI style — not core-team brain.
+            # The prompt keeps answers short and human, while fresh context prevents old memory headlines.
+            if is_news_question:
+                if lang == "dv":
+                    safe_prompt = (
+                        "You are Samuga AI, the public SamugaNewsBot style assistant. "
+                        "Answer in natural Dhivehi if the user used Dhivehi, otherwise simple English. "
+                        "Use ONLY the fresh Samuga context below for news facts. "
+                        "Do not mention old stories from memory. Do not use markdown symbols like ** or ###. "
+                        "Keep it short. For latest news, give maximum 3 items. "
+                        "For breaking, only say breaking if context actually looks breaking. "
+                        "Be friendly like a chat, not a formal article.\n\n"
+                        f"Fresh Samuga context:\n{context}\n\n"
+                        f"User asked: {message}"
+                    )
+                else:
+                    if is_breaking_question:
+                        mode = "breaking news check"
+                    elif is_briefing_question:
+                        mode = "short daily briefing"
+                    else:
+                        mode = "latest news chat"
+                    safe_prompt = (
+                        "You are Samuga AI, the public @SamugaNewsBot style assistant. "
+                        "Reply naturally, friendly, and human — like a helpful Maldivian news buddy. "
+                        "Use ONLY the fresh Samuga context below for news facts. "
+                        "Do not use old headlines from memory. Do not use markdown symbols like **, ###, or long separators. "
+                        "Do not dump a long list. Maximum 3 short items unless the user asks for more. "
+                        "Avoid repeating the title and summary. Keep each item to one short sentence. "
+                        "End with one natural follow-up question.\n\n"
+                        f"Mode: {mode}\n"
+                        f"Fresh Samuga context:\n{context}\n\n"
+                        f"User asked: {message}"
+                    )
+            else:
+                safe_prompt = (
+                    "You are Samuga AI, the public @SamugaNewsBot style assistant. "
+                    "Chat naturally and friendly. You can answer normal questions too. "
+                    "If the question is about news, use the fresh Samuga context below. "
+                    "Do not reveal private newsroom/admin details. Do not approve/reject/post anything. "
+                    "Keep the answer short and conversational. No markdown symbols like **.\n\n"
+                    f"Fresh Samuga context if needed:\n{context}\n\n"
+                    f"User message: {message}"
+                )
+
             if lang == "dv":
                 try:
                     history = get_conversation(user_id)
@@ -7940,17 +7995,17 @@ def api_chat():
                     else:
                         reply = chat_with_claude(safe_prompt, user_id)
                 except Exception as e:
-                    log.error(f"Website Dhivehi chat fallback: {e}")
+                    log.error(f"Website Dhivehi public chat fallback: {e}")
                     reply = chat_with_claude(safe_prompt, user_id)
             else:
                 reply = chat_with_claude(safe_prompt, user_id)
 
-        reply = _public_chat_clean_reply(reply) or "Sorry bro, I couldn't answer that right now."
+        reply = _public_chat_clean_reply(reply) or "Sorry bro, I couldn't answer that right now. Try asking again."
         return jsonify({
             "ok": True,
             "reply": reply,
-            "source": "Samuga AI",
-            "fresh_stories_used": len(latest_rows),
+            "source": "Samuga AI public chat",
+            "mode": "public_samuganewsbot_style",
             "rate_limit": {"limit": limit, "window_seconds": _PUBLIC_CHAT_WINDOW}
         })
 
@@ -7960,8 +8015,7 @@ def api_chat():
             "ok": False,
             "error": "server_error",
             "reply": "Something went wrong bro 😅 Try again in a moment."
-        }), 500
-
+        })
 
 def start_api_server():
     """Start the public website API on Railway's assigned PORT."""
