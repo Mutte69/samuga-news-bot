@@ -7378,8 +7378,9 @@ if __name__ == "__main__":
     seen_on_start=load_seen()
     log.info(f"📚 Loaded {len(seen_on_start)} seen articles")
 
-    threading.Thread(target=handle_updates, daemon=True).start()
-threading.Thread(target=start_api_server, daemon=True).start()
+        threading.Thread(target=handle_updates, daemon=True).start()
+    threading.Thread(target=start_api_server, daemon=True).start()
+
     scheduler=BlockingScheduler(timezone="UTC")
     scheduler.add_job(scheduled_check, "interval", minutes=15)
     # Breaking news fast check every 5 min (LOCAL/DISASTER only)
