@@ -7277,7 +7277,61 @@ def handle_updates():
         except Exception as e:
             log.error(f"Update loop: {e}"); time.sleep(5)
 
-# ── Entry ─────────────────────────────────────────────────────────────────────
+# # ── Website API ───────────────────────────────────────────────────────────────
+from flask import Flask, jsonify
+from flask import Response
+
+api_app = Flask(__name__)
+
+@api_app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    return response
+
+@api_app.get("/")
+def api_home():
+    return jsonify({
+        "status": "online",
+        "name": "Samuga News Bot API",
+        "endpoints": ["/api/stories"]
+    })
+
+@api_app.get("/api/stories")
+def api_stories():
+    try:
+        rows = db_execute("""
+            SELECT title, summary, category, source, link, posted_at
+            FROM articles
+            WHERE status = 'posted'
+            ORDER BY posted_at DESC NULLS LAST, found_at DESC
+            LIMIT 30
+        """, fetch="all")
+
+        stories = []
+
+        if rows:
+            for title, summary, category, source, link, posted_at in rows:
+                stories.append({
+                    "title": title or "Untitled story",
+                    "summary": summary or "",
+                    "category": category or "Community",
+                    "source": source or "Samuga Media",
+                    "url": link or "#",
+                    "time": posted_at.strftime("%d %b %Y • %H:%M") if posted_at else "Recent"
+                })
+
+        return jsonify(stories)
+
+    except Exception as e:
+        log.error(f"Website API /api/stories error: {e}")
+        return jsonify([])
+
+def start_api_server():
+    port = int(os.environ.get("PORT", 8080))
+    log.info(f"🌐 Website API starting on port {port}")
+    api_app.run(host="0.0.0.0", port=port)── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import signal, atexit
 
@@ -7324,7 +7378,7 @@ if __name__ == "__main__":
     log.info(f"📚 Loaded {len(seen_on_start)} seen articles")
 
     threading.Thread(target=handle_updates, daemon=True).start()
-
+threading.Thread(target=start_api_server, daemon=True).start()
     scheduler=BlockingScheduler(timezone="UTC")
     scheduler.add_job(scheduled_check, "interval", minutes=15)
     # Breaking news fast check every 5 min (LOCAL/DISASTER only)
