@@ -123,15 +123,37 @@ ISLAMIC_REMINDERS = [
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _tomorrow_code_to_wmo(code):
-    """Map Tomorrow.io weatherCode to nearest WMO code."""
+    """
+    Map Tomorrow.io weatherCode to the nearest WMO code so weather_code_to_info()
+    works unchanged. Tomorrow.io codes: 1000=clear, 1100=mostly clear,
+    1101=partly cloudy, 1102=mostly cloudy, 1001=cloudy, 2000=fog,
+    4000=drizzle, 4001=rain, 4200=light rain, 4201=heavy rain,
+    8000=thunderstorm, 5000=snow (won't happen in Maldives but handled).
+    """
     mapping = {
-        1000: 0, 1100: 1, 1101: 2, 1102: 3, 1001: 3,
-        2000: 45, 2100: 48,
-        4000: 51, 4001: 61, 4200: 61, 4201: 65,
-        6000: 51, 6001: 61, 6200: 51, 6201: 65,
-        7000: 71, 7101: 77, 7102: 71,
-        5000: 71, 5001: 73, 5100: 71, 5101: 75,
-        8000: 95,
+        1000: 0,    # clear sky
+        1100: 1,    # mostly clear
+        1101: 2,    # partly cloudy
+        1102: 3,    # mostly cloudy
+        1001: 3,    # cloudy/overcast
+        2000: 45,   # fog
+        2100: 48,   # light fog
+        4000: 51,   # drizzle
+        4001: 61,   # rain
+        4200: 61,   # light rain
+        4201: 65,   # heavy rain
+        6000: 51,   # freezing drizzle
+        6001: 61,   # freezing rain
+        6200: 51,   # light freezing rain
+        6201: 65,   # heavy freezing rain
+        7000: 71,   # ice pellets
+        7101: 77,   # heavy ice pellets
+        7102: 71,   # light ice pellets
+        5000: 71,   # snow
+        5001: 73,   # flurries
+        5100: 71,   # light snow
+        5101: 75,   # heavy snow
+        8000: 95,   # thunderstorm
     }
     return mapping.get(code, 3)
 
@@ -148,123 +170,194 @@ def _wmo_to_tomorrow(wmo):
     if wmo in [95,96,99]:   return 8000
     return 1000
 
+def draw_weather_icon(draw, code, x, y, size=40):
+    """Draw vector weather icon — scales cleanly at any size (line widths proportional)."""
+    import math
+    cx, cy = x, y
+    s = size
+    lw = max(2, s // 18)   # proportional line width
+
+    if code == 0:  # Sun
+        draw.ellipse([cx-s//3, cy-s//3, cx+s//3, cy+s//3], fill=(255,210,40,255))
+        for angle in range(0, 360, 30):
+            rad = math.radians(angle)
+            x1 = cx + int((s//3+s//12)*math.cos(rad))
+            y1 = cy + int((s//3+s//12)*math.sin(rad))
+            x2 = cx + int((s//2+s//10)*math.cos(rad))
+            y2 = cy + int((s//2+s//10)*math.sin(rad))
+            draw.line([x1,y1,x2,y2], fill=(255,210,40,230), width=lw)
+    elif code in [1,2]:  # Partly cloudy — sun behind cloud
+        draw.ellipse([cx-s//6, cy-s//2, cx+s//2, cy+s//8], fill=(255,210,40,235))
+        draw.ellipse([cx-s//2, cy-s//8, cx+s//6, cy+s//2], fill=(225,235,250,255))
+        draw.ellipse([cx-s//8, cy-s//5, cx+s//2, cy+s//3], fill=(225,235,250,255))
+        draw.ellipse([cx-s//2, cy, cx+s//4, cy+s//2], fill=(225,235,250,255))
+    elif code == 3:  # Cloud
+        draw.ellipse([cx-s//2, cy-s//8, cx+s//2, cy+s//2], fill=(210,220,245,255))
+        draw.ellipse([cx-s//3, cy-s//3, cx+s//6, cy+s//4], fill=(210,220,245,255))
+        draw.ellipse([cx-s//12, cy-s//4, cx+s//2, cy+s//3], fill=(210,220,245,255))
+    elif code in [51,53,55,61,63,65,80,81,82]:  # Rain
+        draw.ellipse([cx-s//2, cy-s//5, cx+s//2, cy+s//3], fill=(175,190,225,255))
+        draw.ellipse([cx-s//3, cy-s//3, cx+s//6, cy+s//5], fill=(175,190,225,255))
+        draw.ellipse([cx-s//12, cy-s//4, cx+s//2, cy+s//4], fill=(175,190,225,255))
+        for rx in [-s//3, 0, s//3]:
+            draw.line([cx+rx, cy+s//3, cx+rx-s//12, cy+s//2+s//8],
+                      fill=(90,160,255,235), width=lw)
+    elif code in [95,96,99]:  # Thunderstorm
+        draw.ellipse([cx-s//2, cy-s//5, cx+s//2, cy+s//3], fill=(90,90,115,255))
+        draw.ellipse([cx-s//3, cy-s//3, cx+s//6, cy+s//5], fill=(90,90,115,255))
+        draw.ellipse([cx-s//12, cy-s//4, cx+s//2, cy+s//4], fill=(90,90,115,255))
+        bolt = [cx+s//12, cy+s//4, cx-s//12, cy+s//4, cx, cy+s//2,
+                cx-s//6, cy+s//2, cx+s//5, cy+s*3//4]
+        draw.line(bolt, fill=(255,215,0,255), width=lw+1)
+    else:  # Default cloud
+        draw.ellipse([cx-s//2, cy-s//8, cx+s//2, cy+s//2], fill=(190,200,230,255))
+        draw.ellipse([cx-s//3, cy-s//3, cx+s//6, cy+s//4], fill=(190,200,230,255))
+
 def weather_code_to_info(code):
-    """Convert WMO weather code to emoji + description."""
-    if code == 0:              return "☀️", "Clear Sky"
-    if code in [1, 2]:         return "🌤️", "Partly Cloudy"
-    if code == 3:              return "☁️", "Overcast"
-    if code in [45, 48]:       return "🌫️", "Foggy"
-    if code in [51, 53, 55]:   return "🌦️", "Drizzle"
-    if code in [61, 63, 65]:   return "🌧️", "Rain"
-    if code in [71, 73, 75]:   return "🌨️", "Snow"
-    if code in [80, 81, 82]:   return "🌧️", "Rain Showers"
-    if code in [95, 96, 99]:   return "⛈️", "Thunderstorm"
+    """Convert WMO weather code to emoji + description"""
+    if code == 0:   return "☀️", "Clear Sky"
+    if code in [1,2]: return "🌤️", "Partly Cloudy"
+    if code == 3:   return "☁️", "Overcast"
+    if code in [45,48]: return "🌫️", "Foggy"
+    if code in [51,53,55]: return "🌦️", "Drizzle"
+    if code in [61,63,65]: return "🌧️", "Rain"
+    if code in [71,73,75]: return "🌨️", "Snow"
+    if code in [80,81,82]: return "🌧️", "Rain Showers"
+    if code in [95,96,99]: return "⛈️", "Thunderstorm"
     return "🌡️", "Unknown"
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Prayer times
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def get_prayer_times():
-    """Fetch prayer times for Malé via Aladhan API. Returns dict or None."""
+    """
+    Fetch today's prayer times + Hijri date for Malé, Maldives.
+    Uses AlAdhan API — free, no key. Uses exact Malé coordinates and the
+    Maldives-correct calculation so times match the official Islamic Ministry.
+    Returns dict or None on failure.
+    """
     try:
-        from datetime import timezone as _tz
-        now_mvt = datetime.now(_tz.utc) + timedelta(hours=5)
-        url = (f"https://api.aladhan.com/v1/timingsByCity"
-               f"?city=Male&country=MV&method=4"
-               f"&date={now_mvt.strftime('%d-%m-%Y')}")
+        from datetime import timezone, timedelta as _td
+        mvt_now = datetime.now(timezone.utc) + _td(hours=5)
+        date_str = mvt_now.strftime("%d-%m-%Y")
+
+        # Exact Malé coordinates + Maldives Islamic Ministry calculation.
+        # Maldives uses: Fajr 19.5°, Isha 78 min after Maghrib, Shafi'i Asr.
+        # tune offsets fine-tune to match the official Maldives prayer schedule exactly.
+        # tune order: Imsak,Fajr,Sunrise,Dhuhr,Asr,Sunset,Maghrib,Isha,Midnight
+        MALE_LAT, MALE_LON = 4.1755, 73.5093
+        url = (f"https://api.aladhan.com/v1/timings/{date_str}"
+               f"?latitude={MALE_LAT}&longitude={MALE_LON}"
+               f"&method=99&methodSettings=19.5,null,78%20min"
+               f"&school=0"
+               f"&timezonestring=Indian/Maldives"
+               f"&tune=0,0,0,1,-3,0,-1,0,0")
         resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            timings = data.get("data", {}).get("timings", {})
-            hijri  = data.get("data", {}).get("date", {}).get("hijri", {})
-            return {
-                "fajr":    timings.get("Fajr", ""),
-                "dhuhr":   timings.get("Dhuhr", ""),
-                "asr":     timings.get("Asr", ""),
-                "maghrib": timings.get("Maghrib", ""),
-                "isha":    timings.get("Isha", ""),
-                "hijri":   hijri,
-            }
+        if resp.status_code != 200:
+            log.warning(f"Prayer times API: HTTP {resp.status_code} — trying fallback")
+            # Fallback: simple city query with Umm al-Qura
+            url2 = (f"https://api.aladhan.com/v1/timingsByCity/{date_str}"
+                    f"?city=Male&country=Maldives&method=4")
+            resp = requests.get(url2, timeout=10)
+            if resp.status_code != 200:
+                return None
+
+        d = resp.json().get("data", {})
+        timings = d.get("timings", {})
+        hijri   = d.get("date", {}).get("hijri", {})
+
+        def clean_t(t): return t[:5] if t else "--:--"
+
+        prayers = {
+            "Fajr":    clean_t(timings.get("Fajr",    "")),
+            "Dhuhr":   clean_t(timings.get("Dhuhr",   "")),
+            "Asr":     clean_t(timings.get("Asr",     "")),
+            "Maghrib": clean_t(timings.get("Maghrib", "")),
+            "Isha":    clean_t(timings.get("Isha",    "")),
+        }
+
+        h_day   = int(hijri.get("day", 0))
+        h_month = hijri.get("month", {}).get("number", 0)
+        h_month_name = hijri.get("month", {}).get("en", "")
+        h_year  = hijri.get("year", "")
+
+        # Special day — check API holidays first, then built-in dict
+        api_holidays = hijri.get("holidays", [])
+        special_name = api_holidays[0] if api_holidays else None
+        special_desc = ""
+
+        if special_name:
+            special_desc = SPECIAL_DAY_DETAILS.get(special_name, "")
+            if not special_desc:
+                key = (h_month, h_day)
+                if key in HIJRI_SPECIAL_DAYS:
+                    _, special_desc = HIJRI_SPECIAL_DAYS[key]
+        else:
+            key = (h_month, h_day)
+            if key in HIJRI_SPECIAL_DAYS:
+                special_name, special_desc = HIJRI_SPECIAL_DAYS[key]
+
+        # If NOT a special day — pick a rotating Islamic reminder
+        reminder = None
+        if not special_name:
+            reminder = get_daily_islamic_reminder(mvt_now)
+
+        log.info(f"🕌 Prayer times — Fajr {prayers['Fajr']} Dhuhr {prayers['Dhuhr']} "
+                 f"Asr {prayers['Asr']} Maghrib {prayers['Maghrib']} Isha {prayers['Isha']}"
+                 + (f" | {special_name}" if special_name else ""))
+
+        return {
+            "prayers":      prayers,
+            "hijri_day":    h_day,
+            "hijri_month":  h_month_name,
+            "hijri_year":   h_year,
+            "special_name": special_name,
+            "special_desc": special_desc,
+            "reminder":     reminder,
+        }
+
     except Exception as e:
         log.error(f"Prayer times: {e}")
-    return None
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Weather data — Tomorrow.io primary, Open-Meteo fallback
-# ═══════════════════════════════════════════════════════════════════════════════
+        return None
 
 def get_weather_data():
     """
-    Fetch current weather for Malé.
-    Primary: Tomorrow.io (richer data — UV, wind gusts, visibility).
-    Fallback: Open-Meteo (free, no key needed).
-    Returns normalised dict or None.
+    Fetch real-time weather for Malé, Maldives.
+    Primary: Tomorrow.io. Fallback: Open-Meteo.
     """
+    TOMORROW_API_KEY = os.environ.get("TOMORROW_API_KEY", "")
+
     if TOMORROW_API_KEY:
         try:
-            lat, lon = 4.1755, 73.5093
-            fields_rt = ["temperature","weatherCode","windSpeed","windGust",
-                         "humidity","apparentTemperature","uvIndex",
-                         "visibility","dewPoint","pressureSurfaceLevel",
-                         "precipitationProbability"]
-            fields_fc = ["temperature","weatherCode","windSpeed"]
-
-            rt = requests.get(
-                "https://api.tomorrow.io/v4/weather/realtime",
-                params={"location": f"{lat},{lon}",
-                        "fields": ",".join(fields_rt),
-                        "units": "metric",
-                        "apikey": TOMORROW_API_KEY},
-                timeout=12)
-            fc = requests.get(
-                "https://api.tomorrow.io/v4/weather/forecast",
-                params={"location": f"{lat},{lon}",
-                        "fields": ",".join(fields_fc),
-                        "timesteps": "1h,1d",
-                        "units": "metric",
-                        "apikey": TOMORROW_API_KEY},
-                timeout=12)
+            base   = "https://api.tomorrow.io/v4/weather"
+            params = f"?location=4.1755,73.5093&apikey={TOMORROW_API_KEY}&units=metric"
+            rt = requests.get(f"{base}/realtime{params}", timeout=15)
+            fc = requests.get(f"{base}/forecast{params}", timeout=15)
 
             if rt.status_code == 200 and fc.status_code == 200:
-                rv = rt.json().get("data", {}).get("values", {})
+                rv = rt.json()["data"]["values"]
                 fd = fc.json()
                 wmo = _tomorrow_code_to_wmo(rv.get("weatherCode", 1000))
-
                 current = {
                     "temperature_2m":       rv.get("temperature", 29),
-                    "apparent_temperature": rv.get("apparentTemperature", 29),
-                    "weathercode":          wmo,
-                    "windspeed_10m":        rv.get("windSpeed", 0),
-                    "windgust_10m":         rv.get("windGust", 0),
-                    "relativehumidity_2m":  rv.get("humidity", 80),
-                    "uv_index":             rv.get("uvIndex", 0),
-                    "visibility":           rv.get("visibility", 10),
-                    "dewpoint_2m":          rv.get("dewPoint", 25),
-                    "pressure_msl":         rv.get("pressureSurfaceLevel", 1010),
-                    "precipitation_prob":   rv.get("precipitationProbability", 0),
-                    "_source":              "Tomorrow.io",
+                    "apparent_temperature":  rv.get("temperatureApparent", 29),
+                    "relativehumidity_2m":   rv.get("humidity", 80),
+                    "windspeed_10m":         rv.get("windSpeed", 10),
+                    "windgust_10m":          rv.get("windGust", 0),
+                    "weathercode":           wmo,
+                    "uv_index":              rv.get("uvIndex", 0),
+                    "visibility":            rv.get("visibility", 10),
+                    "dewpoint_2m":           rv.get("dewPoint", 25),
+                    "pressure_msl":          rv.get("pressureSurfaceLevel", 1010),
+                    "precipitation_prob":    rv.get("precipitationProbability", 0),
+                    "_source":               "Tomorrow.io",
                 }
-
-                # Hourly forecast
-                hourly_times, hourly_t, hourly_wmo, hourly_precip = [], [], [], []
-                for h in fd.get("timelines", {}).get("hourly", [])[:12]:
-                    hv = h.get("values", {})
-                    hourly_times.append(h.get("time", ""))
-                    hourly_t.append(hv.get("temperature", 29))
-                    hourly_wmo.append(_tomorrow_code_to_wmo(hv.get("weatherCode", 1000)))
-                    hourly_precip.append(hv.get("precipitationProbability", 0))
-
-                hourly = {
-                    "time":                     hourly_times,
-                    "temperature_2m":           hourly_t,
-                    "weathercode":              hourly_wmo,
-                    "precipitation_probability": hourly_precip,
-                }
-
-                # Daily H/L + sunrise/sunset
+                hourly_t, hourly_wmo, hourly_precip, hourly_times = [], [], [], []
+                for slot in fd.get("timelines", {}).get("hourly", [])[:24]:
+                    v = slot.get("values", {})
+                    hourly_times.append(slot.get("time", ""))
+                    hourly_t.append(v.get("temperature", 29))
+                    hourly_wmo.append(_tomorrow_code_to_wmo(v.get("weatherCode", 1000)))
+                    hourly_precip.append(v.get("precipitationProbability", 0))
+                hourly = {"time": hourly_times, "temperature_2m": hourly_t,
+                          "weathercode": hourly_wmo, "precipitation_probability": hourly_precip}
                 daily_max, daily_min, daily_wmo = [], [], []
                 sunrise_str, sunset_str = "06:00", "18:00"
                 for day in fd.get("timelines", {}).get("daily", [])[:1]:
@@ -272,20 +365,19 @@ def get_weather_data():
                     daily_max.append(v.get("temperatureMax", 32))
                     daily_min.append(v.get("temperatureMin", 26))
                     daily_wmo.append(_tomorrow_code_to_wmo(v.get("weatherCodeMax", 1000)))
-                    for key, default, out in [
-                        ("sunriseTime", "06:00", "sunrise_str"),
-                        ("sunsetTime",  "18:00", "sunset_str"),
-                    ]:
-                        val = v.get(key, "")
-                        if val:
-                            try:
-                                dt_utc = datetime.fromisoformat(val.replace("Z", "+00:00"))
-                                result = (dt_utc + timedelta(hours=5)).strftime("%H:%M")
-                            except Exception:
-                                result = val[11:16]
-                            if key == "sunriseTime": sunrise_str = result
-                            else:                    sunset_str  = result
-
+                    sr = v.get("sunriseTime", ""); ss = v.get("sunsetTime", "")
+                    if sr:
+                        from datetime import datetime as _dt, timedelta as _td2
+                        try:
+                            sr_utc = _dt.fromisoformat(sr.replace("Z","+00:00"))
+                            sunrise_str = (sr_utc + _td2(hours=5)).strftime("%H:%M")
+                        except: sunrise_str = sr[11:16]
+                    if ss:
+                        from datetime import datetime as _dt, timedelta as _td2
+                        try:
+                            ss_utc = _dt.fromisoformat(ss.replace("Z","+00:00"))
+                            sunset_str = (ss_utc + _td2(hours=5)).strftime("%H:%M")
+                        except: sunset_str = ss[11:16]
                 daily = {
                     "temperature_2m_max": daily_max or [32],
                     "temperature_2m_min": daily_min or [26],
@@ -293,17 +385,14 @@ def get_weather_data():
                     "sunrise":            [f"2026-01-01T{sunrise_str}"],
                     "sunset":             [f"2026-01-01T{sunset_str}"],
                 }
-
-                log.info(f"🌤️ Tomorrow.io: {current['temperature_2m']:.1f}°C, "
-                         f"UV={current['uv_index']}, wind={current['windspeed_10m']}km/h")
-                return {"current": current, "hourly": hourly, "daily": daily,
-                        "_source": "Tomorrow.io"}
+                log.info(f"🌤️ Tomorrow.io: {current['temperature_2m']:.1f}°C UV={current['uv_index']} wind={current['windspeed_10m']}km/h")
+                return {"current": current, "hourly": hourly, "daily": daily, "_source": "Tomorrow.io"}
             else:
                 log.warning(f"Tomorrow.io HTTP rt={rt.status_code} fc={fc.status_code} — falling back")
         except Exception as e:
             log.error(f"Tomorrow.io weather: {e} — falling back to Open-Meteo")
 
-    # ── Fallback: Open-Meteo ──────────────────────────────────────────────────
+    # Fallback: Open-Meteo
     try:
         url = ("https://api.open-meteo.com/v1/forecast"
                "?latitude=4.1755&longitude=73.5093"
@@ -316,24 +405,13 @@ def get_weather_data():
             data = resp.json()
             data["_source"] = "Open-Meteo"
             c = data.get("current", {})
-            c["uv_index"]           = 0
-            c["visibility"]         = 10
-            c["windgust_10m"]       = 0
-            c["dewpoint_2m"]        = 25
-            c["pressure_msl"]       = 1010
-            c["precipitation_prob"] = 0
-            c["_source"]            = "Open-Meteo"
-            log.info(f"🌤️ Open-Meteo fallback: {c.get('temperature_2m', 29):.1f}°C")
+            c.update({"uv_index":0,"visibility":10,"windgust_10m":0,
+                      "dewpoint_2m":25,"pressure_msl":1010,"precipitation_prob":0,"_source":"Open-Meteo"})
+            log.info(f"🌤️ Open-Meteo fallback: {c.get('temperature_2m',29):.1f}°C")
             return data
     except Exception as e:
         log.error(f"Open-Meteo fallback: {e}")
     return None
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Island forecasts
-# ═══════════════════════════════════════════════════════════════════════════════
-
 
 def generate_outlook(hourly_slots, mvt_now_dt):
     """
@@ -401,428 +479,707 @@ def generate_outlook(hourly_slots, mvt_now_dt):
     return f"{desc} {time_hint}"
 
 
-def _island_openmeteo_fallback(island, mvt_now_dt):
-    """Open-Meteo fallback for a single island with simple 12-hour outlook."""
+def _island_openmeteo_fallback(island, mvt_now):
+    """Fetch a single island's forecast from Open-Meteo (free, no key)."""
     try:
-        url = (
-            f"https://api.open-meteo.com/v1/forecast"
-            f"?latitude={island['lat']}&longitude={island['lon']}"
-            f"&current=temperature_2m,weathercode,windspeed_10m"
-            f"&hourly=weathercode,precipitation_probability"
-            f"&timezone=Indian%2FMaldives&forecast_days=1"
-        )
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            j = resp.json()
-            c = j.get("current", {})
-            hourly = j.get("hourly", {})
-            times = hourly.get("time", [])[:12]
-            codes = hourly.get("weathercode", [])[:12]
-            precips = hourly.get("precipitation_probability", [])[:12]
-            slots = []
-            for t, code, precip in zip(times, codes, precips):
-                try:
-                    dt = datetime.fromisoformat(str(t))
-                except Exception:
-                    dt = mvt_now_dt
-                slots.append({"dt": dt, "code": int(code or 0), "precip": int(precip or 0)})
-            return {
-                "name": island["name"],
-                "temp": round(c.get("temperature_2m", 29)),
-                "wmo": int(c.get("weathercode", 3) or 3),
-                "wind": round(c.get("windspeed_10m", 0)),
-                "source": "Open-Meteo",
-                "outlook": generate_outlook(slots, mvt_now_dt),
-            }
+        url = ("https://api.open-meteo.com/v1/forecast"
+               f"?latitude={island['lat']}&longitude={island['lon']}"
+               "&current=temperature_2m,weathercode"
+               "&hourly=temperature_2m,weathercode,precipitation_probability"
+               "&timezone=Indian%2FMaldives&forecast_days=1")
+        resp = requests.get(url, timeout=12)
+        if resp.status_code != 200:
+            return {"name": island["name"], "temp": 29, "code": 1000, "outlook": "Mostly cloudy"}
+        d = resp.json()
+        temp = round(d.get("current", {}).get("temperature_2m", 29))
+        code = d.get("current", {}).get("weathercode", 1)
+        # Build slots compatible with generate_outlook (uses native Tomorrow codes;
+        # Open-Meteo uses WMO codes which generate_outlook also tolerates via labels)
+        hourly = d.get("hourly", {})
+        times = hourly.get("time", [])
+        wcodes = hourly.get("weathercode", [])
+        precs = hourly.get("precipitation_probability", [])
+        slots = []
+        for i in range(min(12, len(times))):
+            # Open-Meteo times are local MVT already; convert to fake UTC for generate_outlook (-5)
+            slots.append({"time": times[i] + ":00Z",
+                          "values": {"weatherCode": _wmo_to_tomorrow(wcodes[i] if i < len(wcodes) else 1),
+                                     "precipitationProbability": precs[i] if i < len(precs) else 0}})
+        outlook = generate_outlook(slots, mvt_now) if slots else "Mostly cloudy"
+        return {"name": island["name"], "temp": temp, "code": code, "outlook": outlook}
     except Exception as e:
-        log.debug(f"Island fallback {island['name']}: {e}")
-    return {
-        "name": island["name"],
-        "temp": 29,
-        "wmo": 3,
-        "wind": 0,
-        "source": "Fallback",
-        "outlook": "Weather data unavailable",
-    }
+        log.debug(f"Island Open-Meteo {island['name']}: {e}")
+        return {"name": island["name"], "temp": 29, "code": 1000, "outlook": "Mostly cloudy"}
 
 def get_island_forecasts():
     """
-    Fetch current conditions for all 5 islands.
-    Primary: Tomorrow.io realtime + forecast.
-    Fallback: Open-Meteo with hourly outlook.
-    Returns list of dicts with keys: name, temp, wmo, wind, source, outlook
+    Fetch 12-hour hourly forecast for all 5 islands.
+    Primary: Tomorrow.io. Fallback per-island: Open-Meteo (so never 'Data unavailable').
+    Returns list of {name, temp, code, outlook} dicts.
     """
+    TOMORROW_API_KEY = os.environ.get("TOMORROW_API_KEY", "")
+    from datetime import datetime, timezone, timedelta as _td
+    mvt_now = datetime.now(timezone.utc) + _td(hours=5)
     results = []
-    from datetime import timezone as _tz
-    mvt_now_dt = datetime.now(_tz.utc) + timedelta(hours=5)
 
     for island in ISLAND_LOCATIONS:
+        # If no Tomorrow.io key, go straight to Open-Meteo
         if not TOMORROW_API_KEY:
-            results.append(_island_openmeteo_fallback(island, mvt_now_dt))
+            results.append(_island_openmeteo_fallback(island, mvt_now))
             continue
         try:
+            params = (f"?location={island['lat']},{island['lon']}"
+                      f"&apikey={TOMORROW_API_KEY}&units=metric")
             base = "https://api.tomorrow.io/v4/weather"
-            params = {"location": f"{island['lat']},{island['lon']}", "units": "metric", "apikey": TOMORROW_API_KEY}
 
-            rt = requests.get(
-                f"{base}/realtime",
-                params={**params, "fields": "temperature,weatherCode,windSpeed"},
-                timeout=12
-            )
-            fc = requests.get(
-                f"{base}/forecast",
-                params={**params, "fields": "temperature,weatherCode,windSpeed,precipitationProbability", "timesteps": "1h"},
-                timeout=12
-            )
+            rt = requests.get(f"{base}/realtime{params}", timeout=12)
+            fc = requests.get(f"{base}/forecast{params}", timeout=12)
 
             if rt.status_code != 200 or fc.status_code != 200:
                 log.warning(f"Island {island['name']}: Tomorrow.io {rt.status_code}/{fc.status_code} — Open-Meteo fallback")
-                results.append(_island_openmeteo_fallback(island, mvt_now_dt))
+                results.append(_island_openmeteo_fallback(island, mvt_now))
                 continue
 
-            rv = rt.json().get("data", {}).get("values", {})
+            rv = rt.json()["data"]["values"]
             fd = fc.json()
-            outlook = generate_outlook((fd.get("timelines", {}) or {}).get("hourly", [])[:12], mvt_now_dt)
+            temp = round(rv.get("temperature", 29))
+            code = _tomorrow_code_to_wmo(rv.get("weatherCode", 1000))
+            hourly_slots = fd.get("timelines", {}).get("hourly", [])[:12]
+            outlook = generate_outlook(hourly_slots, mvt_now)
 
-            results.append({
-                "name": island["name"],
-                "temp": round(rv.get("temperature", 29)),
-                "wmo": _tomorrow_code_to_wmo(rv.get("weatherCode", 1000)),
-                "wind": round(rv.get("windSpeed", 0)),
-                "source": "Tomorrow.io",
-                "outlook": outlook,
-            })
-            log.info(f"🏝️ {island['name']}: {round(rv.get('temperature',29))}°C — {outlook}")
+            results.append({"name": island["name"], "temp": temp,
+                             "code": code, "outlook": outlook})
+            log.info(f"🏝️ {island['name']}: {temp}°C — {outlook}")
+
         except Exception as e:
-            log.warning(f"Island forecast {island['name']}: {e} — Open-Meteo fallback")
-            results.append(_island_openmeteo_fallback(island, mvt_now_dt))
+            log.error(f"Island forecast {island['name']}: {e} — Open-Meteo fallback")
+            results.append(_island_openmeteo_fallback(island, mvt_now))
 
-    ordered = []
-    by_name = {r["name"]: r for r in results if r}
-    for isl in ISLAND_LOCATIONS:
-        if isl["name"] in by_name:
-            ordered.append(by_name[isl["name"]])
-    log.info(f"🏝️ Island forecasts: {len(ordered)}/{len(ISLAND_LOCATIONS)} fetched")
-    return ordered if ordered else None
+    return results
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Weather card generator — full Samuga branded card
+    """
+    Fetch real-time weather for Malé, Maldives.
+    Primary: Tomorrow.io (richer data — UV, gusts, visibility, dew point).
+    Fallback: Open-Meteo (free, no key, always available).
+    Returns a normalised dict the card renderer understands.
+    """
+    TOMORROW_API_KEY = os.environ.get("TOMORROW_API_KEY", "")
 
-# ═══════════════════════════════════════════════════════════════════════════════
+    # ── Primary: Tomorrow.io ─────────────────────────────────────────────────
+    if TOMORROW_API_KEY:
+        try:
+            # Two calls: realtime (current) + forecast (hourly + daily)
+            base = "https://api.tomorrow.io/v4/weather"
+            params = f"?location=4.1755,73.5093&apikey={TOMORROW_API_KEY}&units=metric"
 
-def generate_weather_card(weather_data, alert_mode=False, alert_text="",
-                          island_data=None, prayer_data=None, alert_level=None):
-    """Samuga branded weather card — 2500x3000, cinematic, sea conditions, prayer times, Hijri, MMS alerts."""
-    from cards import draw_weather_icon
+            rt = requests.get(f"{base}/realtime{params}", timeout=15)
+            fc = requests.get(f"{base}/forecast{params}", timeout=15)
+
+            if rt.status_code == 200 and fc.status_code == 200:
+                rv = rt.json()["data"]["values"]
+                fd = fc.json()
+
+                # Current conditions
+                wmo = _tomorrow_code_to_wmo(rv.get("weatherCode", 1000))
+                current = {
+                    "temperature_2m":        rv.get("temperature", 29),
+                    "apparent_temperature":   rv.get("temperatureApparent", 29),
+                    "relativehumidity_2m":    rv.get("humidity", 80),
+                    "windspeed_10m":          rv.get("windSpeed", 10),
+                    "windgust_10m":           rv.get("windGust", 0),
+                    "weathercode":            wmo,
+                    "uv_index":               rv.get("uvIndex", 0),
+                    "visibility":             rv.get("visibility", 10),
+                    "dewpoint_2m":            rv.get("dewPoint", 25),
+                    "pressure_msl":           rv.get("pressureSurfaceLevel", 1010),
+                    "precipitation_prob":     rv.get("precipitationProbability", 0),
+                    "_source":                "Tomorrow.io",
+                }
+
+                # Hourly forecast (next 8 hours)
+                hourly_t, hourly_wmo, hourly_precip = [], [], []
+                hourly_times = []
+                for slot in fd.get("timelines", {}).get("hourly", [])[:12]:
+                    v = slot.get("values", {})
+                    hourly_times.append(slot.get("time", ""))
+                    hourly_t.append(v.get("temperature", 29))
+                    hourly_wmo.append(_tomorrow_code_to_wmo(v.get("weatherCode", 1000)))
+                    hourly_precip.append(v.get("precipitationProbability", 0))
+
+                hourly = {
+                    "time":                     hourly_times,
+                    "temperature_2m":           hourly_t,
+                    "weathercode":              hourly_wmo,
+                    "precipitation_probability":hourly_precip,
+                }
+
+                # Daily H/L + sunrise/sunset
+                daily_max, daily_min, daily_wmo = [], [], []
+                sunrise_str, sunset_str = "06:00", "18:00"
+                for i, day in enumerate(fd.get("timelines", {}).get("daily", [])[:1]):
+                    v = day.get("values", {})
+                    daily_max.append(v.get("temperatureMax", 32))
+                    daily_min.append(v.get("temperatureMin", 26))
+                    daily_wmo.append(_tomorrow_code_to_wmo(v.get("weatherCodeMax", 1000)))
+                    sr = v.get("sunriseTime", "")
+                    ss = v.get("sunsetTime", "")
+                    if sr:
+                        from datetime import datetime as _dt, timedelta as _td2
+                        try:
+                            sr_utc = _dt.fromisoformat(sr.replace("Z","+00:00"))
+                            sunrise_str = (sr_utc + _td2(hours=5)).strftime("%H:%M")
+                        except: sunrise_str = sr[11:16]
+                    if ss:
+                        from datetime import datetime as _dt, timedelta as _td2
+                        try:
+                            ss_utc = _dt.fromisoformat(ss.replace("Z","+00:00"))
+                            sunset_str = (ss_utc + _td2(hours=5)).strftime("%H:%M")
+                        except: sunset_str = ss[11:16]
+
+                daily = {
+                    "temperature_2m_max": daily_max or [32],
+                    "temperature_2m_min": daily_min or [26],
+                    "weathercode":        daily_wmo or [wmo],
+                    "sunrise":            [f"2026-01-01T{sunrise_str}"],
+                    "sunset":             [f"2026-01-01T{sunset_str}"],
+                }
+
+                log.info(f"🌤️ Tomorrow.io: {current['temperature_2m']:.1f}°C, "
+                         f"UV={current['uv_index']}, wind={current['windspeed_10m']}km/h")
+                return {"current": current, "hourly": hourly, "daily": daily,
+                        "_source": "Tomorrow.io"}
+
+            else:
+                log.warning(f"Tomorrow.io HTTP rt={rt.status_code} fc={fc.status_code} — falling back")
+        except Exception as e:
+            log.error(f"Tomorrow.io weather: {e} — falling back to Open-Meteo")
+
+    # ── Fallback: Open-Meteo (no key needed, always free) ────────────────────
+    try:
+        url = ("https://api.open-meteo.com/v1/forecast"
+               "?latitude=4.1755&longitude=73.5093"
+               "&current=temperature_2m,weathercode,windspeed_10m,relativehumidity_2m,apparent_temperature"
+               "&hourly=temperature_2m,weathercode,precipitation_probability"
+               "&daily=temperature_2m_max,temperature_2m_min,sunrise,sunset,weathercode"
+               "&timezone=Indian%2FMaldives&forecast_days=1")
+        resp = requests.get(url, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            data["_source"] = "Open-Meteo"
+            # Normalise Open-Meteo current to match Tomorrow.io shape
+            c = data.get("current", {})
+            c["uv_index"]        = 0
+            c["visibility"]      = 10
+            c["windgust_10m"]    = 0
+            c["dewpoint_2m"]     = 25
+            c["pressure_msl"]    = 1010
+            c["precipitation_prob"] = 0
+            c["_source"]         = "Open-Meteo"
+            log.info(f"🌤️ Open-Meteo fallback: {c.get('temperature_2m',29):.1f}°C")
+            return data
+    except Exception as e:
+        log.error(f"Open-Meteo fallback: {e}")
+    return None
+
+def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_data=None, prayer_data=None, alert_level=None):
+    """Samuga branded weather card v3 — 2500x3000, cinematic, sea conditions, prayer times, Hijri, MMS alerts."""
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter
+    import io
 
     W, H = 2500, (3050 if island_data else 2300)
-    img  = Image.new("RGB", (W, H), (0, 0, 0))
+    img = Image.new("RGB", (W, H), (0, 0, 0))
     draw = ImageDraw.Draw(img, "RGBA")
 
-    # MMS alert level colors
-    ALERT_COLORS = {
-        "white":  (220, 220, 220),
-        "yellow": (255, 200, 0),
-        "orange": (255, 120, 0),
-        "red":    (220, 40, 40),
-    }
-    accent = ALERT_COLORS.get(alert_level, (41, 171, 226)) if alert_mode else (41, 171, 226)
+    current    = weather_data.get("current", {})
+    hourly_d   = weather_data.get("hourly", {})
+    daily_d    = weather_data.get("daily", {})
+    source     = weather_data.get("_source", "")
 
-    # ── Background gradient ───────────────────────────────────────────────────
+    temp     = round(current.get("temperature_2m", 29))
+    feels    = round(current.get("apparent_temperature", 29))
+    humidity = current.get("relativehumidity_2m", 80)
+    wind     = round(current.get("windspeed_10m", 10))
+    gusts    = round(current.get("windgust_10m", 0))
+    uv       = current.get("uv_index", 0)
+    vis      = round(current.get("visibility", 10))
+    dew      = round(current.get("dewpoint_2m", 25))
+    pressure = round(current.get("pressure_msl", 1010))
+    precip_p = current.get("precipitation_prob", 0)
+    code     = current.get("weathercode", 0)
+    _, condition = weather_code_to_info(code)
+
+    temp_max = round(daily_d.get("temperature_2m_max", [temp])[0])
+    temp_min = round(daily_d.get("temperature_2m_min", [temp])[0])
+    sunrise_raw = daily_d.get("sunrise", [""])[0]
+    sunset_raw  = daily_d.get("sunset",  [""])[0]
+    sunrise_str = sunrise_raw.split("T")[1][:5] if "T" in sunrise_raw else "06:00"
+    sunset_str  = sunset_raw.split("T")[1][:5]  if "T" in sunset_raw  else "18:19"
+
+    hours  = hourly_d.get("time", [])
+    temps  = hourly_d.get("temperature_2m", [])
+    codes  = hourly_d.get("weathercode", [])
+    precip = hourly_d.get("precipitation_probability", [])
+
+    from datetime import timezone
+    mvt = datetime.now(timezone.utc) + timedelta(hours=5)
+
+    # ── Sea condition assessment (Maldives-specific) ──────────────────────────
+    def sea_condition(wind_kmh, gust_kmh, precip_pct, wcode):
+        if wind_kmh >= 50 or gust_kmh >= 65 or wcode in [95,96,99]:
+            return "⛔", "Very Rough Sea", "Avoid all sea travel"
+        if wind_kmh >= 35 or gust_kmh >= 45:
+            return "🟠", "Rough Sea", "Caution — small craft warning"
+        if wind_kmh >= 20 or gust_kmh >= 30:
+            return "🟡", "Moderate Sea", "Speedboats with care"
+        return "🟢", "Calm Sea", "Good conditions for travel"
+
+    sea_icon, sea_label, sea_advice = sea_condition(wind, gusts, precip_p, code)
+
+    # ── Background — deep layered atmospheric ─────────────────────────────────
+    if alert_mode and alert_level:
+        # Each MMS level gets its own tinted background
+        if alert_level == "white":
+            TOP, BOT = (30, 45, 70), (12, 22, 42)      # light steel blue
+        elif alert_level == "yellow":
+            TOP, BOT = (60, 50, 8), (28, 22, 4)        # dark yellowish
+        elif alert_level == "orange":
+            TOP, BOT = (70, 38, 6), (32, 16, 3)        # dark orangish
+        elif alert_level == "red":
+            TOP, BOT = (55, 6, 6), (18, 2, 2)          # deep red (serious)
+        else:
+            TOP, BOT = (45, 5, 5), (15, 2, 2)
+    elif alert_mode:
+        TOP, BOT = (45, 5, 5), (15, 2, 2)
+    elif code in [95,96,99]:
+        TOP, BOT = (18, 10, 45), (6, 4, 22)
+    elif code in [61,63,65,80,81,82,51,53,55]:
+        TOP, BOT = (8, 18, 52), (4, 8, 28)
+    elif code == 0:
+        TOP, BOT = (5, 22, 80), (3, 10, 42)
+    else:
+        TOP, BOT = (8, 18, 55), (4, 8, 32)
+
+    # Three-stop gradient: top → mid → bottom
+    MID = tuple(int((TOP[i]+BOT[i])//2 + 8) for i in range(3))
     for y in range(H):
-        t   = y / H
-        r   = int(5  + (15  - 5)  * t)
-        g   = int(20 + (40  - 20) * t)
-        b   = int(60 + (100 - 60) * t)
-        draw.line([(0, y), (W, y)], fill=(r, g, b))
+        t = y / H
+        if t < 0.45:
+            f = t / 0.45
+            r = int(TOP[0] + (MID[0]-TOP[0])*f)
+            g = int(TOP[1] + (MID[1]-TOP[1])*f)
+            b = int(TOP[2] + (MID[2]-TOP[2])*f)
+        else:
+            f = (t-0.45) / 0.55
+            r = int(MID[0] + (BOT[0]-MID[0])*f)
+            g = int(MID[1] + (BOT[1]-MID[1])*f)
+            b = int(MID[2] + (BOT[2]-MID[2])*f)
+        draw.line([(0,y),(W,y)], fill=(max(0,min(255,r)), max(0,min(255,g)), max(0,min(255,b)), 255))
 
-    # Top accent bar
-    draw.rectangle([(0, 0), (W, 8)], fill=accent)
+    # Atmospheric glow layers — large soft blobs of colour for depth
+    glow = Image.new("RGBA", (W, H), (0,0,0,0))
+    gd   = ImageDraw.Draw(glow)
 
-    # ── Font loading ──────────────────────────────────────────────────────────
-    def _font(path, size):
-        try:    return ImageFont.truetype(path, size)
-        except: return ImageFont.load_default()
+    # Primary glow — centre-top (SKY blue)
+    for r in range(700, 0, -1):
+        a = int(28 * (1 - r/700))
+        gd.ellipse([(W//2-r, 180-r), (W//2+r, 180+r)], fill=(41,171,226,a))
 
-    BOLD   = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    REG    = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    f_huge  = _font(BOLD, 220)
-    f_large = _font(BOLD, 90)
-    f_med   = _font(BOLD, 70)
-    f_reg   = _font(REG,  60)
-    f_sm    = _font(REG,  50)
-    f_xs    = _font(REG,  42)
-    f_tag   = _font(BOLD, 55)
+    # Secondary glow — lower left (deeper blue)
+    for r in range(500, 0, -1):
+        a = int(18 * (1 - r/500))
+        gd.ellipse([(200-r, H-400-r), (200+r, H-400+r)], fill=(20,60,160,a))
 
-    # ── Logo ──────────────────────────────────────────────────────────────────
+    # Accent glow — lower right (hint of teal)
+    for r in range(400, 0, -1):
+        a = int(14 * (1 - r/400))
+        gd.ellipse([(W-300-r, H-500-r), (W-300+r, H-500+r)], fill=(20,120,140,a))
+
+    glow = glow.filter(ImageFilter.GaussianBlur(60))
+    img_rgba = img.convert("RGBA")
+    img_rgba = Image.alpha_composite(img_rgba, glow)
+
+    # Noise/grain overlay for depth (subtle)
+    import random
+    grain = Image.new("RGBA", (W, H), (0,0,0,0))
+    gpx  = grain.load()
+    for yy in range(0, H, 3):
+        for xx in range(0, W, 3):
+            v = random.randint(0, 12)
+            gpx[xx, yy] = (v, v, v+4, 6)
+    img_rgba = Image.alpha_composite(img_rgba, grain)
+
+    img  = img_rgba.convert("RGB")
+    draw = ImageDraw.Draw(img, "RGBA")
+
+    # Alert tint overlay — coloured by level
+    if alert_mode:
+        tint_map = {
+            "white":  (60, 90, 130, 30),
+            "yellow": (120, 100, 10, 35),
+            "orange": (140, 70, 5, 35),
+            "red":    (90, 0, 0, 45),
+        }
+        tc = tint_map.get(alert_level, (80, 0, 0, 40))
+        overlay = Image.new("RGBA", (W,H), tc)
+        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+        draw = ImageDraw.Draw(img, "RGBA")
+
+    # ── Fonts ─────────────────────────────────────────────────────────────────
+    def F(sz, bold=False):
+        try:
+            path = f"/usr/share/fonts/truetype/dejavu/DejaVuSans{chr(45)+'Bold' if bold else ''}.ttf"
+            return ImageFont.truetype(path, sz)
+        except:
+            return ImageFont.load_default()
+
+    f_giant  = F(420, True)   # temperature
+    f_huge   = F(110, True)   # condition
+    f_large  = F(80,  True)   # location, section headers
+    f_med    = F(64)           # H/L, details
+    f_small  = F(52,  True)   # island names, sea label
+    f_body   = F(46)           # outlook text
+    f_tiny   = F(38)           # hourly labels
+    f_xs     = F(32)           # sub-labels
+    f_xxs    = F(26)           # footer, source
+
+    # ── MMS Alert banner FIRST (so logo sits below it, not under it) ──────────
+    banner_h = 0
+    if alert_mode and alert_level:
+        level_cfg = MMS_ALERT_LEVELS.get(alert_level, MMS_ALERT_LEVELS["white"])
+        acolor = level_cfg["color"]
+        banner_h = 130
+        draw.rectangle([(0, 0), (W, banner_h)], fill=(acolor[0], acolor[1], acolor[2], 235))
+        btext = f"{level_cfg['emoji']}  {level_cfg['label']}  —  {level_cfg['headline'].upper()}"
+        btw = draw.textlength(btext, font=f_small)
+        txt_color = (20,20,20,255) if alert_level in ["white","yellow"] else (255,255,255,255)
+        draw.text(((W-btw)//2, 38), btext, font=f_small, fill=txt_color)
+    elif alert_mode:
+        banner_h = 110
+        draw.rectangle([(0, 0), (W, banner_h)], fill=(200, 40, 40, 235))
+        btext = "⚠  WEATHER ALERT  ⚠"
+        btw = draw.textlength(btext, font=f_small)
+        draw.text(((W-btw)//2, 30), btext, font=f_small, fill=(255,255,255,255))
+
+    # ── SAMUGA LOGO — top left (below banner if in alert mode) ────────────────
+    logo_y = (banner_h + 25) if alert_mode else 55
     try:
         logo = Image.open("logo.png").convert("RGBA")
-        lh   = 130; lw = int(logo.width * lh / logo.height)
-        logo = logo.resize((lw, lh), Image.LANCZOS)
-        img.paste(logo, (80, 60), logo)
+        lh = 120; lw2 = int(logo.width * lh / logo.height)
+        logo = logo.resize((lw2, lh), Image.LANCZOS)
+        ir = img.convert("RGBA"); ir.paste(logo, (70, logo_y), logo)
+        img = ir.convert("RGB"); draw = ImageDraw.Draw(img, "RGBA")
     except Exception as e:
-        log.debug(f"Weather card logo: {e}")
+        log.debug(f"weather logo: {e}")
+        draw.text((70, logo_y), "SAMUGA MEDIA", font=f_xs, fill=(255,255,255,200))
 
-    draw.text((W - 600, 80), "t.me/samugacommunity", font=f_sm, fill=(180, 210, 255))
+    # Channel tag — top right (below banner if in alert mode)
+    tag = "t.me/samugacommunity"
+    ttw = draw.textlength(tag, font=f_xs)
+    tag_y = (banner_h + 45) if alert_mode else 78
+    draw.text((W-ttw-70, tag_y), tag, font=f_xs, fill=(255,255,255,130))
 
-    # ── Main weather data ─────────────────────────────────────────────────────
-    current   = weather_data.get("current", {})
-    daily     = weather_data.get("daily", {})
-    hourly    = weather_data.get("hourly", {})
-    source    = weather_data.get("_source", "Open-Meteo")
+    # ── LOCATION ──────────────────────────────────────────────────────────────
+    loc = "Malé, Maldives"
+    loc_y = (banner_h + 180) if alert_mode else 240
+    lcw = draw.textlength(loc, font=f_large)
+    draw.text(((W-lcw)//2, loc_y), loc, font=f_large, fill=(255,255,255,230))
 
-    temp      = round(current.get("temperature_2m", 29))
-    feels     = round(current.get("apparent_temperature", temp))
-    wcode     = current.get("weathercode", 0)
-    wind      = round(current.get("windspeed_10m", 0))
-    gusts     = round(current.get("windgust_10m", 0))
-    humidity  = round(current.get("relativehumidity_2m", 80))
-    uv        = round(current.get("uv_index", 0))
-    precip_p  = round(current.get("precipitation_prob", 0))
-    vis       = round(current.get("visibility", 10))
+    # ── WEATHER ICON — dead centre between location and temperature ────────────
+    icon_y = loc_y + 175
+    draw_weather_icon(draw, code, W//2, icon_y, size=175)
 
-    temp_max  = round(daily.get("temperature_2m_max", [32])[0])
-    temp_min  = round(daily.get("temperature_2m_min", [26])[0])
+    # ── TEMPERATURE ───────────────────────────────────────────────────────────
+    temp_str = f"{temp}°"
+    ttw2 = draw.textlength(temp_str, font=f_giant)
+    temp_y = icon_y + 175
+    draw.text(((W-ttw2)//2, temp_y), temp_str, font=f_giant, fill=(255,255,255,255))
 
-    emoji, condition = weather_code_to_info(wcode)
-
-    # Sunrise / sunset
-    sunrise_str, sunset_str = "06:00", "18:00"
-    try:
-        sr = daily.get("sunrise", [""])[0]
-        ss = daily.get("sunset",  [""])[0]
-        if "T" in str(sr): sunrise_str = str(sr).split("T")[1][:5]
-        if "T" in str(ss): sunset_str  = str(ss).split("T")[1][:5]
-    except Exception:
-        pass
-
-    from datetime import timezone as _tz
-    mvt_now_dt  = datetime.now(_tz.utc) + timedelta(hours=5)
-    date_str    = mvt_now_dt.strftime("%A, %d %B %Y")
-    time_str    = mvt_now_dt.strftime("%H:%M") + " MVT"
-
-    # ── Date / time header ────────────────────────────────────────────────────
-    y_pos = 230
-    draw.text((80, y_pos), date_str, font=f_med, fill=(180, 210, 255))
-    y_pos += 85
-    draw.text((80, y_pos), time_str, font=f_reg, fill=(140, 180, 230))
-    y_pos += 100
-
-    # ── Hijri date + Islamic reminder / special day ───────────────────────────
-    if prayer_data and prayer_data.get("hijri"):
-        hijri   = prayer_data["hijri"]
-        h_day   = int(hijri.get("day", 0))
-        h_month = int(hijri.get("month", {}).get("number", 0))
-        h_year  = hijri.get("year", "")
-        h_month_name = hijri.get("month", {}).get("en", "")
-        hijri_str    = f"{h_day} {h_month_name} {h_year} AH"
-        draw.text((80, y_pos), hijri_str, font=f_xs, fill=(160, 200, 255, 200))
-        y_pos += 65
-
-        special = HIJRI_SPECIAL_DAYS.get((h_month, h_day))
-        if not special:
-            # Check API-returned holiday name
-            holidays = hijri.get("holidays", [])
-            if holidays:
-                hname = holidays[0]
-                detail = SPECIAL_DAY_DETAILS.get(hname, "")
-                special = (hname, detail)
-        if special:
-            sname, sdesc = special
-            draw.text((80, y_pos), f"✨ {sname}", font=f_sm, fill=(255, 215, 80))
-            y_pos += 60
-            if sdesc:
-                # Wrap description
-                words = sdesc.split()
-                line, lines = "", []
-                for w in words:
-                    test = (line + " " + w).strip()
-                    if draw.textbbox((0,0), test, font=f_xs)[2] < W - 200:
-                        line = test
-                    else:
-                        if line: lines.append(line)
-                        line = w
-                if line: lines.append(line)
-                for dl in lines[:2]:
-                    draw.text((80, y_pos), dl, font=f_xs, fill=(220, 200, 140))
-                    y_pos += 52
-        else:
-            # Rotating daily Islamic reminder
-            day_idx = mvt_now_dt.timetuple().tm_yday % len(ISLAMIC_REMINDERS)
-            reminder, source_ref = ISLAMIC_REMINDERS[day_idx]
-            # Wrap reminder text
-            words = reminder.split()
-            line, lines = "", []
-            for w in words:
-                test = (line + " " + w).strip()
-                if draw.textbbox((0,0), test, font=f_xs)[2] < W - 200:
-                    line = test
-                else:
-                    if line: lines.append(line)
-                    line = w
-            if line: lines.append(line)
-            for rl in lines[:2]:
-                draw.text((80, y_pos), rl, font=f_xs, fill=(200, 185, 140))
-                y_pos += 52
-            draw.text((80, y_pos), f"— {source_ref}", font=f_xs, fill=(160, 150, 110))
-            y_pos += 55
-
-    y_pos += 30
-
-    # ── Divider ───────────────────────────────────────────────────────────────
-    draw.rectangle([(80, y_pos), (W - 80, y_pos + 2)], fill=(255, 255, 255, 40))
-    y_pos += 40
-
-    # ── MMS Alert banner ──────────────────────────────────────────────────────
-    if alert_mode and alert_text:
-        alert_cfg = MMS_ALERT_LEVELS.get(alert_level or "white", MMS_ALERT_LEVELS["white"])
-        banner_color = ALERT_COLORS.get(alert_level, (220, 220, 220))
-        text_color   = (0, 0, 0) if alert_level in ("white", "yellow") else (255, 255, 255)
-        draw.rectangle([(80, y_pos), (W - 80, y_pos + 90)], fill=banner_color)
-        draw.text((110, y_pos + 18),
-                  f"{alert_cfg['emoji']} {alert_cfg['label'].upper()} — {alert_cfg['headline']}",
-                  font=f_tag, fill=text_color)
-        y_pos += 110
-        words = alert_text.split()
-        line, lines = "", []
-        for w in words:
-            test = (line + " " + w).strip()
-            if draw.textbbox((0,0), test, font=f_reg)[2] < W - 200:
-                line = test
-            else:
-                if line: lines.append(line)
-                line = w
-        if line: lines.append(line)
-        for al in lines[:4]:
-            draw.text((80, y_pos), al, font=f_reg, fill=(255, 230, 180))
-            y_pos += 70
-        y_pos += 20
-
-    # ── Weather icon + big temp ───────────────────────────────────────────────
-    draw_weather_icon(draw, wcode, 280, y_pos + 160, size=220)
-    draw.text((560, y_pos + 50), f"{temp}°C", font=f_huge, fill=(255, 255, 255))
-    draw.text((560, y_pos + 280), condition, font=f_large, fill=(180, 215, 255))
-    draw.text((560, y_pos + 380), f"Feels like {feels}°C", font=f_reg, fill=(140, 180, 230))
-    y_pos += 500
-
-    # H/L
-    draw.text((80, y_pos), f"H: {temp_max}°  L: {temp_min}°", font=f_med, fill=(200, 225, 255))
-    y_pos += 110
-
-    # ── Stats row ─────────────────────────────────────────────────────────────
-    draw.rectangle([(80, y_pos), (W - 80, y_pos + 2)], fill=(255, 255, 255, 40))
-    y_pos += 30
-
-    stats = [
-        (f"💧 {humidity}%",   "Humidity"),
-        (f"💨 {wind} km/h",   "Wind"),
-        (f"💥 {gusts} km/h",  "Gusts"),
-        (f"☀️ UV {uv}",       "UV Index"),
-        (f"☔ {precip_p}%",   "Rain Chance"),
-        (f"👁 {vis} km",      "Visibility"),
-    ]
-    col_w = (W - 160) // 3
-    for i, (val, label) in enumerate(stats):
-        cx = 80 + (i % 3) * col_w
-        cy = y_pos + (i // 3) * 130
-        draw.text((cx, cy),      val,   font=f_med, fill=(255, 255, 255))
-        draw.text((cx, cy + 75), label, font=f_xs,  fill=(140, 180, 230))
-    y_pos += 300
-
-    # ── Sunrise / Sunset ──────────────────────────────────────────────────────
-    draw.rectangle([(80, y_pos), (W - 80, y_pos + 2)], fill=(255, 255, 255, 40))
-    y_pos += 30
-    draw.text((80,      y_pos), f"🌅 Sunrise  {sunrise_str}", font=f_reg, fill=(255, 200, 100))
-    draw.text((W // 2,  y_pos), f"🌇 Sunset  {sunset_str}",  font=f_reg, fill=(255, 160, 80))
-    y_pos += 100
-
-    # ── Prayer times ──────────────────────────────────────────────────────────
+    # ── PRAYER TIMES (left of temp) + HIJRI (right of temp) ───────────────────
     if prayer_data:
-        draw.rectangle([(80, y_pos), (W - 80, y_pos + 2)], fill=(255, 255, 255, 40))
-        y_pos += 30
-        draw.text((80, y_pos), "🕌 Prayer Times — Malé", font=f_med, fill=(200, 225, 255))
-        y_pos += 90
-        prayers = [
-            ("Fajr",    prayer_data.get("fajr",    "")),
-            ("Dhuhr",   prayer_data.get("dhuhr",   "")),
-            ("Asr",     prayer_data.get("asr",     "")),
-            ("Maghrib", prayer_data.get("maghrib", "")),
-            ("Isha",    prayer_data.get("isha",    "")),
-        ]
-        col_w2 = (W - 160) // 3
-        for i, (name, time_val) in enumerate(prayers):
-            cx = 80 + (i % 3) * col_w2
-            cy = y_pos + (i // 3) * 120
-            draw.text((cx, cy),       name,     font=f_sm,  fill=(160, 200, 255))
-            draw.text((cx, cy + 55),  time_val, font=f_med, fill=(255, 255, 255))
-        y_pos += 280
+        prayers  = prayer_data.get("prayers", {})
+        h_day    = prayer_data.get("hijri_day", "")
+        h_month  = prayer_data.get("hijri_month", "")
+        h_year   = prayer_data.get("hijri_year", "")
+        sp_name  = prayer_data.get("special_name", "")
+        sp_desc  = prayer_data.get("special_desc", "")
+        reminder = prayer_data.get("reminder", None)
 
-    # ── Island watch ─────────────────────────────────────────────────────────
+        flank_y = temp_y + 30   # align with top of big temperature
+
+        # ── LEFT: Prayer times ────────────────────────────────────────────────
+        px = 90
+        py = flank_y
+        draw.text((px, py), "PRAYER TIMES", font=f_xs, fill=(255,220,100,210))
+        py += 60
+        prayer_order = ["Fajr","Dhuhr","Asr","Maghrib","Isha"]
+        for name in prayer_order:
+            draw.text((px, py), name, font=f_small, fill=(255,255,255,220))
+            t_val = prayers.get(name, "--:--")
+            tw_p = int(draw.textlength(t_val, font=f_small))
+            draw.text((px + 430 - tw_p, py), t_val, font=f_small, fill=(160,215,255,235))
+            py += 78
+
+        # ── RIGHT: Hijri calendar ─────────────────────────────────────────────
+        rx = W - 90 - 540   # right block left edge (room for long month names)
+        ry = flank_y
+        draw.text((rx, ry), "HIJRI CALENDAR", font=f_xs, fill=(255,220,100,210))
+        ry += 60
+        # Big day number
+        h_day_str = str(h_day)
+        draw.text((rx, ry), h_day_str, font=F(150, True), fill=(255,255,255,245))
+        ry += 165
+        # Month + year below the number
+        draw.text((rx, ry), h_month, font=f_med, fill=(255,255,255,215))
+        ry += 66
+        draw.text((rx, ry), f"{h_year} AH", font=f_body, fill=(200,225,255,165))
+        ry += 70
+
+        # Special day box (gold) OR Islamic reminder box (subtle teal)
+        if sp_name:
+            box_left  = rx
+            box_right = W - 80
+            box_w_px  = box_right - box_left
+            desc_lines = []
+            if sp_desc:
+                words = sp_desc.split()
+                cur = ""
+                for w in words:
+                    test = (cur + " " + w).strip()
+                    if draw.textlength(test, font=F(28)) <= box_w_px - 40:
+                        cur = test
+                    else:
+                        desc_lines.append(cur); cur = w
+                if cur: desc_lines.append(cur)
+            box_h = 56 + len(desc_lines)*38 + 30
+            draw.rounded_rectangle([(box_left, ry),(box_right, ry+box_h)],
+                                   radius=18, fill=(58,44,4,180))
+            draw.text((box_left+24, ry+18), sp_name, font=F(38,True), fill=(255,220,80,255))
+            dyy = ry + 70
+            for dl in desc_lines:
+                draw.text((box_left+24, dyy), dl, font=F(28), fill=(255,205,90,210))
+                dyy += 38
+        elif reminder:
+            # Islamic reminder box — subtle teal/blue accent
+            box_left  = rx
+            box_right = W - 80
+            box_w_px  = box_right - box_left
+            r_text = reminder.get("text", "")
+            r_src  = reminder.get("source", "")
+            # Wrap the reminder text
+            words = r_text.split()
+            lines = []
+            cur = ""
+            for w in words:
+                test = (cur + " " + w).strip()
+                if draw.textlength(test, font=F(30)) <= box_w_px - 40:
+                    cur = test
+                else:
+                    lines.append(cur); cur = w
+            if cur: lines.append(cur)
+            box_h = 50 + len(lines)*40 + 50
+            draw.rounded_rectangle([(box_left, ry),(box_right, ry+box_h)],
+                                   radius=18, fill=(10,40,55,170))
+            # Small header
+            draw.text((box_left+24, ry+16), "✦ DAILY REMINDER", font=F(24,True), fill=(120,200,220,220))
+            dyy = ry + 56
+            for ln in lines:
+                draw.text((box_left+24, dyy), ln, font=F(30), fill=(220,240,250,225))
+                dyy += 40
+            # Source
+            draw.text((box_left+24, dyy+4), f"— {r_src}", font=F(26), fill=(150,200,220,190))
+
+    # ── CONDITION ─────────────────────────────────────────────────────────────
+    cond_y = temp_y + 440
+    ccw = draw.textlength(condition, font=f_huge)
+    draw.text(((W-ccw)//2, cond_y), condition, font=f_huge, fill=(255,255,255,200))
+
+    # ── H / L ─────────────────────────────────────────────────────────────────
+    hl_y = cond_y + 130
+    hl_str = f"H:{temp_max}°   L:{temp_min}°"
+    hlw = draw.textlength(hl_str, font=f_med)
+    draw.text(((W-hlw)//2, hl_y), hl_str, font=f_med, fill=(255,255,255,180))
+
+    # Alert text — wrapped, below H/L (full detail is also in the caption)
+    if alert_mode and alert_text:
+        acol = (255,140,140,255)
+        if alert_level in MMS_ALERT_LEVELS:
+            c = MMS_ALERT_LEVELS[alert_level]["color"]
+            acol = (min(255,c[0]+40), min(255,c[1]+40), min(255,c[2]+40), 255)
+        # Wrap alert text
+        words = alert_text.split()
+        lines = []; cur = ""
+        for w in words:
+            test = (cur + " " + w).strip()
+            if draw.textlength(test, font=f_body) <= W - 200:
+                cur = test
+            else:
+                lines.append(cur); cur = w
+        if cur: lines.append(cur)
+        ay = hl_y + 80
+        for ln in lines[:3]:
+            lw_a = draw.textlength(ln, font=f_body)
+            draw.text(((W-lw_a)//2, ay), ln, font=f_body, fill=acol)
+            ay += 56
+        hl_y = ay - 80  # push details down below the alert text
+
+    # ── DETAILS — 3 rows ──────────────────────────────────────────────────────
+    dy = hl_y + 90
+    def centred(text, font, color, y):
+        w = draw.textlength(text, font=font)
+        draw.text(((W-w)//2, y), text, font=font, fill=color)
+
+    row1 = f"Feels {feels}°   Humidity {humidity}%   Wind {wind} km/h"
+    if gusts and gusts > wind: row1 += f" (gusts {gusts})"
+    centred(row1, f_med, (255,255,255,175), dy); dy += 70
+
+    row2_parts = []
+    if uv:       row2_parts.append(f"UV {uv}")
+    if vis:      row2_parts.append(f"Visibility {vis} km")
+    if dew:      row2_parts.append(f"Dew {dew}°")
+    if pressure: row2_parts.append(f"Pressure {pressure} hPa")
+    if row2_parts:
+        centred("   ".join(row2_parts), f_body, (255,255,255,145), dy); dy += 60
+
+    sun_str = f"Sunrise {sunrise_str}   Sunset {sunset_str}"
+    if precip_p: sun_str += f"   Rain {precip_p}%"
+    centred(sun_str, f_body, (255,220,100,200), dy); dy += 50
+
+    # ── THIN DIVIDER ──────────────────────────────────────────────────────────
+    div1 = dy + 20
+    draw.line([(80,div1),(W-80,div1)], fill=(255,255,255,35), width=2)
+
+    # ── SEA & WIND CONDITION SECTION (Maldives-specific) ─────────────────────
+    sea_y = div1 + 50
+    # Section label
+    sea_hdr = "SEA & WIND CONDITIONS"
+    shw = draw.textlength(sea_hdr, font=f_small)
+    draw.text(((W-shw)//2, sea_y), sea_hdr, font=f_small, fill=(255,220,100,220))
+    sea_y += 80
+
+    # Three columns: wind | sea state | advice
+    col_w = W // 3
+    # Wind column
+    draw.text((col_w*0 + 80, sea_y), "WIND", font=f_xs, fill=(255,255,255,120))
+    wind_val = f"{wind} km/h"
+    draw.text((col_w*0 + 80, sea_y+40), wind_val, font=f_small, fill=(255,255,255,230))
+    if gusts > wind:
+        draw.text((col_w*0 + 80, sea_y+100), f"Gusts {gusts} km/h", font=f_body, fill=(255,200,100,180))
+
+    # Sea state column — centred
+    sl_w = draw.textlength(sea_label, font=f_small)
+    draw.text(((W-sl_w)//2, sea_y+40), sea_label, font=f_small, fill=(255,255,255,230))
+    adv_w = draw.textlength(sea_advice, font=f_body)
+    draw.text(((W-adv_w)//2, sea_y+100), sea_advice, font=f_body, fill=(200,230,255,170))
+
+    # UV + Visibility column — right
+    draw.text((col_w*2 + 80, sea_y), "UV INDEX", font=f_xs, fill=(255,255,255,120))
+    uv_col = "Low" if uv<=2 else "Moderate" if uv<=5 else "High" if uv<=7 else "Very High"
+    draw.text((col_w*2 + 80, sea_y+40), f"{uv} — {uv_col}", font=f_small, fill=(255,255,255,230))
+    draw.text((col_w*2 + 80, sea_y+100), f"Vis {vis} km", font=f_body, fill=(200,230,255,170))
+
+    sea_y += 160
+    div2 = sea_y + 10
+    draw.line([(80,div2),(W-80,div2)], fill=(255,255,255,35), width=2)
+    div3 = div2
+
+    # ── HOURLY STRIP — next 8 hours ───────────────────────────────────────────
+    hourly_y = div3 + 40
+    now_hour = mvt.hour
+    slot_w = (W - 160) // 8
+    displayed = 0
+
+    for h_str, ht, hc, hp in zip(hours, temps, codes, precip):
+        try:
+            h_hour = int(h_str.split("T")[1][:2])
+        except:
+            continue
+        if h_hour < now_hour: continue
+        if displayed >= 8: break
+
+        hx = 80 + displayed * slot_w + slot_w // 2
+
+        # Hour label
+        h_label = "Now" if displayed == 0 else f"{h_hour:02d}:00"
+        hlw2 = draw.textlength(h_label, font=f_tiny)
+        draw.text((hx-hlw2//2, hourly_y), h_label, font=f_tiny, fill=(255,255,255,160))
+
+        # Icon
+        draw_weather_icon(draw, hc, hx, hourly_y+75, size=78)
+
+        # Temp
+        ht_str = f"{round(ht)}°"
+        htw = draw.textlength(ht_str, font=f_small)
+        draw.text((hx-htw//2, hourly_y+140), ht_str, font=f_small, fill=(255,255,255,255))
+
+        # Rain %
+        if hp and hp > 0:
+            hp_str = f"{hp}%"
+            hpw = draw.textlength(hp_str, font=f_tiny)
+            draw.text((hx-hpw//2, hourly_y+200), hp_str, font=f_tiny, fill=(120,200,255,200))
+
+        displayed += 1
+
+    div3 = hourly_y + 260
+    draw.line([(80,div3),(W-80,div3)], fill=(255,255,255,35), width=2)
+
+    # ── ISLAND WATCH STRIP ────────────────────────────────────────────────────
     if island_data:
-        draw.rectangle([(80, y_pos), (W - 80, y_pos + 2)], fill=(255, 255, 255, 40))
-        y_pos += 30
-        draw.text((80, y_pos), "🏝️ Island Watch", font=f_med, fill=(200, 225, 255))
-        y_pos += 90
-        col_w3 = (W - 160) // 3
-        for i, isl in enumerate(island_data[:6]):
-            cx  = 80 + (i % 3) * col_w3
-            cy  = y_pos + (i // 3) * 160
-            ie, _ = weather_code_to_info(isl.get("wmo", 0))
-            draw.text((cx, cy),        isl["name"],                    font=f_sm,  fill=(160, 200, 255))
-            draw.text((cx, cy + 55),   f"{ie} {isl.get('temp',29)}°C", font=f_med, fill=(255, 255, 255))
-            draw.text((cx, cy + 115),  f"💨 {isl.get('wind',0)} km/h", font=f_xs,  fill=(140, 180, 230))
-        y_pos += 360
+        iw_y = div3 + 50
 
-    # ── Footer ────────────────────────────────────────────────────────────────
-    draw.rectangle([(0, H - 100), (W, H)], fill=(3, 12, 30))
-    draw.rectangle([(0, H - 100), (W, H - 97)], fill=accent)
-    draw.text((80, H - 72), "📡 Samuga Media  |  @samugacommunity", font=f_sm, fill=(180, 210, 255))
-    src_tag = f"Data: {source}"
-    draw.text((W - 500, H - 72), src_tag, font=f_xs, fill=(120, 160, 210))
+        iw_hdr = "WEATHER WATCH — MALDIVES"
+        ihw = draw.textlength(iw_hdr, font=f_small)
+        draw.text(((W-ihw)//2, iw_y), iw_hdr, font=f_small, fill=(255,220,100,225))
+        iw_y += 90
+
+        for isl in island_data:
+            iname = isl["name"]
+            iout  = isl["outlook"]
+            itemp = isl.get("temp", 29)
+
+            # Name left, temp right
+            draw.text((90, iw_y), iname, font=f_small, fill=(255,255,255,230))
+            ts2 = f"{itemp}°C"
+            tw3 = int(draw.textlength(ts2, font=f_small))
+            draw.text((W-90-tw3, iw_y), ts2, font=f_small, fill=(160,215,255,210))
+            # Outlook below
+            draw.text((90, iw_y+58), iout, font=f_body, fill=(200,225,255,165))
+
+            # Subtle row separator
+            draw.line([(90, iw_y+108),(W-90, iw_y+108)], fill=(255,255,255,18), width=1)
+            iw_y += 118
+
+        div4 = iw_y + 20
+        draw.line([(80,div4),(W-80,div4)], fill=(255,255,255,30), width=2)
+        bottom_start = div4
+    else:
+        bottom_start = div3
+
+    # ── BOTTOM BAR ────────────────────────────────────────────────────────────
+    bar_y = H - 160
+    # Semi-transparent dark strip
+    bar_overlay = Image.new("RGBA", (W, 160), (0,0,0,80))
+    img.paste(Image.new("RGB",(W,160),(0,0,0)), (0,bar_y),
+              Image.new("L",(W,160), 80))
+    draw = ImageDraw.Draw(img, "RGBA")
+
+    time_str = mvt.strftime("%A, %d %B %Y  •  %H:%M MVT")
+    tfw = draw.textlength(time_str, font=f_xs)
+    draw.text(((W-tfw)//2, bar_y+18), time_str, font=f_xs, fill=(255,255,255,120))
+
+    brand = "Samuga Media  |  @samugacommunity"
+    bw3 = draw.textlength(brand, font=f_small)
+    draw.text(((W-bw3)//2, bar_y+62), brand, font=f_small, fill=(255,255,255,210))
+
+    if source:
+        src_txt = f"Data: {source}"
+        stw2 = draw.textlength(src_txt, font=f_xxs)
+        draw.text((W-stw2-80, bar_y+128), src_txt, font=f_xxs, fill=(255,255,255,80))
 
     buf = io.BytesIO()
-    img.save(buf, format="PNG", quality=95)
+    img.convert("RGB").save(buf, format="PNG")
     buf.seek(0)
     return buf
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MMS Alert system
-# ═══════════════════════════════════════════════════════════════════════════════
-
-weather_alerts_today = {"date": None, "count": 0}
-
-MMS_ALERT_LEVELS = {
-    "white": {
-        "emoji": "⚪",
-        "label": "White Alert",
-        "headline": "Strong Winds & Rough Seas",
-        "wind_min": 28, "gust_min": 45,
-        "color": (220, 220, 220),
-    },
-    "yellow": {
-        "emoji": "🟡",
-        "label": "Yellow Alert",
-        "headline": "Thunderstorms & Rough Seas",
-        "wind_min": 38, "gust_min": 60,
-        "color": (255, 200, 0),
-    },
-    "orange": {
-        "emoji": "🟠",
-        "label": "Orange Alert",
-        "headline": "Severe Winds & Very Rough Seas",
-        "wind_min": 50, "gust_min": 75,
-        "color": (255, 120, 0),
-    },
-    "red": {
-        "emoji": "🔴",
-        "label": "Red Alert",
-        "headline": "Dangerous Storm Conditions",
-        "wind_min": 70, "gust_min": 95,
-        "color": (220, 40, 40),
-    },
-}
 
 def can_send_weather_alert():
     """Max 2 MMS alerts per day."""
