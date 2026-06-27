@@ -4404,7 +4404,8 @@ def handle_updates():
                                     if islands:
                                         island_lines = "\n\n🏝 <b>Weather Watch</b>\n"
                                         for isl in islands:
-                                            island_lines += f"📍 <b>{isl['name']}</b> — {isl['outlook']}\n"
+                                            _out = isl.get("outlook") or f"{isl.get('temp',29)}°C • wind {isl.get('wind',0)} km/h"
+                                            island_lines += f"📍 <b>{isl['name']}</b> — {_out}\n"
                                     caption = (
                                         f"🌤️ <b>Weather Preview — Malé, Maldives</b>\n"
                                         f"{emoji} {temp}°C — {condition}"

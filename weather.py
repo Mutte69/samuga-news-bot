@@ -334,84 +334,181 @@ def get_weather_data():
 # Island forecasts
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+def generate_outlook(hourly_slots, mvt_now_dt):
+    """
+    Convert the next 12 hours into a short island outlook line.
+    Supports Tomorrow.io hourly slots and simple normalized fallback slots.
+    """
+    SEVERITY = {
+        95:5, 96:5, 99:5,
+        65:4, 82:4,
+        63:3, 61:3, 80:3, 81:3,
+        51:2, 53:2, 55:2,
+        45:1, 48:1,
+        3:0, 2:0, 1:0, 0:0,
+    }
+
+    def sev(code): return SEVERITY.get(int(code or 0), 0)
+
+    def label(code):
+        code = int(code or 0)
+        if code in [95,96,99]: return "Thunderstorms"
+        if code in [65,82]: return "Heavy showers"
+        if code in [63,61,80,81]: return "Rain showers"
+        if code in [51,53,55]: return "Light rain"
+        if code in [45,48]: return "Foggy conditions"
+        if code == 3: return "Cloudy skies"
+        if code in [1,2]: return "Partly cloudy"
+        return "Sunny"
+
+    entries = []
+    for slot in (hourly_slots or [])[:12]:
+        try:
+            if isinstance(slot, dict) and "values" in slot:
+                dt = datetime.fromisoformat(str(slot.get("time","")).replace("Z","+00:00")) + timedelta(hours=5)
+                vals = slot.get("values", {})
+                code = _tomorrow_code_to_wmo(vals.get("weatherCode", 1000))
+                precip = int(vals.get("precipitationProbability", 0) or 0)
+            else:
+                dt = slot.get("dt")
+                code = int(slot.get("code", 0) or 0)
+                precip = int(slot.get("precip", 0) or 0)
+            hour = dt.hour if hasattr(dt, "hour") else mvt_now_dt.hour
+            entries.append((hour, code, precip))
+        except Exception:
+            continue
+
+    if not entries:
+        return "Weather data unavailable"
+
+    worst_h, worst_code, worst_precip = max(entries, key=lambda e: (sev(e[1]), e[2]))
+    if sev(worst_code) == 0:
+        codes = [e[1] for e in entries]
+        if all(c == 0 for c in codes): return "Sunny all day"
+        if all(c in [0,1,2] for c in codes): return "Sunny with some clouds"
+        if all(c in [0,1,2,3] for c in codes): return "Mostly cloudy"
+        return "Partly cloudy"
+
+    desc = label(worst_code)
+    if worst_h < 6: time_hint = "overnight"
+    elif worst_h < 9: time_hint = "early morning"
+    elif worst_h < 12: time_hint = "this morning"
+    elif worst_h < 15: time_hint = "this afternoon"
+    elif worst_h < 18: time_hint = f"after {worst_h - 12} PM"
+    elif worst_h < 21: time_hint = "this evening"
+    else: time_hint = "tonight"
+    return f"{desc} {time_hint}"
+
+
 def _island_openmeteo_fallback(island, mvt_now_dt):
-    """Open-Meteo fallback for a single island."""
+    """Open-Meteo fallback for a single island with simple 12-hour outlook."""
     try:
-        url = (f"https://api.open-meteo.com/v1/forecast"
-               f"?latitude={island['lat']}&longitude={island['lon']}"
-               f"&current=temperature_2m,weathercode,windspeed_10m"
-               f"&timezone=Indian%2FMaldives&forecast_days=1")
+        url = (
+            f"https://api.open-meteo.com/v1/forecast"
+            f"?latitude={island['lat']}&longitude={island['lon']}"
+            f"&current=temperature_2m,weathercode,windspeed_10m"
+            f"&hourly=weathercode,precipitation_probability"
+            f"&timezone=Indian%2FMaldives&forecast_days=1"
+        )
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
-            c = resp.json().get("current", {})
-            wmo = c.get("weathercode", 3)
+            j = resp.json()
+            c = j.get("current", {})
+            hourly = j.get("hourly", {})
+            times = hourly.get("time", [])[:12]
+            codes = hourly.get("weathercode", [])[:12]
+            precips = hourly.get("precipitation_probability", [])[:12]
+            slots = []
+            for t, code, precip in zip(times, codes, precips):
+                try:
+                    dt = datetime.fromisoformat(str(t))
+                except Exception:
+                    dt = mvt_now_dt
+                slots.append({"dt": dt, "code": int(code or 0), "precip": int(precip or 0)})
             return {
-                "name":    island["name"],
-                "temp":    round(c.get("temperature_2m", 29)),
-                "wmo":     wmo,
-                "wind":    round(c.get("windspeed_10m", 0)),
-                "source":  "Open-Meteo",
+                "name": island["name"],
+                "temp": round(c.get("temperature_2m", 29)),
+                "wmo": int(c.get("weathercode", 3) or 3),
+                "wind": round(c.get("windspeed_10m", 0)),
+                "source": "Open-Meteo",
+                "outlook": generate_outlook(slots, mvt_now_dt),
             }
     except Exception as e:
         log.debug(f"Island fallback {island['name']}: {e}")
-    return None
+    return {
+        "name": island["name"],
+        "temp": 29,
+        "wmo": 3,
+        "wind": 0,
+        "source": "Fallback",
+        "outlook": "Weather data unavailable",
+    }
 
 def get_island_forecasts():
-    """Fetch current conditions for all 5 Maldivian island locations."""
-    import threading as _th
-    results = {}
-    lock    = _th.Lock()
-
+    """
+    Fetch current conditions for all 5 islands.
+    Primary: Tomorrow.io realtime + forecast.
+    Fallback: Open-Meteo with hourly outlook.
+    Returns list of dicts with keys: name, temp, wmo, wind, source, outlook
+    """
+    results = []
     from datetime import timezone as _tz
     mvt_now_dt = datetime.now(_tz.utc) + timedelta(hours=5)
 
-    def _fetch_one(island):
+    for island in ISLAND_LOCATIONS:
+        if not TOMORROW_API_KEY:
+            results.append(_island_openmeteo_fallback(island, mvt_now_dt))
+            continue
         try:
-            data = None
-            if TOMORROW_API_KEY:
-                try:
-                    rt = requests.get(
-                        "https://api.tomorrow.io/v4/weather/realtime",
-                        params={"location": f"{island['lat']},{island['lon']}",
-                                "fields": "temperature,weatherCode,windSpeed",
-                                "units": "metric",
-                                "apikey": TOMORROW_API_KEY},
-                        timeout=10)
-                    if rt.status_code == 200:
-                        rv  = rt.json().get("data", {}).get("values", {})
-                        wmo = _tomorrow_code_to_wmo(rv.get("weatherCode", 1000))
-                        data = {
-                            "name":   island["name"],
-                            "temp":   round(rv.get("temperature", 29)),
-                            "wmo":    wmo,
-                            "wind":   round(rv.get("windSpeed", 0)),
-                            "source": "Tomorrow.io",
-                        }
-                except Exception:
-                    pass
-            if not data:
-                data = _island_openmeteo_fallback(island, mvt_now_dt)
-            if data:
-                with lock:
-                    results[island["name"]] = data
-        except Exception as e:
-            log.debug(f"Island fetch {island['name']}: {e}")
+            base = "https://api.tomorrow.io/v4/weather"
+            params = {"location": f"{island['lat']},{island['lon']}", "units": "metric", "apikey": TOMORROW_API_KEY}
 
-    threads = [_th.Thread(target=_fetch_one, args=(isl,), daemon=True)
-               for isl in ISLAND_LOCATIONS]
-    for t in threads: t.start()
-    for t in threads: t.join(timeout=15)
+            rt = requests.get(
+                f"{base}/realtime",
+                params={**params, "fields": "temperature,weatherCode,windSpeed"},
+                timeout=12
+            )
+            fc = requests.get(
+                f"{base}/forecast",
+                params={**params, "fields": "temperature,weatherCode,windSpeed,precipitationProbability", "timesteps": "1h"},
+                timeout=12
+            )
+
+            if rt.status_code != 200 or fc.status_code != 200:
+                log.warning(f"Island {island['name']}: Tomorrow.io {rt.status_code}/{fc.status_code} — Open-Meteo fallback")
+                results.append(_island_openmeteo_fallback(island, mvt_now_dt))
+                continue
+
+            rv = rt.json().get("data", {}).get("values", {})
+            fd = fc.json()
+            outlook = generate_outlook((fd.get("timelines", {}) or {}).get("hourly", [])[:12], mvt_now_dt)
+
+            results.append({
+                "name": island["name"],
+                "temp": round(rv.get("temperature", 29)),
+                "wmo": _tomorrow_code_to_wmo(rv.get("weatherCode", 1000)),
+                "wind": round(rv.get("windSpeed", 0)),
+                "source": "Tomorrow.io",
+                "outlook": outlook,
+            })
+            log.info(f"🏝️ {island['name']}: {round(rv.get('temperature',29))}°C — {outlook}")
+        except Exception as e:
+            log.warning(f"Island forecast {island['name']}: {e} — Open-Meteo fallback")
+            results.append(_island_openmeteo_fallback(island, mvt_now_dt))
 
     ordered = []
+    by_name = {r["name"]: r for r in results if r}
     for isl in ISLAND_LOCATIONS:
-        if isl["name"] in results:
-            ordered.append(results[isl["name"]])
+        if isl["name"] in by_name:
+            ordered.append(by_name[isl["name"]])
     log.info(f"🏝️ Island forecasts: {len(ordered)}/{len(ISLAND_LOCATIONS)} fetched")
     return ordered if ordered else None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Weather card generator — full Samuga branded card
+
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def generate_weather_card(weather_data, alert_mode=False, alert_text="",

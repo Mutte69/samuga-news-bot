@@ -1,3 +1,4 @@
+from urllib.parse import urlparse, parse_qs
 """
 db.py — Samuga AI Database Module
 Extracted from bot.py v7.0
@@ -534,18 +535,54 @@ def db_unhide_article(identifier):
     return rows or []
 
 def db_delete_article_by_url(url):
-    """Hide a website article using its public URL by extracting the trailing slug."""
+    """
+    Hide a website article using its public URL.
+
+    Supports:
+    - pretty slug URLs
+    - article.html?id=ARTICLE_ID links
+    - raw slug pasted from the website
+    """
     if not DB_ENABLED or not url:
         return []
     try:
-        slug = str(url).strip().rstrip("/").split("/")[-1].strip()
-        if not slug:
-            return []
-        rows = db_execute(
-            "UPDATE articles SET status='hidden' WHERE article_slug=%s OR id=%s RETURNING id, title, article_slug",
-            (slug, slug), fetch="all"
-        )
-        return rows or []
+        raw = str(url).strip()
+        parsed = urlparse(raw)
+        path_last = (parsed.path or "").rstrip("/").split("/")[-1].strip()
+        qs = parse_qs(parsed.query or "")
+        article_id = (qs.get("id") or [""])[0].strip()
+
+        candidates = []
+        for x in [article_id, path_last, raw]:
+            if x and x not in candidates:
+                candidates.append(x)
+
+        # Try direct ID / slug match first
+        for cand in candidates:
+            rows = db_execute(
+                "UPDATE articles SET status='hidden' WHERE id=%s OR article_slug=%s RETURNING id, title, article_slug",
+                (cand, cand), fetch="all"
+            )
+            if rows:
+                return rows
+
+        # article.html links often use ?id=... while slug is different; fetch by id then hide related variant too
+        if article_id:
+            rows = db_execute(
+                """
+                UPDATE articles
+                SET status='hidden'
+                WHERE id=%s
+                   OR id=%s
+                   OR article_slug=(SELECT article_slug FROM articles WHERE id=%s LIMIT 1)
+                RETURNING id, title, article_slug
+                """,
+                (article_id, f"{article_id}_dv", article_id), fetch="all"
+            )
+            if rows:
+                return rows
+
+        return []
     except Exception:
         return []
 
