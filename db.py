@@ -513,6 +513,26 @@ def db_set_article_matchkey(article_id, title):
         db_execute("UPDATE articles SET match_key=%s WHERE id=%s", (mk, article_id))
 
 
+def db_hide_article(identifier):
+    """Hide a website article by id or article_slug."""
+    if not DB_ENABLED or not identifier:
+        return False
+    rows = db_execute(
+        "UPDATE articles SET status='hidden' WHERE id=%s OR article_slug=%s RETURNING id, title",
+        (identifier, identifier), fetch="all"
+    )
+    return rows or []
+
+def db_unhide_article(identifier):
+    """Restore a hidden website article by id or article_slug."""
+    if not DB_ENABLED or not identifier:
+        return False
+    rows = db_execute(
+        "UPDATE articles SET status='posted' WHERE (id=%s OR article_slug=%s) AND status='hidden' RETURNING id, title",
+        (identifier, identifier), fetch="all"
+    )
+    return rows or []
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Website article engine
 # ═══════════════════════════════════════════════════════════════════════════════

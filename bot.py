@@ -59,6 +59,7 @@ from db import (
     init_database, db_execute, db_record_article, db_mark_status,
     db_publish_article_for_website, db_log_learning,
     db_set_article_message, db_set_article_matchkey,
+    db_hide_article, db_unhide_article,
     kv_get, kv_set, mem_add, mem_list, mem_clear_all, mem_delete_last,
     detect_trends, is_trending_topic, find_or_create_story,
     get_story_timeline, search_stories, get_active_stories,
@@ -800,6 +801,17 @@ def contentlab_candidate_is_safe(title="", summary="", source="", lang="en"):
         return False, "samuga internal short text"
     return True, ""
 
+
+def should_publish_dhivehi_to_website(item=None, approved=False):
+    """
+    Dhivehi must never appear on the website unless a human approved it.
+    For safety, approved Dhivehi website publishing stays OFF unless
+    DHIVEHI_WEBSITE_APPROVED=true is set in Railway.
+    """
+    if not approved:
+        return False
+    return os.environ.get("DHIVEHI_WEBSITE_APPROVED", "false").lower() == "true"
+
 def story_signal_key(title="", summary="", lang="en"):
     """
     Normalize a story into a stable English-ish key so Dhivehi/Latin variants
@@ -1088,16 +1100,19 @@ def _social_queue_worker():
                         log.info(f"[QUEUE] Telegram: {'✅' if tg_ok else '❌'}")
                         if tg_ok and item.get("article_id"):
                             try:
-                                db_publish_article_for_website(
-                                    article_id=item.get("article_id"),
-                                    title=item.get("title",""),
-                                    summary=item.get("summary",""),
-                                    category=item.get("cat","LOCAL"),
-                                    source=item.get("source","Samuga Media"),
-                                    link=item.get("link",""),
-                                    lang=item.get("lang","en"),
-                                    is_breaking=item.get("is_breaking", False)
-                                )
+                                if item.get("lang","en") != "dv" or should_publish_dhivehi_to_website(item, approved=True):
+                                    db_publish_article_for_website(
+                                        article_id=item.get("article_id"),
+                                        title=item.get("title",""),
+                                        summary=item.get("summary",""),
+                                        category=item.get("cat","LOCAL"),
+                                        source=item.get("source","Samuga Media"),
+                                        link=item.get("link",""),
+                                        lang=item.get("lang","en"),
+                                        is_breaking=item.get("is_breaking", False)
+                                    )
+                                else:
+                                    log.info(f"🌐 Dhivehi website sync skipped (approval-only policy): {item.get('title','')[:70]}")
                                 if isinstance(tg_ok, int):
                                     db_set_article_message(item.get("article_id"), tg_ok)
                                 if item.get("title"):
@@ -1168,7 +1183,7 @@ def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=Non
             send_text(notify_chat_id, "🚫 Post blocked by placeholder safety gate. It was not queued.", thread_id=notify_thread_id)
         return False
 
-    if article_id:
+    if article_id and (lang != "dv"):
         try:
             db_publish_article_for_website(
                 article_id=article_id, title=title, summary=summary, category=cat,
@@ -1419,11 +1434,15 @@ def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_
     if tg_ok:
         remember_post(title, cat, ts)
         if article_id:
-            db_publish_article_for_website(
-                article_id=article_id, title=title, summary=summary, category=cat,
-                source=SAMUGA_PUBLIC_SOURCE, link=SAMUGA_PUBLIC_LINK, lang=("dv" if is_dhivehi(title + " " + summary) else "en"),
-                is_breaking=is_breaking_flag
-            )
+            _lang_for_web = ("dv" if is_dhivehi(title + " " + summary) else "en")
+            if _lang_for_web != "dv" or should_publish_dhivehi_to_website(None, approved=True):
+                db_publish_article_for_website(
+                    article_id=article_id, title=title, summary=summary, category=cat,
+                    source=SAMUGA_PUBLIC_SOURCE, link=SAMUGA_PUBLIC_LINK, lang=_lang_for_web,
+                    is_breaking=is_breaking_flag
+                )
+            else:
+                log.info(f"🌐 Dhivehi website publish skipped (approval-only policy): {str(title)[:70]}")
         if isinstance(tg_ok, int) and article_id:        # Phase 2: store msg id
             db_set_article_message(article_id, tg_ok)
         if article_id:                                    # Phase 2.5: store match key for FB/IG
@@ -3617,6 +3636,26 @@ def handle_updates():
                             else:
                                 send_text(chat_id, f"Key <code>{key}</code> not found — maybe already posted or rejected.", reply_to=msg_id, thread_id=thread_id)
 
+                        # /hide <article_id_or_slug> — remove a website article fast
+                        elif text.strip().lower().startswith("/hide "):
+                            ident = text.strip()[6:].strip()
+                            rows = db_hide_article(ident)
+                            if rows:
+                                joined = "\n".join([f"• <code>{rid}</code> — {ttl[:70]}" for rid, ttl in rows[:5]])
+                                send_text(chat_id, f"🙈 <b>Hidden from website</b>\n\n{joined}", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                send_text(chat_id, f"⚠️ No website article found for <code>{ident}</code>", reply_to=msg_id, thread_id=thread_id)
+
+                        # /unhide <article_id_or_slug> — restore hidden article
+                        elif text.strip().lower().startswith("/unhide "):
+                            ident = text.strip()[8:].strip()
+                            rows = db_unhide_article(ident)
+                            if rows:
+                                joined = "\n".join([f"• <code>{rid}</code> — {ttl[:70]}" for rid, ttl in rows[:5]])
+                                send_text(chat_id, f"👀 <b>Restored on website</b>\n\n{joined}", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                send_text(chat_id, f"⚠️ No hidden website article found for <code>{ident}</code>", reply_to=msg_id, thread_id=thread_id)
+
                         # /buffercheck — test imgbb + Buffer connection live
                         elif text.strip().lower() in ["/buffercheck", "/socialcheck", "/checkbuffer"]:
                             send_text(chat_id, "🔍 Testing imgbb + Buffer connection... ⏳",
@@ -3769,6 +3808,7 @@ def handle_updates():
                                             lines.append(f"  ❌ @{ch.get('handle','?')} / {ch['source']}: {str(ce)[:30]}")
                                     # 5. Queue state
                                     lines.append("\n🧠 <b>Queue guards:</b> duplicate translation wall + internal/junk safety wall active")
+                                    lines.append("🌐 <b>Dhivehi website rule:</b> no Dhivehi website publish without Content Lab approval")
                                     dv_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="dv")
                                     en_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="en")
                                     lines.append(f"\n📋 <b>Approval queue:</b> {dv_queued} Dhivehi, {en_queued} English waiting")

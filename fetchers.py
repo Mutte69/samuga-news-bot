@@ -173,12 +173,33 @@ DV_TELEGRAM_CHANNELS = [
 MVCRISIS_AD_MARKERS = [
     "hire", "rent", "for sale", "available", "booking", "book now", "contact",
     "call now", "whatsapp", "viber", "discount", "offer", "promo", "cheap",
-    "price", "mvr ", "rufiyaa ", "delivery", "order now", "dm ", "inbox",
-    "trip", "package", "tour", "charter", "ferry service", "speedboat",
-    "submarine", "diving", "snorkeling", "fishing trip", "safari", "liveaboard",
-    "accommodation", "guesthouse", "room available", "bed available",
-    "apply now", "vacancy", "hiring", "wanted", "looking for", "job opening",
+    "delivery", "order now", "dm ", "inbox", "trip", "package", "tour", "charter",
+    "ferry service", "speedboat", "submarine", "diving", "snorkeling", "fishing trip",
+    "safari", "liveaboard", "accommodation", "guesthouse", "room available",
+    "bed available", "apply now", "vacancy", "hiring", "wanted", "looking for",
+    "job opening", "menu", "beef", "chicken", "burger", "pizza", "fries",
+    "instagram", "foodies", "dhigrab", "avas food", "yummo"
 ]
+
+_AD_PLATFORM_MARKERS = ["instagram", "viber", "whatsapp", "telegram", "tiktok", "foodies", "dhigrab", "eeezap"]
+_AD_MENU_MARKERS = ["beef", "chicken", "burger", "pizza", "fries", "pulled beef", "mustard chicken", "pepper beef", "honey sriracha"]
+
+def _looks_like_mvcrisis_ad(text):
+    """Source-specific ad filter for MvCrisis promos, menus, jobs and commerce spam."""
+    t = strip_source_links(str(text or "")).lower()
+    if not t:
+        return False
+    if any(m in t for m in MVCRISIS_AD_MARKERS):
+        return True
+    if re.search(r"(mvr|rf|rufiyaa)\s*\d{1,5}|\d{1,5}\s*(mvr|rf)", t):
+        return True
+    if sum(1 for m in _AD_PLATFORM_MARKERS if m in t) >= 2:
+        return True
+    if sum(1 for m in _AD_MENU_MARKERS if m in t) >= 2:
+        return True
+    if (t.count("•") >= 2 or t.count("·") >= 2 or t.count(",") >= 5) and any(m in t for m in _AD_MENU_MARKERS + _AD_PLATFORM_MARKERS):
+        return True
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -254,9 +275,11 @@ def _html_unescape(text):
     except Exception:
         return str(text or "")
 
-def _looks_like_ad(text):
-    """Return True if text looks like an ad, promo, or job listing."""
-    t = text.lower()
+def _looks_like_ad(text, source=""):
+    """Return True if text looks like an ad, promo, menu, or job listing."""
+    t = strip_source_links(str(text or "")).lower()
+    if (source or "").lower() == "mvcrisis":
+        return _looks_like_mvcrisis_ad(t)
     return any(marker in t for marker in MVCRISIS_AD_MARKERS)
 
 def is_fresh(entry, hours=3):
@@ -347,7 +370,7 @@ def fetch_mvcrisis():
         for text, published in _extract_telegram_messages(resp.text, limit=15):
             if len(text) < 25:
                 continue
-            if _looks_like_ad(text):
+            if _looks_like_ad(text, source="MvCrisis"):
                 skipped_ads += 1
                 continue
             art_id = "mvc_" + hashlib.md5((text[:80] + str(published)).encode()).hexdigest()[:10]
@@ -380,7 +403,7 @@ def fetch_dv_telegram(handle, source, reliability=80):
         for text, published in _extract_telegram_messages(resp.text, limit=12):
             if len(text) < 20:
                 continue
-            if _looks_like_ad(text):
+            if _looks_like_ad(text, source=source):
                 continue
             if (_utcnow() - published).total_seconds() > 12 * 3600:
                 continue
