@@ -59,7 +59,7 @@ from db import (
     init_database, db_execute, db_record_article, db_mark_status,
     db_publish_article_for_website, db_log_learning,
     db_set_article_message, db_set_article_matchkey,
-    db_hide_article, db_unhide_article, db_hide_all_dhivehi,
+    db_hide_article, db_unhide_article, db_delete_article_by_url, db_hide_all_dhivehi, db_unhide_all_dhivehi, db_bot_stats,
     kv_get, kv_set, mem_add, mem_list, mem_clear_all, mem_delete_last,
     detect_trends, is_trending_topic, find_or_create_story,
     get_story_timeline, search_stories, get_active_stories,
@@ -687,6 +687,24 @@ def send_text(chat_id, text, reply_to=None, thread_id=None):
     try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",json=payload,timeout=15)
     except Exception as e: log.error(f"Send text: {e}")
 
+_ops_last_alerts = {}
+website_banner = {"active": False, "text": "", "image_url": "", "updated_at": None}
+
+def alert_admin(message, dedupe_key=None, cooloff_minutes=20):
+    """Send an operational alert into the Alert thread without spamming duplicates."""
+    try:
+        key = dedupe_key or _caption_match_key(message) or str(hash(message))
+        now = utcnow()
+        last = _ops_last_alerts.get(key)
+        if last and (now - last).total_seconds() < cooloff_minutes * 60:
+            return False
+        _ops_last_alerts[key] = now
+        send_text(CORE_TEAM_CHAT_ID, f"⚠️ <b>Samuga Ops Alert</b>\n\n{message}", thread_id=ALERT_THREAD_ID)
+        return True
+    except Exception as e:
+        log.error(f"alert_admin: {e}")
+        return False
+
 def delete_telegram_message(chat_id, message_id):
     """Delete a Telegram message when the bot has rights in the chat."""
     try:
@@ -703,6 +721,48 @@ def delete_telegram_message(chat_id, message_id):
     except Exception as e:
         log.error(f"delete_telegram_message: {e}")
         return False
+
+def download_telegram_photo_bytes(photo_list):
+    """Download the highest quality Telegram photo and return raw bytes."""
+    try:
+        if not photo_list:
+            return None
+        file_id = photo_list[-1]["file_id"]
+        resp = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
+            params={"file_id": file_id}, timeout=15
+        )
+        data = resp.json()
+        file_path = data["result"]["file_path"]
+        img_resp = requests.get(
+            f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}",
+            timeout=25
+        )
+        if img_resp.ok and img_resp.content:
+            return img_resp.content
+    except Exception as e:
+        log.error(f"download_telegram_photo_bytes: {e}")
+    return None
+
+def website_article_url(article_id=None, slug=None):
+    """Return the public website URL for an article."""
+    base = (SAMUGA_CAPTION_LINK or "https://samugamedia.com").rstrip("/")
+    if article_id:
+        return f"{base}/article.html?id={article_id}"
+    if slug:
+        return f"{base}/article.html?slug={slug}"
+    return base
+
+def extract_inline_post_to_web_body(text):
+    """Allow admins to send article text + /post to web in the same message."""
+    raw = str(text or "")
+    clean = re.sub(r'@SamugaNewsBot\b', '', raw, flags=re.I)
+    clean = re.sub(r'(?im)^\s*/post\s+to\s+web\s*$', '', clean)
+    clean = re.sub(r'(?im)^\s*/postweb\s*$', '', clean)
+    clean = re.sub(r'(?im)^\s*/posttoweb\s*$', '', clean)
+    clean = re.sub(r'(?im)^\s*/post\s+web\s*$', '', clean)
+    clean = clean.strip()
+    return clean
 
 # ── Gemini Dhivehi Caption ────────────────────────────────────────────────────
 # Model fallback chain — newest first, fall back if quota/deprecated
@@ -2820,12 +2880,22 @@ def manual_post_replied_article_to_website(reply_text, category_hint="LOCAL"):
         parts = [p.strip() for p in raw.split("\n") if p.strip()]
         if not parts:
             return None, "Reply text is empty."
+
+        parts = [p for p in parts if re.sub(r'@SamugaNewsBot\b', '', p, flags=re.I).strip().lower() not in ["/post to web", "/post web", "/posttoweb", "/postweb"]]
+        if not parts:
+            return None, "Only the command was found. Reply to the actual article text."
+
         title = parts[0][:220]
-        body = "\n\n".join(parts[1:]).strip() if len(parts) > 1 else title
+        body = "\n\n".join(parts[1:]).strip() if len(parts) > 1 else ""
+        if not body:
+            return None, "Article body is empty. Write the title on line 1 and the article on the lines below."
+
         lang = "dv" if is_dhivehi(title + " " + body) else "en"
         safe_ok, safe_reason = contentlab_candidate_is_safe(title, body, "Samuga Media", lang)
         if not safe_ok:
+            alert_admin(f"Manual website post blocked\n\n<b>{title[:120]}</b>\nReason: {safe_reason}", dedupe_key=f"manualweb:{title[:80]}")
             return None, f"Blocked by safety wall: {safe_reason}"
+
         category = canonical_category(category_hint or "LOCAL", title, body)
         base_id = "manualweb_" + hashlib.md5((title + "|" + body + "|" + str(utcnow())).encode()).hexdigest()[:12]
         db_publish_article_for_website(
@@ -2841,26 +2911,40 @@ def manual_post_replied_article_to_website(reply_text, category_hint="LOCAL"):
             is_breaking=(category in ("BREAKING","DISASTER"))
         )
         saved_id = base_id if lang != "dv" else f"{base_id}_dv"
+
+        row = None
         try:
             excerpt = make_article_excerpt(title, body, lang=lang)
             db_execute(
-                "UPDATE articles SET article_body=%s, article_excerpt=%s, status='posted' WHERE id=%s",
-                (body, excerpt, saved_id)
+                "UPDATE articles SET article_body=%s, article_excerpt=%s, status='posted' WHERE id=%s RETURNING id, article_slug",
+                (body, excerpt, saved_id), fetch=None
             )
+            row = db_execute("SELECT id, article_slug, status FROM articles WHERE id=%s LIMIT 1", (saved_id,), fetch="one")
         except Exception as e:
             log.warning(f"manual_post_replied_article_to_website body persist: {e}")
-        slug = make_article_slug(title, saved_id)
+
+        if not row:
+            row = db_execute("SELECT id, article_slug, status FROM articles WHERE id=%s LIMIT 1", (saved_id,), fetch="one")
+        if not row:
+            return None, "The article was not found in the database after publish."
+
+        _, slug, status = row
+        url = website_article_url(article_id=saved_id, slug=slug)
         return {
             "article_id": saved_id,
-            "slug": slug,
+            "slug": slug or make_article_slug(title, saved_id),
             "title": title,
             "body": body,
             "category": category,
             "lang": lang,
+            "url": url,
+            "status": status or "posted",
         }, None
     except Exception as e:
         log.error(f"manual_post_replied_article_to_website: {e}")
+        alert_admin(f"Manual website post failed\n\nReason: {str(e)[:300]}", dedupe_key="manual_post_replied_article_to_website")
         return None, str(e)
+
 
 def needs_web_search(msg):
     # Skip search only for simple greetings / meta questions
@@ -3397,6 +3481,8 @@ def handle_updates():
                 msg=update.get("message",{})
                 if not msg: continue
                 text=msg.get("text","") or msg.get("caption","")
+                text_cmd = re.sub(r'@SamugaNewsBot\b', '', text or '', flags=re.I).strip()
+                text_cmd_low = text_cmd.lower()
                 photo=msg.get("photo")  # list of photo sizes if message has photo
                 video=msg.get("video") or msg.get("video_note")
                 reply_msg = msg.get("reply_to_message", {}) or {}
@@ -3526,7 +3612,7 @@ def handle_updates():
                             cmd = "approve" if is_approve else "reject"
                             return (cmd, key, extra)
 
-                        _fcmd, _fkey, _fextra = _parse_fuzzy_cmd(text)
+                        _fcmd, _fkey, _fextra = _parse_fuzzy_cmd(text_cmd)
 
                         # /approved <key> [optional corrected dhivehi text]
                         if _fcmd == "approve" or text.strip().lower().startswith("/approved "):
@@ -3712,8 +3798,8 @@ def handle_updates():
                                 send_text(chat_id, f"Key <code>{key}</code> not found — maybe already posted or rejected.", reply_to=msg_id, thread_id=thread_id)
 
                         # /hide <article_id_or_slug> — remove a website article fast
-                        elif text.strip().lower().startswith("/hide "):
-                            ident = text.strip()[6:].strip()
+                        elif text_cmd_low.startswith("/hide "):
+                            ident = text_cmd[6:].strip()
                             rows = db_hide_article(ident)
                             if rows:
                                 joined = "\n".join([f"• <code>{rid}</code> — {ttl[:70]}" for rid, ttl in rows[:5]])
@@ -3722,8 +3808,8 @@ def handle_updates():
                                 send_text(chat_id, f"⚠️ No website article found for <code>{ident}</code>", reply_to=msg_id, thread_id=thread_id)
 
                         # /unhide <article_id_or_slug> — restore hidden article
-                        elif text.strip().lower().startswith("/unhide "):
-                            ident = text.strip()[8:].strip()
+                        elif text_cmd_low.startswith("/unhide "):
+                            ident = text_cmd[8:].strip()
                             rows = db_unhide_article(ident)
                             if rows:
                                 joined = "\n".join([f"• <code>{rid}</code> — {ttl[:70]}" for rid, ttl in rows[:5]])
@@ -3732,7 +3818,7 @@ def handle_updates():
                                 send_text(chat_id, f"⚠️ No hidden website article found for <code>{ident}</code>", reply_to=msg_id, thread_id=thread_id)
 
                         # /delete — reply to a bot message in Content Lab to delete it and remove queue item if present
-                        elif text.strip().lower() in ["/delete", "/del", "/remove"]:
+                        elif text_cmd_low in ["/delete", "/del", "/remove"]:
                             if not reply_msg_id:
                                 send_text(chat_id,
                                     "Reply to the bot message you want deleted, then send <code>/delete</code>.",
@@ -3758,31 +3844,54 @@ def handle_updates():
                                     send_text(chat_id,
                                         "⚠️ I couldn't delete that Telegram message. Check bot admin rights in the group.",
                                         reply_to=msg_id, thread_id=thread_id)
+                                    alert_admin("Content Lab delete failed. Check bot delete permissions in Telegram.", dedupe_key="telegram_delete_permission")
 
-                        # /post to web — reply to a human-written article in Content Lab and publish it to website
-                        elif text.strip().lower() in ["/post to web", "/post web", "/posttoweb"]:
-                            if not reply_text.strip():
+                                                # /post to web — reply to a human-written article or include article + command in same message
+                        elif text_cmd_low in ["/post to web", "/post web", "/posttoweb"] or "/post to web" in text_cmd_low:
+                            article_source = ""
+                            if reply_text.strip():
+                                article_source = re.sub(r'@SamugaNewsBot\b', '', reply_text or '', flags=re.I).strip()
+                            else:
+                                article_source = extract_inline_post_to_web_body(text)
+                            if not article_source.strip():
                                 send_text(chat_id,
-                                    "Reply to the written article first, then send <code>/post to web</code>.",
+                                    "⚠️ Website post needs article text. Either reply to the article and send <code>/post to web</code>, or send the article with <code>/post to web</code> at the bottom.",
                                     reply_to=msg_id, thread_id=thread_id)
                             else:
-                                send_text(chat_id, "🌐 Publishing replied article to website... ⏳", reply_to=msg_id, thread_id=thread_id)
-                                result, err = manual_post_replied_article_to_website(reply_text, category_hint="LOCAL")
+                                send_text(chat_id, "🌐 Publishing article to website... ⏳", reply_to=msg_id, thread_id=thread_id)
+                                result, err = manual_post_replied_article_to_website(article_source, category_hint="LOCAL")
                                 if result:
-                                    send_text(
-                                        chat_id,
-                                        "🌐 <b>Posted to website</b>\n\n"
+                                    send_text(chat_id,
+                                        f"✅ <b>Posted to website</b>\n\n"
                                         f"<b>{result['title']}</b>\n"
                                         f"Category: {result['category']}\n"
                                         f"Lang: {result['lang']}\n"
                                         f"ID: <code>{result['article_id']}</code>\n"
-                                        f"Slug: <code>{result['slug']}</code>",
-                                        reply_to=msg_id, thread_id=thread_id
-                                    )
+                                        f"Link: {result['url']}",
+                                        reply_to=msg_id, thread_id=thread_id)
                                 else:
-                                    send_text(chat_id, f"❌ Website post failed: {err}", reply_to=msg_id, thread_id=thread_id)
+                                    send_text(chat_id, f"❌ Facing some issues posting to website.\nReason: {err}", reply_to=msg_id, thread_id=thread_id)
+                                    alert_admin(f"Manual website publish failed\n\nReason: {str(err)[:300]}", dedupe_key="manual_web_post_fail")
 
-                        # /hide_dv — hide all currently posted Dhivehi website articles
+# /delete https://samugamedia.com/... — hide a website article by URL
+                        elif text_cmd_low.startswith("/delete http://") or text_cmd_low.startswith("/delete https://"):
+                            try:
+                                url = text_cmd[8:].strip()
+                                rows = db_delete_article_by_url(url)
+                                if rows:
+                                    joined = "\n".join([f"• <code>{rid}</code> — {ttl[:70]}" for rid, ttl, slug in rows[:5]])
+                                    send_text(chat_id,
+                                        f"🗑️ <b>Hidden from website by URL</b>\n\n{joined}",
+                                        reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id,
+                                        "⚠️ No website article matched that URL. Check the full post link or slug.",
+                                        reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                send_text(chat_id, f"❌ Delete by URL failed: {str(e)[:150]}", reply_to=msg_id, thread_id=thread_id)
+                                alert_admin(f"Delete by URL failed\n\nReason: {str(e)[:250]}", dedupe_key="cmd_delete_by_url_fail")
+
+# /hide_dv — hide all currently posted Dhivehi website articles
                         elif text.strip().lower() in ["/hide_dv", "/hide dv", "/hide all dv"]:
                             rows = db_hide_all_dhivehi()
                             if rows:
@@ -3793,6 +3902,91 @@ def handle_updates():
                                 send_text(chat_id,
                                     "ℹ️ No posted Dhivehi website articles found to hide.",
                                     reply_to=msg_id, thread_id=thread_id)
+
+
+                        # /stats — quick operational stats
+                        elif text_cmd_low in ["/stats", "/botstats", "/stat"]:
+                            try:
+                                send_text(chat_id, format_bot_stats(), reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                send_text(chat_id, f"❌ Stats command failed: {str(e)[:150]}", reply_to=msg_id, thread_id=thread_id)
+                                alert_admin(f"/stats failed\n\nReason: {str(e)[:250]}", dedupe_key="cmd_stats_fail")
+
+                                                # /banner status | /banner off | /banner on [text] | /post banner
+                        elif text_cmd_low.startswith("/banner") or text_cmd_low in ["/post banner", "/banner post"]:
+                            try:
+                                raw = text_cmd.strip()
+                                low = raw.lower()
+                                # image-based sponsor banner
+                                if low in ["/post banner", "/banner post"]:
+                                    banner_photo = photo or (reply_msg.get("photo") if reply_msg else None)
+                                    if not banner_photo:
+                                        send_text(chat_id, "⚠️ Attach a website-size photo or reply to a photo, then send <code>/post banner</code>.", reply_to=msg_id, thread_id=thread_id)
+                                    else:
+                                        img_bytes = download_telegram_photo_bytes(banner_photo)
+                                        if not img_bytes:
+                                            send_text(chat_id, "❌ Banner post failed: I couldn't download the Telegram photo.", reply_to=msg_id, thread_id=thread_id)
+                                            alert_admin("Banner post failed: Telegram photo download failed.", dedupe_key="banner_photo_download_fail")
+                                        else:
+                                            image_url = upload_to_imgbb(img_bytes)
+                                            if not image_url:
+                                                send_text(chat_id, "❌ Banner post failed: image upload failed (imgbb).", reply_to=msg_id, thread_id=thread_id)
+                                                alert_admin("Banner post failed: imgbb upload failed.", dedupe_key="banner_imgbb_fail")
+                                            else:
+                                                website_banner.update({"active": True, "text": "", "image_url": image_url, "updated_at": utcnow().isoformat()})
+                                                persist_state()
+                                                send_text(chat_id, f"🎯 <b>Website banner posted</b>\n\nImage saved and banner is active.\n{image_url}", reply_to=msg_id, thread_id=thread_id)
+                                elif low in ["/banner", "/banner status"]:
+                                    active = bool(website_banner.get("active"))
+                                    txt = (website_banner.get("text") or "").strip()
+                                    img = (website_banner.get("image_url") or "").strip()
+                                    send_text(chat_id,
+                                        f"🎯 <b>Website banner</b>\n\n"
+                                        f"Active: <b>{'Yes' if active else 'No'}</b>\n"
+                                        f"Image: {img or '—'}\n"
+                                        f"Text: {txt or '—'}",
+                                        reply_to=msg_id, thread_id=thread_id)
+                                elif low.startswith("/banner off"):
+                                    website_banner.update({"active": False, "text": "", "image_url": "", "updated_at": utcnow().isoformat()})
+                                    persist_state()
+                                    send_text(chat_id, "🧹 Website banner turned off.", reply_to=msg_id, thread_id=thread_id)
+                                elif low.startswith("/banner on"):
+                                    banner_text = raw[len("/banner on"):].strip()
+                                    if not banner_text:
+                                        send_text(chat_id, "⚠️ Use: <code>/banner on Your sponsored banner text</code> or attach a photo and use <code>/post banner</code>.", reply_to=msg_id, thread_id=thread_id)
+                                    else:
+                                        website_banner.update({"active": True, "text": banner_text[:240], "image_url": "", "updated_at": utcnow().isoformat()})
+                                        persist_state()
+                                        send_text(chat_id, f"🎯 Website text banner turned on.\n\n{banner_text[:240]}", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id, "⚠️ Use <code>/banner status</code>, <code>/banner on ...</code>, <code>/banner off</code>, or attach a photo and send <code>/post banner</code>.", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                send_text(chat_id, f"❌ Banner command failed: {str(e)[:150]}", reply_to=msg_id, thread_id=thread_id)
+                                alert_admin(f"Banner command failed\n\nReason: {str(e)[:250]}", dedupe_key="cmd_banner_fail")
+
+# /hide_dv — hide all currently posted Dhivehi website articles
+                        elif text_cmd_low in ["/hide_dv", "/hide dv", "/hide all dv", "/delete_dv", "/delete dv", "/delete all dv"]:
+                            try:
+                                rows = db_hide_all_dhivehi()
+                                if rows:
+                                    send_text(chat_id, f"🙈 <b>Hidden Dhivehi website articles:</b> {len(rows)}", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id, "ℹ️ No posted Dhivehi website articles found to hide.", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                send_text(chat_id, f"❌ hide_dv failed: {str(e)[:150]}", reply_to=msg_id, thread_id=thread_id)
+                                alert_admin(f"hide_dv failed\n\nReason: {str(e)[:250]}", dedupe_key="cmd_hide_dv_fail")
+
+                        # /unhide_dv — restore hidden Dhivehi website articles
+                        elif text_cmd_low in ["/unhide_dv", "/unhide dv", "/unhide all dv"]:
+                            try:
+                                rows = db_unhide_all_dhivehi()
+                                if rows:
+                                    send_text(chat_id, f"👀 <b>Restored hidden Dhivehi website articles:</b> {len(rows)}", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id, "ℹ️ No hidden Dhivehi website articles found to restore.", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                send_text(chat_id, f"❌ unhide_dv failed: {str(e)[:150]}", reply_to=msg_id, thread_id=thread_id)
+                                alert_admin(f"unhide_dv failed\n\nReason: {str(e)[:250]}", dedupe_key="cmd_unhide_dv_fail")
 
                         # /buffercheck — test imgbb + Buffer connection live
                         elif text.strip().lower() in ["/buffercheck", "/socialcheck", "/checkbuffer"]:
@@ -3947,6 +4141,9 @@ def handle_updates():
                                     # 5. Queue state
                                     lines.append("\n🧠 <b>Queue guards:</b> duplicate translation wall + internal/junk safety wall active")
                                     lines.append("🌐 <b>Dhivehi website rule:</b> no Dhivehi website publish without Content Lab approval")
+                                    lines.append(f"🎯 <b>Website banner:</b> {'ON' if website_banner.get('active') else 'OFF'}")
+                                    if website_banner.get("image_url"):
+                                        lines.append("🖼️ <b>Banner type:</b> image")
                                     dv_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="dv")
                                     en_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="en")
                                     lines.append(f"\n📋 <b>Approval queue:</b> {dv_queued} Dhivehi, {en_queued} English waiting")
@@ -4753,6 +4950,47 @@ def handle_updates():
         except Exception as e:
             log.error(f"Update loop: {e}"); time.sleep(5)
 
+def ops_watchdog():
+    """Light operational watchdog. Sends Alert messages when something looks wrong."""
+    try:
+        issues = []
+        try:
+            stats = db_bot_stats() or {}
+            if int(stats.get("posted_dv", 0)) > 0 and os.environ.get("DHIVEHI_WEBSITE_APPROVED", "false").lower() != "true":
+                issues.append(f"Dhivehi website leak detected: {stats.get('posted_dv',0)} posted Dhivehi article(s) still visible.")
+        except Exception as e:
+            issues.append(f"Stats check failed: {str(e)[:120]}")
+        try:
+            if len(approval_queue) >= 25:
+                issues.append(f"Approval queue is high: {len(approval_queue)} items waiting.")
+            if len(_social_queue) >= 12:
+                issues.append(f"Social queue is high: {len(_social_queue)} items waiting.")
+        except Exception:
+            pass
+        if issues:
+            alert_admin("<br/>".join(issues), dedupe_key="ops_watchdog", cooloff_minutes=30)
+    except Exception as e:
+        log.error(f"ops_watchdog: {e}")
+
+def format_bot_stats():
+    """Human-friendly stats block for Telegram."""
+    stats = db_bot_stats() or {}
+    lines = ["📊 <b>Samuga Bot Stats</b>"]
+    lines.append(f"🗂️ Articles total: <b>{stats.get('articles_total', 0)}</b>")
+    lines.append(f"🌐 Website posted: <b>{stats.get('posted_total', 0)}</b>")
+    lines.append(f"🙈 Website hidden: <b>{stats.get('hidden_total', 0)}</b>")
+    lines.append(f"🇲🇻 Posted Dhivehi on website: <b>{stats.get('posted_dv', 0)}</b>")
+    lines.append(f"🇬🇧 Posted English on website: <b>{stats.get('posted_en', 0)}</b>")
+    lines.append(f"🕓 Articles found in last 24h: <b>{stats.get('last_24h', 0)}</b>")
+    lines.append(f"🧠 Approval queue: <b>{len(approval_queue)}</b>")
+    lines.append(f"📲 Social queue: <b>{len(_social_queue)}</b>")
+    lines.append(f"📚 Seen title memory: <b>{len(recent_story_titles)}</b>")
+    lines.append(f"🎯 Banner active: <b>{'Yes' if website_banner.get('active') else 'No'}</b>")
+    if website_banner.get("image_url"):
+        lines.append("🖼️ Banner image: saved")
+    return "\n".join(lines)
+
+
 # ── Website API ───────────────────────────────────────────────────────────────
 from flask import Flask, jsonify, request
 import html as _html
@@ -4913,6 +5151,20 @@ def api_health():
         "queue": len(_social_queue) if "_social_queue" in globals() else 0
     })
 
+
+@api_app.get("/api/banner")
+def api_banner():
+    """Optional sponsored/banner block for the website frontend."""
+    try:
+        return jsonify({
+            "active": bool(website_banner.get("active")),
+            "text": str(website_banner.get("text") or ""),
+            "image_url": str(website_banner.get("image_url") or ""),
+            "updated_at": website_banner.get("updated_at"),
+        })
+    except Exception as e:
+        log.error(f"Website API /api/banner error: {e}")
+        return jsonify({"active": False, "text": "", "updated_at": None})
 
 @api_app.get("/api/public-interest")
 def api_public_interest():
@@ -5682,6 +5934,7 @@ def persist_state():
             "approval_queue": _serialize_approval_queue(),
             "poll_offset": _poll_offset[0],
             "social_queue": sq_serialized,
+            "website_banner": website_banner,
         }
         _save_state(state)
     except Exception as e:
@@ -5716,6 +5969,10 @@ def restore_state():
             except Exception: pass
         _approval_counter[0] = state.get("approval_counter", 0)
         _poll_offset[0] = state.get("poll_offset", 0)
+        try:
+            website_banner.update(state.get("website_banner", {}))
+        except Exception:
+            pass
         global _last_social_post_time
         lspt = state.get("last_social_post_time")
         if lspt:
@@ -5879,6 +6136,7 @@ if __name__ == "__main__":
 
     # Periodic state heartbeat — saves every 5 minutes so restarts lose minimal state
     scheduler.add_job(persist_state, "interval", minutes=5, id="state_heartbeat")
+    scheduler.add_job(ops_watchdog, "interval", minutes=10)
 
     log.info("⏰ Scheduler started!")
     scheduler.start()

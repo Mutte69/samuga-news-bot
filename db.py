@@ -533,6 +533,22 @@ def db_unhide_article(identifier):
     )
     return rows or []
 
+def db_delete_article_by_url(url):
+    """Hide a website article using its public URL by extracting the trailing slug."""
+    if not DB_ENABLED or not url:
+        return []
+    try:
+        slug = str(url).strip().rstrip("/").split("/")[-1].strip()
+        if not slug:
+            return []
+        rows = db_execute(
+            "UPDATE articles SET status='hidden' WHERE article_slug=%s OR id=%s RETURNING id, title, article_slug",
+            (slug, slug), fetch="all"
+        )
+        return rows or []
+    except Exception:
+        return []
+
 def db_hide_all_dhivehi():
     """Hide all currently posted Dhivehi website articles."""
     if not DB_ENABLED:
@@ -542,6 +558,38 @@ def db_hide_all_dhivehi():
         fetch="all"
     )
     return rows or []
+
+def db_unhide_all_dhivehi():
+    """Restore all hidden Dhivehi website articles."""
+    if not DB_ENABLED:
+        return []
+    rows = db_execute(
+        "UPDATE articles SET status='posted' WHERE status='hidden' AND lang='dv' RETURNING id, title",
+        fetch="all"
+    )
+    return rows or []
+
+def db_bot_stats():
+    """Quick operational stats for Telegram command output."""
+    if not DB_ENABLED:
+        return {}
+    out = {}
+    try:
+        row = db_execute("SELECT COUNT(*) FROM articles", fetch="one")
+        out["articles_total"] = int(row[0] or 0) if row else 0
+        row = db_execute("SELECT COUNT(*) FROM articles WHERE status='posted'", fetch="one")
+        out["posted_total"] = int(row[0] or 0) if row else 0
+        row = db_execute("SELECT COUNT(*) FROM articles WHERE status='hidden'", fetch="one")
+        out["hidden_total"] = int(row[0] or 0) if row else 0
+        row = db_execute("SELECT COUNT(*) FROM articles WHERE status='posted' AND lang='dv'", fetch="one")
+        out["posted_dv"] = int(row[0] or 0) if row else 0
+        row = db_execute("SELECT COUNT(*) FROM articles WHERE status='posted' AND lang='en'", fetch="one")
+        out["posted_en"] = int(row[0] or 0) if row else 0
+        row = db_execute("SELECT COUNT(*) FROM articles WHERE found_at >= NOW() - INTERVAL '24 hours'", fetch="one")
+        out["last_24h"] = int(row[0] or 0) if row else 0
+    except Exception:
+        pass
+    return out
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Website article engine
