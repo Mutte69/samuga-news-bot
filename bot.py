@@ -308,8 +308,18 @@ def release_content_lab_drip():
 
 def store_pending_approval(card_bytes, caption, title, link, cat="LOCAL", lang="en",
                            dv_text=None, keyword="maldives news", source="LOCAL",
-                           is_breaking=False, allow_social=True):
-    """Store a fully-built card awaiting approval. Returns the key."""
+                           is_breaking=False, allow_social=True, dedup_title=None, summary=""):
+    """Store a fully-built card awaiting approval. Returns the key or None if blocked."""
+    safe_ok, safe_reason = contentlab_candidate_is_safe(
+        title=title,
+        summary=(dv_text or caption or summary or ""),
+        source=source,
+        lang=lang,
+    )
+    if not safe_ok:
+        log.warning(f"🧱 Content Lab blocked candidate: {safe_reason} — {str(title)[:90]}")
+        return None
+
     _approval_counter[0] += 1
     prefix = "dv" if lang == "dv" else "en"
     key = f"{prefix}{_approval_counter[0]}"
@@ -326,6 +336,8 @@ def store_pending_approval(card_bytes, caption, title, link, cat="LOCAL", lang="
         "is_breaking": is_breaking,
         "allow_social": allow_social,
         "created_at": utcnow(),
+        "_dedup_title": dedup_title or title,
+        "summary": summary or "",
     }
     # Cap queue size
     if len(approval_queue) > 40:
@@ -734,10 +746,88 @@ Summary:
     if result and is_dhivehi(result):
         log.info("✅ Gemini Dhivehi caption done")
         return strip_source_links(result).strip()
+
     if result:
         log.warning("Gemini Dhivehi caption returned non-Thaana text — rejected")
     return None
 
+# ── Safety + dedup normalization layer ────────────────────────────────────────
+_INTERNAL_NEWS_BLOCKLIST = [
+    "technical issue", "being fixed", "sorry for the trouble", "sorry for the inconvenience",
+    "temporarily unavailable", "maintenance", "test post", "debug", "samuga media is facing",
+    "issue is being fixed", "we are fixing", "service interruption"
+]
+_MARKUP_JUNK_PATTERNS = [
+    r"\.cls-\d", r"fill-rule\s*:", r"evenodd", r"<svg", r"</svg", r"xmlns=",
+    r"viewbox", r"path\s+d=", r"fill:\s*#"
+]
+_signal_key_cache = {}
+
+def gemini_dhivehi_to_english(text):
+    """Translate proper Thaana or mixed Dhivehi text into clean English for scoring/dedup."""
+    if not GEMINI_API_KEY or not text:
+        return None
+    prompt = f"""Translate this Dhivehi news text into clean English.
+
+Rules:
+- Output ONLY English.
+- Do not add new facts.
+- Keep names and places accurate.
+- Clean short newsroom style.
+
+Text:
+{text}
+"""
+    out = _gemini_post(prompt, timeout=18)
+    if out and not is_dhivehi(out):
+        return strip_source_links(out).strip()
+    return None
+
+def contentlab_candidate_is_safe(title="", summary="", source="", lang="en"):
+    """Block internal/system chatter, CSS/SVG junk, and fake newsroom items before Content Lab."""
+    combined = strip_source_links(f"{title}\n{summary}").strip()
+    c_lower = combined.lower()
+    for bad in _INTERNAL_NEWS_BLOCKLIST:
+        if bad in c_lower:
+            return False, f"internal/system text: {bad}"
+    for pat in _MARKUP_JUNK_PATTERNS:
+        if re.search(pat, combined, re.I):
+            return False, f"markup/css junk: {pat}"
+    if combined.startswith(".") and "{" in combined and "}" in combined:
+        return False, "css-like content"
+    # Extremely short Samuga-self lines with no news detail are not news.
+    if source.lower().startswith("samuga") and len(combined.split()) < 8:
+        return False, "samuga internal short text"
+    return True, ""
+
+def story_signal_key(title="", summary="", lang="en"):
+    """
+    Normalize a story into a stable English-ish key so Dhivehi/Latin variants
+    of the same story do not keep entering Content Lab.
+    """
+    raw = strip_source_links(" ".join(x for x in [title, summary] if x)).strip()
+    if not raw:
+        return ""
+    cache_key = f"{lang}|{raw[:500]}"
+    if cache_key in _signal_key_cache:
+        return _signal_key_cache[cache_key]
+
+    normalized = raw
+    try:
+        if looks_latin_thaana(raw):
+            en = gemini_latin_thaana_to_english(raw)
+            if en:
+                normalized = en
+        elif (lang == "dv") or is_dhivehi(raw):
+            en = gemini_dhivehi_to_english(raw)
+            if en:
+                normalized = en
+    except Exception as e:
+        log.debug(f"story_signal_key translation: {e}")
+
+    key = _caption_match_key(normalized or raw)
+    _signal_key_cache[cache_key] = key
+    return key
 
 # ── Dhivehi Quality Layer: Latin Thaana → Proper Thaana / English ─────────────
 # (Implemented in db.normalize_article_language_for_public — imported above.)
@@ -1394,6 +1484,17 @@ def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_
 
 def _send_approval_card(key, item, force=False):
     """Send a card preview to Content Lab with approve/reject buttons, rate-limited."""
+    safe_ok, safe_reason = contentlab_candidate_is_safe(
+        title=item.get("title",""),
+        summary=item.get("dv_text") or item.get("caption") or item.get("summary",""),
+        source=item.get("source",""),
+        lang=item.get("lang","en"),
+    )
+    if not safe_ok:
+        approval_queue.pop(key, None)
+        persist_state()
+        log.warning(f"🧱 Approval preview blocked and removed: {key} — {safe_reason}")
+        return False
     if item.get("_content_lab_suppressed"):
         log.info(f"🧯 Content Lab suppressed for {key}")
         return False
@@ -1457,6 +1558,24 @@ def post_article(article, seen, social_only=False, allow_social=True):
     breaking = is_breaking(article["title"], article["summary"], cat)
     is_dv = article.get("lang") == "dv"
 
+    # Hard safety wall before Content Lab / cards / website.
+    safe_ok, safe_reason = contentlab_candidate_is_safe(
+        title=article.get("title",""),
+        summary=article.get("summary",""),
+        source=article.get("source",""),
+        lang=article.get("lang","en"),
+    )
+    if not safe_ok:
+        seen.add(article["id"]); save_seen(seen)
+        db_record_article(article, score=0,
+                          reliability=source_reliability(article.get("source","")),
+                          status="filtered", is_breaking=False)
+        log.warning(f"🧱 Blocked unsafe story before queue: {safe_reason} — {article['title'][:90]}")
+        return False
+
+    dedup_title = story_signal_key(article.get("title",""), article.get("summary",""), article.get("lang","en"))
+    article["_dedup_title"] = dedup_title or article.get("title","")
+
     # Mark seen now so the same article isn't re-processed on the next scan
     seen.add(article["id"]); save_seen(seen)
 
@@ -1466,15 +1585,15 @@ def post_article(article, seen, social_only=False, allow_social=True):
                       status="seen", is_breaking=breaking)
 
     # ── Story clustering — track which sources report this event ──
-    cluster_size, cluster_sources = register_in_cluster(article["title"], article.get("source",""))
+    cluster_size, cluster_sources = register_in_cluster(article["_dedup_title"], article.get("source",""))
 
-    # ── Duplicate story check — skip if same event already posted/queued ──
-    if is_duplicate_story(article["title"]):
+    # ── Duplicate story check — skip if same event already posted/queued/rejected ──
+    if is_duplicate_story(article["_dedup_title"]):
         log.info(f"⏭️ Skipping duplicate ({cluster_size} sources): {article['title'][:55]}")
         db_mark_status(article["id"], "duplicate")
         return False
-    # Record this title so later similar stories are caught
-    remember_story_title(article["title"])
+    # Record this normalized title so later similar stories are caught
+    remember_story_title(article["_dedup_title"])
     # Stash cluster info on the article so the card can show "X sources reporting"
     article["_cluster_size"] = cluster_size
     article["_cluster_sources"] = cluster_sources
@@ -1511,8 +1630,11 @@ def post_article(article, seen, social_only=False, allow_social=True):
                 key = store_pending_approval(
                     card_bytes, caption, article["title"], article["link"], cat=cat, lang="en",
                     dv_text=None, keyword=keyword, source=article.get("source","LOCAL"),
-                    is_breaking=True, allow_social=allow_social
+                    is_breaking=True, allow_social=allow_social,
+                    dedup_title=article.get("_dedup_title"), summary=article.get("summary","")
                 )
+                if not key:
+                    return False
                 approval_queue[key]["rewritten"] = rewritten
                 approval_queue[key]["summary"] = article.get("summary","")
                 approval_queue[key]["article_id"] = article["id"]
@@ -1570,8 +1692,12 @@ def post_article(article, seen, social_only=False, allow_social=True):
                     key = store_pending_approval(
                         None, None, _title, _link, cat=_cat, lang="dv",
                         dv_text=dv_text, keyword=_kw, source=_source,
-                        is_breaking=True, allow_social=True
+                        is_breaking=True, allow_social=True,
+                        dedup_title=story_signal_key(_title, _rewritten, "dv"),
+                        summary=article.get("summary","")
                     )
+                    if not key:
+                        return
                     approval_queue[key]["article_id"] = f"{_aid}_dv"
                     approval_queue[key]["_auto_post_breaking"] = True   # 2hr auto-post flag
                     approval_queue[key]["summary"] = article.get("summary","")
@@ -1606,8 +1732,11 @@ def post_article(article, seen, social_only=False, allow_social=True):
             key = store_pending_approval(
                 None, None, article["title"], article["link"], cat=cat, lang="dv",
                 dv_text=dv_text, keyword=keyword, source=article.get("source","LOCAL"),
-                is_breaking=breaking, allow_social=allow_social
+                is_breaking=breaking, allow_social=allow_social,
+                dedup_title=article.get("_dedup_title"), summary=article.get("summary","")
             )
+            if not key:
+                return False
             approval_queue[key]["article_id"] = article["id"]
             approval_queue[key]["_priority"] = article.get("_priority", priority)
             approval_queue[key]["_confidence"] = confidence
@@ -1635,8 +1764,11 @@ def post_article(article, seen, social_only=False, allow_social=True):
         key = store_pending_approval(
             card_bytes, caption, article["title"], article["link"], cat=cat, lang="en",
             dv_text=None, keyword=keyword, source=article.get("source","LOCAL"),
-            is_breaking=breaking, allow_social=allow_social
+            is_breaking=breaking, allow_social=allow_social,
+            dedup_title=article.get("_dedup_title"), summary=article.get("summary","")
         )
+        if not key:
+            return False
         # Stash rewritten + summary for poll generation on approval
         approval_queue[key]["rewritten"] = rewritten
         approval_queue[key]["summary"] = article.get("summary","")
@@ -1685,8 +1817,11 @@ def post_article(article, seen, social_only=False, allow_social=True):
                     dv_key = store_pending_approval(
                         None, None, _title, _link, cat=_cat, lang="dv",
                         dv_text=dv_text, keyword=_keyword, source=_source,
-                        is_breaking=breaking, allow_social=allow_social
+                        is_breaking=breaking, allow_social=allow_social,
+                        dedup_title=story_signal_key(_title, _rewritten, "dv"), summary=_summary
                     )
+                    if not dv_key:
+                        return
                     approval_queue[dv_key]["article_id"] = f"{_aid}_dv"
                     approval_queue[dv_key]["_priority"] = 0
                     approval_queue[dv_key]["summary"] = _summary
@@ -2555,6 +2690,10 @@ def manual_publish_website_article(title, subheading="", category="LOCAL", sourc
         raw_title = (title or "").strip()
         raw_sub   = (subheading or "").strip()
         if not raw_title:
+            return None
+        safe_ok, safe_reason = contentlab_candidate_is_safe(raw_title, raw_sub, "Samuga Media", "en")
+        if not safe_ok:
+            log.warning(f"🧱 Manual website article blocked: {safe_reason} — {raw_title[:90]}")
             return None
 
         search_seed = (raw_title + ("\n\n" + raw_sub if raw_sub else "")).strip()
@@ -3466,6 +3605,10 @@ def handle_updates():
                                     theme=rej_item.get("_trend_theme",""),
                                     original_caption=rej_item.get("dv_text") or rej_item.get("caption",""),
                                     lang=rej_item.get("lang","en"))
+                                try:
+                                    remember_story_title(rej_item.get("_dedup_title") or rej_item.get("title",""))
+                                except Exception:
+                                    pass
                                 del approval_queue[key]
                                 persist_state()
                                 import random as _r
@@ -3625,6 +3768,7 @@ def handle_updates():
                                         except Exception as ce:
                                             lines.append(f"  ❌ @{ch.get('handle','?')} / {ch['source']}: {str(ce)[:30]}")
                                     # 5. Queue state
+                                    lines.append("\n🧠 <b>Queue guards:</b> duplicate translation wall + internal/junk safety wall active")
                                     dv_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="dv")
                                     en_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="en")
                                     lines.append(f"\n📋 <b>Approval queue:</b> {dv_queued} Dhivehi, {en_queued} English waiting")
