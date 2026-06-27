@@ -40,6 +40,12 @@ queue_for_social = None
 utcnow          = None
 mvt_now         = None
 
+def posting_paused():
+    return os.environ.get("POSTING_PAUSED", "false").lower() == "true"
+
+def social_paused():
+    return os.environ.get("SOCIAL_PAUSED", "false").lower() == "true" or posting_paused()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Island locations
@@ -784,8 +790,10 @@ def send_weather_alert(weather_data, level_key, alert_text):
             f"{alert_text}\n\n"
             f"📡 <b>Samuga Media</b> | @samugacommunity"
         )
-        if send_photo:
+        if send_photo and not posting_paused():
             send_photo(TELEGRAM_CHANNEL_ID, card, caption)
+        elif posting_paused():
+            log.warning("🛑 Weather alert public post blocked — POSTING_PAUSED=true")
 
         from datetime import timezone as _tz
         today = (datetime.now(_tz.utc) + timedelta(hours=5)).strftime("%Y-%m-%d")
@@ -887,16 +895,20 @@ def send_weather_update(time_of_day="morning"):
             f"{src_tag}"
         )
 
-        if send_photo:
+        if send_photo and not posting_paused():
             send_photo(TELEGRAM_CHANNEL_ID, card, caption)
-        log.info(f"✅ Weather card sent to Telegram ({time_of_day}) via {source}")
+            log.info(f"✅ Weather card sent to Telegram ({time_of_day}) via {source}")
+        elif posting_paused():
+            log.warning("🛑 Weather update Telegram post blocked — POSTING_PAUSED=true")
 
         # Post to social (FB + IG + X)
         try:
             card.seek(0)
-            if queue_for_social:
+            if queue_for_social and not social_paused():
                 queue_for_social(io.BytesIO(card.getvalue()), caption)
-            log.info(f"📲 Weather card queued for FB + IG + X ({time_of_day})")
+                log.info(f"📲 Weather card queued for FB + IG + X ({time_of_day})")
+            elif social_paused():
+                log.warning("🛑 Weather social queue blocked — SOCIAL/POSTING paused")
         except Exception as e:
             log.error(f"Weather social queue: {e}")
 

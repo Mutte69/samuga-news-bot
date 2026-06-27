@@ -116,6 +116,21 @@ def mvt_display_time(dt):
     except Exception:
         return "Recent"
 
+def posting_paused():
+    """Live Railway env kill switch: POSTING_PAUSED=true blocks all public posting."""
+    return os.environ.get("POSTING_PAUSED", "false").lower() == "true"
+
+def social_paused():
+    """Live Railway env kill switch: SOCIAL_PAUSED=true blocks Buffer/social posting."""
+    return os.environ.get("SOCIAL_PAUSED", "false").lower() == "true" or posting_paused()
+
+def _posting_block_reason():
+    if posting_paused():
+        return "POSTING_PAUSED=true"
+    if social_paused():
+        return "SOCIAL_PAUSED=true"
+    return ""
+
 # ═══════════════════════════════════════════════════════════════════════════
 # [CONFIG] — Environment variables & API keys
 # ═══════════════════════════════════════════════════════════════════════════
@@ -139,6 +154,13 @@ META_APP_SECRET     = os.environ.get("META_APP_SECRET", "")
 META_IG_ID          = os.environ.get("META_IG_ID", "")  # optional; auto-resolved if blank
 META_API_VER        = os.environ.get("META_API_VER", "v21.0")
 TOMORROW_API_KEY    = os.environ.get("TOMORROW_API_KEY", "")  # weather data
+
+# ── Killer posting switches ──────────────────────────────────────────────────
+# POSTING_PAUSED=true blocks all public Telegram + Buffer/social posting.
+# SOCIAL_PAUSED=true blocks Buffer/social only.
+# These are read live from Railway env vars on every post attempt.
+POSTING_PAUSED = os.environ.get("POSTING_PAUSED", "false").lower() == "true"
+SOCIAL_PAUSED  = os.environ.get("SOCIAL_PAUSED",  "false").lower() == "true"
 
 ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -578,6 +600,9 @@ def increment_social_count():
 def send_to_telegram(buf, caption):
     """Post a photo to the community channel. Returns message_id (int) or False."""
     try:
+        if posting_paused():
+            log.warning("🛑 Telegram public post blocked — POSTING_PAUSED=true")
+            return False
         safe_caption = samuga_public_caption(caption)
         if not public_text_is_safe(safe_caption):
             log.error(f"🚫 Telegram blocked unsafe public caption: {str(safe_caption)[:120]}")
@@ -822,6 +847,9 @@ def resolve_url(url):
 
 def post_to_buffer(image_url, caption, channel_id, metadata=None):
     """Post to a single Buffer channel. Returns True on success."""
+    if social_paused():
+        log.warning(f"🛑 Buffer post blocked — {_posting_block_reason()}")
+        return False
     if not BUFFER_TOKEN or not channel_id: return False
     clean = re.sub(r'<[^>]+>', '', caption)
     clean = clean.replace('&amp;', '&').replace('&#039;', "'").replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>').strip()
@@ -927,6 +955,13 @@ def _social_queue_worker():
                     continue
                 item = _social_queue.pop(0)
 
+            if posting_paused():
+                log.warning("🛑 Social queue holding because POSTING_PAUSED=true")
+                with _social_queue_lock:
+                    _social_queue.insert(0, item)
+                time.sleep(60)
+                continue
+
             combined_public_text = f"{item.get('title','')}\n{item.get('summary','')}\n{item.get('caption','')}"
             if not public_text_is_safe(combined_public_text):
                 log.error(f"🚫 Social queue dropped unsafe post: {item.get('key_label','Post')} — {str(item.get('title',''))[:80]}")
@@ -1025,6 +1060,12 @@ def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=Non
     immediately when it enters the public publishing queue.
     """
     img_bytes = img_buf.getvalue() if hasattr(img_buf, "getvalue") else img_buf
+    if posting_paused():
+        log.warning("🛑 Public queue refused post — POSTING_PAUSED=true")
+        if notify_chat_id:
+            send_text(notify_chat_id, "🛑 Public posting is paused (POSTING_PAUSED=true). Post was not queued.", thread_id=notify_thread_id)
+        return False
+
     combined_public_text = f"{title}\n{summary}\n{caption}"
     if not public_text_is_safe(combined_public_text):
         log.error(f"🚫 Social queue refused unsafe post: {str(title)[:90]}")
@@ -1079,6 +1120,9 @@ def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=Non
 
 # Keep old name as the "post now" internal function
 def _post_to_social_now(img_buf, caption):
+    if social_paused():
+        log.warning(f"🛑 Social post blocked — {_posting_block_reason()}")
+        return {"Facebook": False, "Instagram": False, "Twitter": False}
     """
     Post to all social platforms via Buffer (FB + IG + X), with the card image.
 
@@ -1150,6 +1194,9 @@ def _post_to_social_now(img_buf, caption):
     return results
 
 def post_to_social(img_buf, caption):
+    if social_paused():
+        log.warning(f"🛑 Social post blocked — {_posting_block_reason()}")
+        return {"Facebook": False, "Instagram": False, "Twitter": False}
     if not BUFFER_TOKEN:
         log.warning("Social: no BUFFER_TOKEN, skipping")
         return
@@ -1253,6 +1300,12 @@ def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_
     article_id: if given, the Telegram message_id is stored for later view tracking.
     """
     global last_regular_post_time
+    if posting_paused():
+        log.warning(f"🛑 Publish blocked — POSTING_PAUSED=true: {str(title)[:80]}")
+        if report_to:
+            rchat, rthread = report_to
+            send_text(rchat, "🛑 Public posting is paused (POSTING_PAUSED=true). It was not published.", thread_id=rthread)
+        return False, {}
     buf = io.BytesIO(card_bytes)
     ts = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
     social_results = {}
@@ -5246,6 +5299,10 @@ if __name__ == "__main__":
     log.info("📚 Story Intelligence: timeline threads active")
     log.info("🧠 Core team brain: live newsroom awareness + persistent memory")
     log.info("💬 Smart chat: history, web search, Dhivehi support, story queries")
+    if posting_paused():
+        log.warning("🛑 POSTING_PAUSED=true — all public posting is blocked")
+    elif social_paused():
+        log.warning("🛑 SOCIAL_PAUSED=true — Buffer/social posting is blocked")
 
     # Start social queue worker — drains one post every 10 minutes
     threading.Thread(target=_social_queue_worker, daemon=True).start()
