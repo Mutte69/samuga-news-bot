@@ -45,7 +45,8 @@ from fetchers import (
     get_local_headlines, rewrite_news, gemini_translate,
     RSS_FEEDS, LOCAL_FEEDS, DV_TELEGRAM_CHANNELS, DEFAULT_KEYWORDS, WEB_LATEST_SOURCES,
     has_public_placeholder, public_text_is_safe, fallback_rewritten_news,
-    clean_ai_line, safe_image_keyword
+    clean_ai_line, safe_image_keyword,
+    get_source_health_snapshot, load_source_health, source_health_score, source_health_summary
 )
 from scoring import (
     is_breaking, is_dhivehi, source_reliability,
@@ -4138,7 +4139,18 @@ def handle_updates():
                                             lines.append(f"  ✅ @{ch['handle']} / {ch['source']}: {len(arts)} items ({dv_count} Dhivehi)")
                                         except Exception as ce:
                                             lines.append(f"  ❌ @{ch.get('handle','?')} / {ch['source']}: {str(ce)[:30]}")
-                                    # 5. Queue state
+                                    # 5. Source health memory
+                                    try:
+                                        lines.append("\n🫀 <b>Source health memory:</b>")
+                                        for row in source_health_summary(limit=8):
+                                            lines.append(
+                                                f"  • {row['source']}: <b>{row['health']}</b>/100 "
+                                                f"(ok {row['successes']}/{row['fetches']}, empty {row['empty']}, fail {row['fails']}, ads {row['ads_total']})"
+                                            )
+                                    except Exception as she:
+                                        lines.append(f"\n🫀 <b>Source health memory:</b> ❌ {str(she)[:40]}")
+
+                                    # 6. Queue state
                                     lines.append("\n🧠 <b>Queue guards:</b> duplicate translation wall + internal/junk safety wall active")
                                     lines.append("🌐 <b>Dhivehi website rule:</b> no Dhivehi website publish without Content Lab approval")
                                     lines.append(f"🎯 <b>Website banner:</b> {'ON' if website_banner.get('active') else 'OFF'}")
@@ -4383,7 +4395,7 @@ def handle_updates():
 
                         # /weather — force send a weather card preview to core team
                         elif text.strip().lower() in ["/weather", "/wx"]:
-                            send_text(chat_id, "🌤️ Fetching weather + island data... ⏳ (cache-aware)",
+                            send_text(chat_id, "🌤️ Fetching weather + island data... ⏳",
                                       reply_to=msg_id, thread_id=thread_id)
                             def _send_weather_preview(_chat_id=chat_id, _thread_id=thread_id, _name=first_name):
                                 try:
@@ -5936,6 +5948,7 @@ def persist_state():
             "poll_offset": _poll_offset[0],
             "social_queue": sq_serialized,
             "website_banner": website_banner,
+            "source_health": get_source_health_snapshot(),
         }
         _save_state(state)
     except Exception as e:
@@ -5972,6 +5985,10 @@ def restore_state():
         _poll_offset[0] = state.get("poll_offset", 0)
         try:
             website_banner.update(state.get("website_banner", {}))
+        except Exception:
+            pass
+        try:
+            load_source_health(state.get("source_health", {}))
         except Exception:
             pass
         global _last_social_post_time
@@ -6088,6 +6105,11 @@ if __name__ == "__main__":
     _ft.ai             = ai
     _ft._gemini_post   = _gemini_post
     _ft.GEMINI_API_KEY = GEMINI_API_KEY
+
+    import scoring as _sg
+    _sg.utcnow = utcnow
+    _sg.normalize_story_signal = story_signal_key
+    _sg.SOURCE_HEALTH_LOOKUP = source_health_score
 
     # Wire weather module with shared functions (avoids circular imports)
     import weather as _wx

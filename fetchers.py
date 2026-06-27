@@ -18,7 +18,7 @@ Dependencies injected by bot.py at startup:
   _gemini_post, GEMINI_API_KEY, ANTHROPIC_API_KEY, ai (anthropic client)
 """
 
-import os, hashlib, logging, threading, feedparser, requests, re
+import os, hashlib, logging, threading, feedparser, requests, re, copy
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
@@ -30,6 +30,114 @@ ai               = None   # bot.py: fetchers.ai = ai
 GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
+# ── Source health memory ──────────────────────────────────────────────────────
+_source_health_lock = threading.RLock()
+SOURCE_HEALTH = {}
+
+def _source_key(name):
+    return re.sub(r"[^a-z0-9]+", "_", str(name or "unknown").lower()).strip("_") or "unknown"
+
+def _blank_source_health(name):
+    return {
+        "source": name,
+        "key": _source_key(name),
+        "fetches": 0,
+        "successes": 0,
+        "fails": 0,
+        "empty": 0,
+        "items_total": 0,
+        "ads_total": 0,
+        "blocked": 0,
+        "http_errors": 0,
+        "last_status": "new",
+        "last_http": None,
+        "last_reason": "",
+        "last_ok_at": None,
+        "last_nonempty_at": None,
+    }
+
+def _health_now_iso():
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+
+def record_source_health(source, ok=False, items=0, ads=0, blocked=False, http_status=None, reason=""):
+    key = _source_key(source)
+    with _source_health_lock:
+        entry = SOURCE_HEALTH.setdefault(key, _blank_source_health(source))
+        entry["source"] = source
+        entry["fetches"] += 1
+        entry["items_total"] += int(items or 0)
+        entry["ads_total"] += int(ads or 0)
+        if blocked:
+            entry["blocked"] += 1
+        if ok:
+            entry["successes"] += 1
+            entry["last_ok_at"] = _health_now_iso()
+            if items:
+                entry["last_nonempty_at"] = entry["last_ok_at"]
+                entry["last_status"] = "ok"
+            else:
+                entry["empty"] += 1
+                entry["last_status"] = "empty"
+        else:
+            entry["fails"] += 1
+            entry["last_status"] = "fail"
+        if http_status is not None:
+            entry["last_http"] = int(http_status)
+            if int(http_status) >= 400:
+                entry["http_errors"] += 1
+        entry["last_reason"] = str(reason or "")[:180]
+        return copy.deepcopy(entry)
+
+def source_health_score(source):
+    key = _source_key(source)
+    with _source_health_lock:
+        entry = SOURCE_HEALTH.get(key)
+        if not entry:
+            return 70
+        fetches = max(1, entry["fetches"])
+        success_rate = entry["successes"] / fetches
+        empty_rate   = entry["empty"] / fetches
+        ad_rate      = entry["ads_total"] / max(1, entry["items_total"] + entry["ads_total"])
+        blocked_rate = entry["blocked"] / fetches
+        fail_rate    = entry["fails"] / fetches
+
+        score = 70
+        score += round((success_rate - 0.5) * 40)
+        score -= round(empty_rate * 18)
+        score -= round(ad_rate * 18)
+        score -= round(blocked_rate * 22)
+        score -= round(fail_rate * 20)
+        return max(25, min(100, score))
+
+def get_source_health_snapshot():
+    with _source_health_lock:
+        return copy.deepcopy(SOURCE_HEALTH)
+
+def load_source_health(snapshot):
+    with _source_health_lock:
+        SOURCE_HEALTH.clear()
+        for k, v in (snapshot or {}).items():
+            SOURCE_HEALTH[k] = dict(v)
+
+def source_health_summary(limit=10):
+    with _source_health_lock:
+        rows = list(SOURCE_HEALTH.values())
+    rows.sort(key=lambda r: (source_health_score(r.get("source")), r.get("fetches", 0)), reverse=True)
+    out = []
+    for r in rows[:limit]:
+        out.append({
+            "source": r.get("source"),
+            "health": source_health_score(r.get("source")),
+            "fetches": r.get("fetches", 0),
+            "successes": r.get("successes", 0),
+            "fails": r.get("fails", 0),
+            "empty": r.get("empty", 0),
+            "items_total": r.get("items_total", 0),
+            "ads_total": r.get("ads_total", 0),
+            "last_status": r.get("last_status", "new"),
+            "last_http": r.get("last_http"),
+        })
+    return out
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # RSS Feed lists
@@ -365,6 +473,7 @@ def fetch_mvcrisis():
     try:
         resp = requests.get("https://t.me/s/mvcrisis", timeout=10, headers={"User-Agent": "Mozilla/5.0"})
         if resp.status_code != 200:
+            record_source_health("MvCrisis", ok=False, items=0, ads=0, blocked=(resp.status_code in [403,429]), http_status=resp.status_code, reason="telegram fetch non-200")
             return []
         articles, skipped_ads = [], 0
         for text, published in _extract_telegram_messages(resp.text, limit=15):
@@ -380,9 +489,11 @@ def fetch_mvcrisis():
                 "link": "https://t.me/mvcrisis", "source": "MvCrisis",
                 "cat": "LOCAL", "lang": lang, "published": published
             })
+        record_source_health("MvCrisis", ok=True, items=len(articles), ads=skipped_ads, http_status=resp.status_code, reason="telegram scrape")
         log.info(f"📡 MvCrisis: {len(articles)} news kept, {skipped_ads} ads skipped")
         return articles
     except Exception as e:
+        record_source_health("MvCrisis", ok=False, reason=str(e)[:180])
         log.error(f"MvCrisis fetch: {e}")
         return []
 
@@ -397,13 +508,16 @@ def fetch_dv_telegram(handle, source, reliability=80):
         url = f"https://t.me/s/{handle}"
         resp = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
         if resp.status_code != 200:
+            record_source_health(source, ok=False, blocked=(resp.status_code in [403,429]), http_status=resp.status_code, reason="telegram non-200")
             log.debug(f"[FETCH] {source} Telegram: HTTP {resp.status_code}")
             return []
         articles = []
+        skipped_ads = 0
         for text, published in _extract_telegram_messages(resp.text, limit=12):
             if len(text) < 20:
                 continue
             if _looks_like_ad(text, source=source):
+                skipped_ads += 1
                 continue
             if (_utcnow() - published).total_seconds() > 12 * 3600:
                 continue
@@ -416,9 +530,11 @@ def fetch_dv_telegram(handle, source, reliability=80):
                 "cat": "LOCAL", "lang": lang, "reliability": reliability,
                 "published": published
             })
+        record_source_health(source, ok=True, items=len(articles), ads=skipped_ads, http_status=resp.status_code, reason="telegram scrape")
         log.info(f"[FETCH] {source} Telegram: {len(articles)} items")
         return articles
     except Exception as e:
+        record_source_health(source, ok=False, reason=str(e)[:180])
         log.error(f"[FETCH] {source} Telegram: {e}")
         return []
 
@@ -472,6 +588,7 @@ def fetch_rss_feed_items(fc, limit=8, max_age_hours=3):
     url = fc.get("url", "")
     if not url:
         return out
+    src_name = fc.get("source") or _feed_source_name(url) or url
     try:
         feed = feedparser.parse(url)
         entries = getattr(feed, "entries", []) or []
@@ -481,7 +598,9 @@ def fetch_rss_feed_items(fc, limit=8, max_age_hours=3):
             a = _build_article_from_feed_entry(entry, fc)
             if a.get("title"):
                 out.append(a)
+        record_source_health(src_name, ok=True, items=len(out), ads=0, reason="rss fetch")
     except Exception as e:
+        record_source_health(src_name, ok=False, reason=str(e)[:180])
         log.debug(f"[RSS] feed failed {url}: {e}")
     return out
 
@@ -552,6 +671,7 @@ def fetch_latest_web_pages(limit_per_source=6):
         try:
             resp = requests.get(src["url"], timeout=12, headers=headers)
             if resp.status_code != 200 or not resp.text:
+                record_source_health(src["source"], ok=False, blocked=(resp.status_code in [403,429]), http_status=resp.status_code, reason="latest-page non-200")
                 log.debug(f"[FETCH] {src['source']} latest page HTTP {resp.status_code}")
                 continue
             try:
@@ -590,7 +710,8 @@ def fetch_latest_web_pages(limit_per_source=6):
                 if kept >= limit_per_source:
                     break
             if kept:
-                log.info(f"[FETCH] {src['source']} latest page: {kept} headline(s)")
+                record_source_health(src["source"], ok=True, items=kept, ads=0, http_status=resp.status_code, reason="latest-page scrape")
+            log.info(f"[FETCH] {src['source']} latest page: {kept} headline(s)")
         except Exception as e:
             log.debug(f"[FETCH] latest page {src.get('source')}: {e}")
     return articles
@@ -608,6 +729,7 @@ def fetch_news():
         key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
         if key and key not in seen_titles:
             seen_titles.add(key)
+            a["_source_health"] = source_health_score(a.get("source",""))
             articles.append(a)
 
     for a in fetch_mvcrisis():

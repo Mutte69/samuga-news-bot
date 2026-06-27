@@ -31,6 +31,8 @@ log = logging.getLogger(__name__)
 
 # ── Injected by bot.py at startup ─────────────────────────────────────────────
 utcnow = None   # bot.py: import scoring; scoring.utcnow = utcnow
+normalize_story_signal = None  # bot.py injects story_signal_key for Gemini-aware normalization
+SOURCE_HEALTH_LOOKUP = None    # bot.py injects fetchers.source_health_score
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -134,14 +136,24 @@ SOURCE_RELIABILITY = {
 DEFAULT_RELIABILITY = 60
 
 def source_reliability(source_name):
-    """Return 0-100 reliability score for a source string."""
+    """Return 0-100 reliability score for a source string, adjusted by live source health if available."""
     if not source_name:
-        return DEFAULT_RELIABILITY
-    s = source_name.lower()
-    for key, val in SOURCE_RELIABILITY.items():
-        if key in s:
-            return val
-    return DEFAULT_RELIABILITY
+        base = DEFAULT_RELIABILITY
+    else:
+        s = source_name.lower()
+        base = DEFAULT_RELIABILITY
+        for key, val in SOURCE_RELIABILITY.items():
+            if key in s:
+                base = val
+                break
+    try:
+        if SOURCE_HEALTH_LOOKUP:
+            health = SOURCE_HEALTH_LOOKUP(source_name)
+            delta = round((health - 70) * 0.35)
+            return max(25, min(100, base + delta))
+    except Exception:
+        pass
+    return base
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -182,30 +194,57 @@ def _now():
         return utcnow()
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
+def _normalize_story_signal_text(text):
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    try:
+        if normalize_story_signal:
+            out = normalize_story_signal(raw, "", "dv" if is_dhivehi(raw) else "en")
+            if out:
+                return str(out).strip()
+    except Exception as e:
+        log.debug(f"normalize_story_signal: {e}")
+    return raw.lower()
+
+def _story_parts(text):
+    norm = _normalize_story_signal_text(text)
+    t = re.sub(r"[^a-z0-9\u0780-\u07bf ]", " ", norm)
+    t = re.sub(r"\s+", " ", t).strip()
+    kws = set(_dup_canon(w) for w in t.split() if w not in _DUP_STOPWORDS and len(w) > 2)
+    nums = set(re.findall(r"\d+", t))
+    return norm, kws, nums
+
 def is_duplicate_story(title, threshold=DUP_THRESHOLD):
     """
     Return True if a very similar story was already posted/queued
-    within DUP_WINDOW_HOURS. Uses keyword overlap similarity.
+    within DUP_WINDOW_HOURS. Uses Gemini-aware normalized signal text when available.
     """
     cutoff = _now() - timedelta(hours=DUP_WINDOW_HOURS)
-    new_kw = _dup_keywords(title)
-    if not new_kw:
+    new_norm, new_kw, new_nums = _story_parts(title)
+    if not new_kw and not new_norm:
         return False
     for old_title, ts in recent_story_titles:
         if ts < cutoff:
             continue
-        old_kw = _dup_keywords(old_title)
-        if not old_kw:
+        old_norm, old_kw, old_nums = _story_parts(old_title)
+        if not old_kw and not old_norm:
             continue
-        overlap = len(new_kw & old_kw) / max(len(new_kw), len(old_kw))
-        if overlap >= threshold:
-            log.debug(f"Dup detected ({overlap:.0%}): {title[:50]!r} ~ {old_title[:50]!r}")
+        if new_norm and old_norm and new_norm == old_norm:
+            log.debug(f"Dup exact: {title[:50]!r} ~ {old_title[:50]!r}")
+            return True
+        overlap = len(new_kw & old_kw) / max(1, max(len(new_kw), len(old_kw)))
+        jaccard = len(new_kw & old_kw) / max(1, len(new_kw | old_kw))
+        nums_match = (not new_nums and not old_nums) or bool(new_nums & old_nums)
+        score = max(overlap, jaccard + (0.08 if nums_match else 0))
+        if score >= threshold:
+            log.debug(f"Dup detected ({score:.0%}): {title[:50]!r} ~ {old_title[:50]!r}")
             return True
     return False
 
 def remember_story_title(title):
-    """Add a title to the dedup window."""
-    recent_story_titles.append((title, _now()))
+    """Add a normalized title/signal to the dedup window."""
+    recent_story_titles.append((_normalize_story_signal_text(title), _now()))
     # Prune old entries
     cutoff = _now() - timedelta(hours=DUP_WINDOW_HOURS + 1)
     recent_story_titles[:] = [(t, ts) for t, ts in recent_story_titles if ts > cutoff]
@@ -217,7 +256,7 @@ def remember_story_title(title):
 
 def _cluster_key(title):
     """Stable key for grouping articles about the same event."""
-    t = title.lower()
+    t = _normalize_story_signal_text(title)
     t = re.sub(r"[^a-z0-9\u0780-\u07bf ]", " ", t)
     words = [w for w in t.split() if w not in _DUP_STOPWORDS and len(w) > 2]
     return " ".join(sorted(words[:6]))
