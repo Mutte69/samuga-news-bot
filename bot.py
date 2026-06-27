@@ -113,6 +113,12 @@ META_IG_ID          = os.environ.get("META_IG_ID", "")  # optional; auto-resolve
 META_API_VER        = os.environ.get("META_API_VER", "v21.0")
 TOMORROW_API_KEY    = os.environ.get("TOMORROW_API_KEY", "")  # weather data
 
+# ── Emergency kill-switches (flip in Railway env vars — no redeploy needed) ──
+# POSTING_PAUSED=true  → stops ALL Telegram + Buffer/social posting instantly
+# SOCIAL_PAUSED=true   → stops Buffer/social only; Telegram still posts normally
+POSTING_PAUSED = os.environ.get("POSTING_PAUSED", "false").lower() == "true"
+SOCIAL_PAUSED  = os.environ.get("SOCIAL_PAUSED",  "false").lower() == "true"
+
 ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -261,7 +267,30 @@ ENGLISH_AUTOPOST_SECONDS = 900    # Fallback: English auto-post after 15 min if 
 BREAKING_AUTOPOST_SECONDS = 0     # Low-confidence breaking does NOT auto-post; it waits for Alert approval
 TELEGRAM_GAP_SECONDS    = 120    # 2 minutes between regular Telegram posts
 DAILY_TG_POST_MAX       = 30     # Strict selection target: normal 10-15/day, big days up to ~30
+BREAKING_DAILY_MAX      = 15     # Hard cap: max breaking posts per day (prevents flood on busy news days)
 DHIVEHI_EXPIRY_SECONDS   = 7200   # Dhivehi: expire (delete) after 2h if not approved
+
+# ── Breaking-news daily counter (MVT-based, resets at midnight) ──────────────
+_breaking_day_count = {"date": None, "count": 0}
+
+def can_post_breaking_today():
+    """Returns True if we haven't hit the breaking daily cap yet."""
+    today = _mvt_today()
+    if _breaking_day_count["date"] != today:
+        _breaking_day_count["date"] = today
+        _breaking_day_count["count"] = 0
+    if _breaking_day_count["count"] >= BREAKING_DAILY_MAX:
+        log.warning(f"📵 Breaking daily cap reached ({_breaking_day_count['count']}/{BREAKING_DAILY_MAX}) — holding")
+        return False
+    return True
+
+def increment_breaking_count():
+    today = _mvt_today()
+    if _breaking_day_count["date"] != today:
+        _breaking_day_count["date"] = today
+        _breaking_day_count["count"] = 0
+    _breaking_day_count["count"] += 1
+    log.info(f"🔴 Breaking posts today: {_breaking_day_count['count']}/{BREAKING_DAILY_MAX}")
 
 approval_queue = {}  # key -> {card_bytes, caption, title, link, cat, lang, dv_text, created_at, ...}
 _approval_counter = [0]
@@ -1938,7 +1967,7 @@ def entry_published_dt(entry):
             return dt
     return None
 
-def is_fresh(entry, hours=12):
+def is_fresh(entry, hours=3):
     """RSS freshness gate. 12h+ is never treated as new; unknown dates pass to source-specific gates."""
     try:
         dt = entry_published_dt(entry)
@@ -1960,16 +1989,21 @@ def article_age_minutes(article):
 
 def freshness_bonus(article):
     """
-    Freshness scoring:
-    0–10m huge boost, 10–30m strong, 30–90m okay,
-    90m–4h only important, 4h+ usually skip, 12h+ never new.
+    Freshness scoring — 0–15 min is the sweet spot Samuga wants to publish in.
+    Scores drop sharply after that to naturally deprioritize older stories.
+    0–15m:  +70  (sweet spot — surface immediately)
+    15–30m: +45  (still very fresh)
+    30–60m: +20  (acceptable)
+    60–90m: +5   (borderline — only posts if score is otherwise strong)
+    90m–3h: -30  (effectively filtered out unless breaking)
+    3h+:    -999 (blocked by should_skip_for_freshness anyway)
     """
     age = article_age_minutes(article)
-    if age <= 10: return 60
-    if age <= 30: return 42
-    if age <= 90: return 22
-    if age <= 240: return 0
-    if age <= 720: return -45
+    if age <= 15: return 70
+    if age <= 30: return 45
+    if age <= 60: return 20
+    if age <= 90: return 5
+    if age <= 180: return -30
     return -999
 
 def freshness_label(article):
@@ -1979,15 +2013,26 @@ def freshness_label(article):
     return f"{age/60:.1f}h old"
 
 def should_skip_for_freshness(article, score=None, breaking=False):
-    """Strict recency gate so Samuga stops posting old stories as latest."""
+    """
+    Strict recency gate — Samuga only posts news from the last 3 hours.
+    Breaking news bypasses this entirely (has its own path).
+    'Developing' stories (active incidents) get up to 4h max.
+    'minister'/'president' are NOT developing keywords — they're just regular news
+    that happens to mention officials, and should NOT get an age bypass.
+    """
     score = score if score is not None else score_article(article)
     age = article_age_minutes(article)
     text = ((article or {}).get("title","") + " " + (article or {}).get("summary","")).lower()
-    developing = any(k in text for k in ["update", "developing", "confirmed", "court", "minister", "president", "parliament", "police", "mndf", "breaking"])
-    if age > 720:
-        return True, f"too old ({age/60:.1f}h)"
-    if age > 240 and not (breaking or score >= 185 or developing):
-        return True, f"older than 4h and not important enough ({age/60:.1f}h, score {score})"
+    # Only genuine live-incident keywords grant the developing bypass
+    developing = any(k in text for k in ["update", "developing", "confirmed", "breaking",
+                                          "court", "police", "mndf", "fire", "flood", "crash"])
+    # Hard outer cap — nothing older than 4h ever posts, even breaking confirmed stories
+    if age > 240:
+        return True, f"too old ({age/60:.1f}h) — hard 4h cap"
+    # Regular news: 3h max
+    if age > 180 and not (breaking or developing):
+        return True, f"older than 3h and not a developing story ({age/60:.1f}h, score {score})"
+    # Lower-scoring stories: 90min max
     if age > 90 and not (breaking or score >= 145 or developing):
         return True, f"older than 90m and not strong enough ({age:.0f}m, score {score})"
     return False, ""
@@ -2397,7 +2442,7 @@ def _build_article_from_feed_entry(entry, fc, fallback_source=""):
         "published": entry_published_dt(entry) or utcnow(),
     }
 
-def fetch_rss_feed_items(fc, limit=8, max_age_hours=12):
+def fetch_rss_feed_items(fc, limit=8, max_age_hours=3):
     """Safe RSS fetch wrapper used by normal feeds + local RSS recovery + world feeds."""
     out = []
     url = fc.get("url", "")
@@ -2431,7 +2476,7 @@ def fetch_local_rss_recovery(limit_per_source=4):
         base = src["domain"].rstrip("/")
         for path in RSS_CANDIDATE_PATHS:
             fc = {"url": base + path, "cat": src.get("cat", "LOCAL"), "lang": src.get("lang", "en"), "source": src.get("source", "LOCAL")}
-            items = fetch_rss_feed_items(fc, limit=limit_per_source, max_age_hours=12)
+            items = fetch_rss_feed_items(fc, limit=limit_per_source, max_age_hours=3)
             if not items:
                 continue
             for a in items:
@@ -2448,7 +2493,7 @@ def fetch_local_rss_recovery(limit_per_source=4):
                 break
     # Google News per-source backup
     for fc in LOCAL_GOOGLE_BACKUP_FEEDS:
-        items = fetch_rss_feed_items(fc, limit=limit_per_source, max_age_hours=12)
+        items = fetch_rss_feed_items(fc, limit=limit_per_source, max_age_hours=3)
         kept = 0
         for a in items:
             key = _caption_match_key(a.get("title", ""))
@@ -2465,7 +2510,7 @@ def fetch_world_updates(limit=8):
     """Fetch major world updates separately so Samuga has global awareness without filler."""
     articles, seen_keys = [], set()
     for fc in WORLD_FEEDS:
-        for a in fetch_rss_feed_items(fc, limit=limit, max_age_hours=12):
+        for a in fetch_rss_feed_items(fc, limit=limit, max_age_hours=3):
             text = a.get("title", "") + " " + a.get("summary", "")
             if not is_major_world_news_text(text):
                 continue
@@ -2587,7 +2632,7 @@ def fetch_news():
 
     # Normal configured RSS feeds.
     for fc in RSS_FEEDS:
-        for a in fetch_rss_feed_items(fc, limit=10, max_age_hours=12):
+        for a in fetch_rss_feed_items(fc, limit=10, max_age_hours=3):
             key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
             if key in seen_titles:
                 continue
@@ -2611,7 +2656,7 @@ def get_local_headlines():
             feed = feedparser.parse(fc["url"])
             for entry in feed.entries[:3]:
                 title = entry.get("title","")
-                if title and is_fresh(entry, hours=12):
+                if title and is_fresh(entry, hours=3):
                     headlines.append(f"• [{fc['cat']}] {title}")
             if len(headlines) >= 10: break
     except Exception as e: log.debug(f"get_local_headlines: {e}")
@@ -3384,6 +3429,9 @@ def resolve_url(url):
 
 def post_to_buffer(image_url, caption, channel_id, metadata=None):
     """Post to a single Buffer channel. Returns True on success."""
+    if SOCIAL_PAUSED or POSTING_PAUSED:
+        log.warning("⏸️ Social posting paused (SOCIAL_PAUSED or POSTING_PAUSED) — Buffer call blocked")
+        return False
     if not BUFFER_TOKEN or not channel_id: return False
     clean = re.sub(r'<[^>]+>', '', caption)
     clean = clean.replace('&amp;', '&').replace('&#039;', "'").replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>').strip()
@@ -3787,6 +3835,10 @@ def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_
     article_id: if given, the Telegram message_id is stored for later view tracking.
     """
     global last_regular_post_time
+    # ── Kill-switch check ────────────────────────────────────────────────────
+    if POSTING_PAUSED:
+        log.warning(f"⏸️ POSTING_PAUSED=true — blocked publish: {title[:60]}")
+        return False, {}
     buf = io.BytesIO(card_bytes)
     ts = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
     social_results = {}
@@ -4762,6 +4814,10 @@ def fetch_breaking_sources():
 def breaking_news_check():
     """Fast check every 5 min — priority sources only, no Telegram throttle"""
     try:
+        if POSTING_PAUSED:
+            log.info("⏸️ POSTING_PAUSED=true — breaking check skipped"); return
+        if not can_post_breaking_today():
+            return  # cap already logged inside can_post_breaking_today
         seen = load_seen()
         articles = fetch_breaking_sources()
         for a in articles:
@@ -4771,12 +4827,15 @@ def breaking_news_check():
             # Score for Maldives relevance
             if score_article(a) < 60: continue
             log.info(f"🔴 BREAKING FAST: {a['title'][:60]}")
+            increment_breaking_count()
             post_article(a, seen, social_only=False, allow_social=True)
             break  # one at a time
     except Exception as e:
         log.error(f"Breaking check: {e}")
 
 def scheduled_check():
+    if POSTING_PAUSED:
+        log.info("⏸️ POSTING_PAUSED=true — scheduled_check skipped entirely"); return
     h=get_mvt_hour()
     if not is_day_mode():
         log.info(f"🌙 Night mode (MVT {h:02d}:xx) — website keeps updating 24/7; socials/content lab stay protected")
@@ -6661,6 +6720,34 @@ def compute_topic_weights(days=28):
         weights[theme] = {"weight": weight, "median": round(med, 2),
                           "avg": round(avg, 2), "n": len(ss)}
 
+    # ── Rejection signal: penalise themes Uly consistently rejects ──────────
+    # Reads the learning table for rejected articles and nudges those themes down.
+    try:
+        rej_rows = db_execute("""
+            SELECT a.title, a.summary FROM learning l
+            JOIN articles a ON a.id = l.article_id
+            WHERE l.action = 'rejected'
+              AND l.logged_at > NOW() - INTERVAL %s
+        """, (f"{days} days",), fetch="all")
+        if rej_rows:
+            rej_theme_counts = {}
+            for title, summary in rej_rows:
+                for theme in _detect_themes(f"{title or ''} {summary or ''}"):
+                    rej_theme_counts[theme] = rej_theme_counts.get(theme, 0) + 1
+            total_rej = sum(rej_theme_counts.values()) or 1
+            for theme, rcount in rej_theme_counts.items():
+                if theme not in weights:
+                    continue
+                # Rejection penalty: proportional to rejection rate, max -5 pts nudge
+                rej_penalty = min(5, round(rcount / total_rej * 20))
+                if rej_penalty > 0:
+                    old_w = weights[theme]["weight"]
+                    weights[theme]["weight"] = max(-LEARN_CAP, old_w - rej_penalty)
+                    weights[theme]["rej"] = rcount
+            log.info(f"📉 Rejection signal applied: {len(rej_theme_counts)} themes penalised")
+    except Exception as e:
+        log.warning(f"Rejection signal skipped: {e}")
+
     kv_set("topic_weights", weights)
     kv_set("topic_weights_baseline", {"median": round(baseline, 2)})
     log.info(f"📊 Computed topic weights for {len(weights)} themes (baseline median {round(baseline)})")
@@ -6715,34 +6802,33 @@ def _top_gainers_losers(weights, n=4):
     return (g, l)
 
 def check_learning_readiness():
-    """Weekly: if gate met and not yet asked, send the ONE-TIME readiness prompt."""
+    """Weekly: auto-activate learning once thresholds met; recompute weights if already on."""
     if not DB_ENABLED:
         return
-    posted, weeks, valid = learning_stats()
-    already = kv_get("learning_prompt_sent", {"sent": False})
-    if learning_is_active() or (isinstance(already, dict) and already.get("sent")):
+    if learning_is_active():
+        # Already on — recompute weights every week so model stays fresh
+        compute_topic_weights()
+        log.info("🧠 Learning active — weights recomputed for this week")
         return
+    posted, weeks, valid = learning_stats()
     if posted < LEARN_MIN_POSTS or weeks < LEARN_MIN_WEEKS or valid < LEARN_MIN_VALID_VIEWS:
-        log.info(f"🧪 Learning not ready: posts={posted}/{LEARN_MIN_POSTS} "
+        log.info(f"🧪 Learning not ready yet: posts={posted}/{LEARN_MIN_POSTS} "
                  f"weeks={weeks}/{LEARN_MIN_WEEKS} valid_views={valid}/{LEARN_MIN_VALID_VIEWS}")
         return
+    # Gate passed — auto-activate without waiting for manual /learning on
+    kv_set("learning_active", {"on": True, "by": "auto", "at": utcnow().isoformat()})
     weights = compute_topic_weights()
     gainers, losers = _top_gainers_losers(weights)
     msg = (
-        "🧠 <b>Learning mode ready</b>\n\n"
-        f"I've banked <b>{posted}</b> posts over <b>{weeks}</b> weeks, "
-        f"<b>{valid}</b> with real view counts.\n\n"
-        "<b>Top performers:</b>\n" + (gainers or "  (not enough data)") + "\n\n"
-        "<b>Underperformers:</b>\n" + (losers or "  (not enough data)") + "\n\n"
-        "If you approve, I'll let audience data <i>nudge</i> my posting decisions — "
-        f"capped at ±{LEARN_CAP} pts. It informs, it never overrides a serious story.\n\n"
-        "✅ <code>/learning on</code> to activate\n"
-        "📊 <code>/learning status</code> to see the numbers\n"
-        "<i>Ignore to stay observe-only. I won't ask again.</i>"
+        "🧠 <b>Learning mode auto-activated</b>\n\n"
+        f"Gate passed: <b>{posted}</b> posts · <b>{weeks}</b> weeks · <b>{valid}</b> with views.\n"
+        f"Audience engagement now nudges story scoring (±{LEARN_CAP} pts cap — never overrides serious news).\n\n"
+        "<b>Top performers:</b>\n" + (gainers or "  (gathering data)") + "\n\n"
+        "<b>Underperformers:</b>\n" + (losers or "  (gathering data)") + "\n\n"
+        "Turn off anytime: <code>/learning off</code>"
     )
     send_text(CORE_TEAM_CHAT_ID, msg, thread_id=ALERT_THREAD_ID)
-    kv_set("learning_prompt_sent", {"sent": True, "at": utcnow().isoformat()})
-    log.info("🧠 Readiness prompt sent to Content Lab (one-time).")
+    log.info(f"🧠 Learning AUTO-ACTIVATED: {posted} posts, {weeks}w, {valid} with views")
 
 # ── Weekly Analytics Report to Core Team ─────────────────────────────────────
 def send_weekly_analytics():
@@ -6773,12 +6859,13 @@ def send_weekly_analytics():
             + f"<b>Bot:</b> Samuga AI v{SAMUGA_VERSION}" + chr(10)
             + "Samuga Media | @samugacommunity"
         )
-        # ── Phase 2: weekly engagement crunch + readiness ──
+        # ── Weekly learning cycle: refresh data → recompute weights → auto-activate if ready ──
         learn_block = ""
         try:
-            backfill_tg_views()                      # refresh view counts (matured)
-            fetch_meta_insights()                    # refresh FB + IG engagement
-            weights = compute_topic_weights()        # recompute (stored, not yet acting)
+            backfill_tg_views()       # pull latest Telegram view counts
+            fetch_meta_insights()     # pull FB + IG engagement
+            check_learning_readiness()  # recompute weights + auto-activate if gate met
+            weights = kv_get("topic_weights", {})
             posted, weeks, valid = learning_stats()
             gainers, losers = _top_gainers_losers(weights)
             mode = "ACTIVE ✅" if learning_is_active() else "observing 👀"
@@ -6793,7 +6880,6 @@ def send_weekly_analytics():
         report = report + learn_block
 
         send_text(CORE_TEAM_CHAT_ID, report)
-        check_learning_readiness()                  # one-time prompt if gate met
         log.info("✅ Analytics report sent to core team")
     except Exception as e:
         log.error(f"Analytics report: {e}")
