@@ -31,6 +31,43 @@ from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
 from io import BytesIO
+from cards import generate_card, generate_dhivehi_card, fetch_background_image, draw_weather_icon
+from weather import (
+    get_weather_data, get_island_forecasts, get_prayer_times,
+    generate_weather_card, weather_code_to_info,
+    detect_weather_alert, send_weather_alert, send_weather_update,
+    MMS_ALERT_LEVELS, weather_alerts_today, ISLAND_LOCATIONS,
+    HIJRI_SPECIAL_DAYS, SPECIAL_DAY_DETAILS, ISLAMIC_REMINDERS
+)
+from fetchers import (
+    fetch_news, fetch_mvcrisis, fetch_all_dv_channels, fetch_dv_telegram,
+    get_local_headlines, rewrite_news, gemini_translate,
+    RSS_FEEDS, LOCAL_FEEDS, DV_TELEGRAM_CHANNELS, DEFAULT_KEYWORDS,
+    has_public_placeholder, public_text_is_safe, fallback_rewritten_news,
+    clean_ai_line, safe_image_keyword
+)
+from scoring import (
+    is_breaking, is_dhivehi, source_reliability,
+    score_article, score_breakdown, confidence_score,
+    should_hold_for_review, format_score_breakdown,
+    is_duplicate_story, remember_story_title, register_in_cluster,
+    recent_posts, user_conversations, recent_story_titles,
+    BREAKING_KEYWORDS, BREAKING_BLACKLIST, SOURCE_RELIABILITY
+)
+from db import (
+    init_database, db_execute, db_record_article, db_mark_status,
+    db_publish_article_for_website, db_log_learning,
+    db_set_article_message, db_set_article_matchkey,
+    kv_get, kv_set, mem_add, mem_list, mem_clear_all, mem_delete_last,
+    detect_trends, is_trending_topic, find_or_create_story,
+    get_story_timeline, search_stories, get_active_stories,
+    canonical_category, strip_source_links, samuga_public_summary,
+    normalize_article_language_for_public, _caption_match_key,
+    make_article_slug, generate_website_article_body,
+    TREND_THEMES, DB_ENABLED, is_dhivehi, looks_latin_thaana,
+    gemini_latin_thaana_to_thaana, gemini_latin_thaana_to_english,
+    _detect_themes
+)
 
 # ── Structured logging: tags make Railway logs readable ──────────────────────
 # Usage: log.info("[FETCH] pulled 12 articles")  →  easy to filter in Railway
@@ -39,126 +76,26 @@ log = logging.getLogger(__name__)
 
 SAMUGA_VERSION = "7.0"
 
+# Module-level timezone alias (used by utcnow() below and elsewhere).
+from datetime import timezone as _tz
 
 # Public destination shown to readers. We never expose competitor/source links on
 # Samuga public platforms; readers are directed back to Samuga Community.
-SAMUGA_PUBLIC_LINK = os.environ.get("SAMUGA_PUBLIC_LINK", "https://t.me/samugacommunity")
 SAMUGA_PUBLIC_SOURCE = os.environ.get("SAMUGA_PUBLIC_SOURCE", "Samuga Media")
-
-_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
-_HTML_A_RE = re.compile(r"<a\s+[^>]*href=[\"'][^\"']+[\"'][^>]*>(.*?)</a>", re.IGNORECASE | re.DOTALL)
-
-
-def strip_source_links(text):
-    """Remove external source URLs/html links from public Samuga copy."""
-    s = str(text or "")
-    # Keep anchor label but remove href destination.
-    s = _HTML_A_RE.sub(r"\1", s)
-    s = _URL_RE.sub("", s)
-    s = re.sub(r"\s+([,.;:!?])", r"\1", s)
-    s = re.sub(r"[ \t]{2,}", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
+SAMUGA_PUBLIC_LINK   = os.environ.get("SAMUGA_PUBLIC_LINK", "https://t.me/samugacommunity")
 
 
 def samuga_public_caption(caption):
-    """Clean any public caption before Telegram/social posting."""
-    clean = strip_source_links(caption)
-    if "@samugacommunity" not in clean and SAMUGA_PUBLIC_LINK not in clean:
-        clean = clean.rstrip() + "\n\n📡 <b>Samuga Media</b> | @samugacommunity"
-    return clean
-
-
-def samuga_public_summary(title="", summary="", rewritten=""):
-    """Create cleaner website article text. Prefer Samuga rewrite over source excerpt."""
-    primary = rewritten or summary or title or ""
-    primary = strip_source_links(primary)
-    primary = re.sub(r"\s+", " ", primary).strip()
-    # Website should feel like an article, not a scraped link/title dump.
-    if primary and len(primary.split()) < 18 and title:
-        primary = f"{strip_source_links(title)}. {primary}"
-    return primary[:2600]
-
-# ── Public output safety gate ────────────────────────────────────────────────
-# Blocks AI/template placeholders from reaching Telegram, Buffer/socials, or website.
-# This protects against model replies like "[3-sentence punchy post]" being treated as news.
-_PUBLIC_PLACEHOLDER_RE = re.compile(
-    r"(\[[^\]]*(?:sentence|punchy|rewrite|rewritten|specific|keyword|caption|post|headline|summary|text|image|insert|placeholder)[^\]]*\])"
-    r"|(<[^>]*(?:rewritten|specific|keyword|caption|post|headline|summary|text|image)[^>]*>)"
-    r"|(\b(?:TEXT|IMAGE|CAPTION|POST|HEADLINE|SUMMARY)\s*:\s*(?:\[|<|$))"
-    r"|(\bplaceholder\b|\blorem ipsum\b|\binsert (?:text|caption|headline|summary|keyword)\b)",
-    re.IGNORECASE
-)
-
-def has_public_placeholder(text):
-    """True if text contains AI/template placeholder garbage that must never go public."""
-    s = strip_source_links(text or "")
-    if not s:
-        return True
-    compact = re.sub(r"\s+", " ", s).strip()
-    if not compact:
-        return True
-    # Pure bracket/template line or obvious instruction fragment.
-    if _PUBLIC_PLACEHOLDER_RE.search(compact):
-        return True
-    if compact.startswith("[") and compact.endswith("]") and len(compact) <= 120:
-        return True
-    # Common model failure: it returns the instruction rather than the result.
-    bad_phrases = [
-        "3-sentence punchy post",
-        "three-sentence punchy post",
-        "rewritten news",
-        "specific keyword",
-        "write a short",
-        "generate a caption",
-    ]
-    low = compact.lower()
-    return any(p in low for p in bad_phrases)
-
-def public_text_is_safe(*parts):
-    """Check combined public-facing text before card/Telegram/social/website output."""
-    combined = "\n".join(str(p or "") for p in parts if p is not None)
-    return not has_public_placeholder(combined)
-
-def fallback_rewritten_news(title="", summary="", cat="LOCAL"):
-    """Safe non-AI fallback when Claude returns a placeholder or invalid output."""
-    title = strip_source_links(title or "").strip()
-    summary = strip_source_links(summary or "").strip()
-    summary = re.sub(r"\s+", " ", summary)
-    if summary and summary.lower() != title.lower() and not has_public_placeholder(summary):
-        # Keep it compact for card/social use.
-        return summary[:360].rsplit(" ", 1)[0] if len(summary) > 360 else summary
-    return title or "Samuga Media is following this developing story."
-
-def clean_ai_line(value):
-    """Remove labels/quotes/brackets from a single AI output line."""
-    s = strip_source_links(value or "")
-    s = s.strip().strip('"').strip("'").strip()
-    # If model returned a bracketed template, keep it for validation to reject.
-    return re.sub(r"\s+", " ", s).strip()
-
-def safe_image_keyword(keyword="", cat="LOCAL", title=""):
-    """Return a safe Pexels keyword; never allow placeholder keywords."""
-    kw = clean_ai_line(keyword)
-    if has_public_placeholder(kw) or len(kw.split()) > 6:
-        return DEFAULT_KEYWORDS.get(cat, DEFAULT_KEYWORDS.get(canonical_category(cat, title, ""), "maldives"))
-    return kw or DEFAULT_KEYWORDS.get(cat, "maldives")
-
-def mvt_display_time(dt):
-    """Format DB timestamps in Maldives time. Railway/Postgres often returns UTC."""
-    if not dt:
-        return "Recent"
+    """Sanitize a caption for public posting: strip competitor/source links so
+    Samuga public platforms never expose external source URLs."""
+    if not caption:
+        return caption
     try:
-        # DB timestamps are effectively UTC in Railway; website readers need MVT.
-        return (dt + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+        return strip_source_links(caption)
     except Exception:
-        try:
-            return dt.strftime("%d %b %Y • %H:%M")
-        except Exception:
-            return "Recent"
+        return caption
 
-# ── Timezone-aware UTC helper (replaces deprecated utcnow()) ─────────
-from datetime import timezone as _tz
+
 def utcnow():
     """Naive UTC datetime — same value as the old utcnow() but not deprecated."""
     return datetime.now(_tz.utc).replace(tzinfo=None)
@@ -166,6 +103,18 @@ def utcnow():
 def mvt_now():
     """Current Maldives time (UTC+5) as naive datetime."""
     return utcnow() + timedelta(hours=5)
+
+def mvt_display_time(dt):
+    """Display DB UTC timestamps as Maldives time for website/API output."""
+    if not dt:
+        return "Recent"
+    try:
+        # psycopg2 TIMESTAMPTZ may be timezone-aware; normalize by adding offset only for naive UTC.
+        if getattr(dt, "tzinfo", None) is not None:
+            return dt.astimezone(_tz.utc).replace(tzinfo=None).__add__(timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+        return (dt + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+    except Exception:
+        return "Recent"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # [CONFIG] — Environment variables & API keys
@@ -190,12 +139,6 @@ META_APP_SECRET     = os.environ.get("META_APP_SECRET", "")
 META_IG_ID          = os.environ.get("META_IG_ID", "")  # optional; auto-resolved if blank
 META_API_VER        = os.environ.get("META_API_VER", "v21.0")
 TOMORROW_API_KEY    = os.environ.get("TOMORROW_API_KEY", "")  # weather data
-
-# ── Emergency kill-switches (flip in Railway env vars — no redeploy needed) ──
-# POSTING_PAUSED=true  → stops ALL Telegram + Buffer/social posting instantly
-# SOCIAL_PAUSED=true   → stops Buffer/social only; Telegram still posts normally
-POSTING_PAUSED = os.environ.get("POSTING_PAUSED", "false").lower() == "true"
-SOCIAL_PAUSED  = os.environ.get("SOCIAL_PAUSED",  "false").lower() == "true"
 
 ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -237,96 +180,6 @@ class Article:
 # ═══════════════════════════════════════════════════════════════════════════
 # ── RSS Feeds (v4 Strategy) ───────────────────────────────────────────────────
 # LOCAL (70%) — Maldivian sources, priority order
-LOCAL_FEEDS = [
-    # Tier 1 - Breaking/Crisis
-    {"url": "https://news.google.com/rss/search?q=maldives+breaking+incident+accident+arrest&hl=en-MV&gl=MV&ceid=MV:en", "cat": "DISASTER", "lang": "en"},
-    # Tier 2 - English sources
-    {"url": "https://see.mv/feed",                   "cat": "LOCAL",   "lang": "en"},
-    {"url": "https://english.sun.mv/feed",            "cat": "LOCAL",   "lang": "en"},  # already present
-    {"url": "https://edition.mv/feed",                "cat": "LOCAL",   "lang": "en"},  # already present (editon)
-    {"url": "https://maldivesindependent.com/feed",   "cat": "LOCAL",   "lang": "en"},
-    {"url": "https://oneonline.mv/en/feed",           "cat": "LOCAL",   "lang": "en"},
-    {"url": "https://psmnews.mv/en/feed",             "cat": "LOCAL",   "lang": "en"},  # already present (PSM News)
-    {"url": "https://maldivesvoice.com/feed",         "cat": "LOCAL",   "lang": "en"},  # NEW: Maldives Voice
-    {"url": "https://presidency.gov.mv/feed",         "cat": "LOCAL",   "lang": "en"},  # NEW: Presidency
-    # Tier 3 - Dhivehi sources
-    {"url": "https://sunonline.mv/feed",              "cat": "LOCAL",   "lang": "dv"},  # NEW: SunOnline (Dhivehi)
-    {"url": "https://mihaaru.com/rss",                "cat": "LOCAL",   "lang": "dv"},
-    {"url": "https://avas.mv/feed",                   "cat": "LOCAL",   "lang": "dv"},
-    {"url": "https://news.google.com/rss/search?q=maldives+politics+parliament+government&hl=en-MV&gl=MV&ceid=MV:en", "cat": "LOCAL", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=maldives+economy+finance+business&hl=en-MV&gl=MV&ceid=MV:en",       "cat": "LOCAL", "lang": "en"},
-]
-
-# SPORTS (10%) — Maldives sports first, then major international
-SPORTS_FEEDS = [
-    {"url": "https://news.google.com/rss/search?q=maldives+football+sports&hl=en-MV&gl=MV&ceid=MV:en", "cat": "SPORTS", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=world+cup+2026+results&hl=en&gl=US&ceid=US:en",       "cat": "SPORTS", "lang": "en"},
-]
-
-# WORLD (10%) — Major international updates, plus Maldives/region impact.
-# Google News RSS is the most reliable fallback because many news sites change/block RSS.
-WORLD_FEEDS = [
-    {"url": "https://news.google.com/rss/search?q=major+world+news+war+crisis+ceasefire+earthquake+election&hl=en&gl=US&ceid=US:en", "cat": "WORLD", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=Iran+US+Israel+Gaza+Russia+Ukraine+latest&hl=en&gl=US&ceid=US:en", "cat": "WORLD", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=South+Asia+India+Sri+Lanka+Bangladesh+Maldives&hl=en-MV&gl=MV&ceid=MV:en", "cat": "WORLD", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=global+economy+oil+prices+dollar+shipping+Indian+Ocean&hl=en&gl=US&ceid=US:en", "cat": "WORLD", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=earthquake+tsunami+disaster+flood+cyclone+latest&hl=en&gl=US&ceid=US:en", "cat": "DISASTER", "lang": "en"},
-]
-
-# LIFESTYLE (10%)
-LIFESTYLE_FEEDS = [
-    {"url": "https://visitmaldives.com/feed",                                                                   "cat": "TOURISM", "lang": "en"},  # NEW: Visit Maldives official
-    {"url": "https://news.google.com/rss/search?q=maldives+tourism+travel+resort&hl=en-MV&gl=MV&ceid=MV:en", "cat": "TOURISM", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=maldives+weather+storm&hl=en-MV&gl=MV&ceid=MV:en",         "cat": "WEATHER", "lang": "en"},
-    # AccuWeather RSS removed — weather handled by 8AM/8PM weather cards instead
-]
-
-RSS_FEEDS = LOCAL_FEEDS + SPORTS_FEEDS + WORLD_FEEDS + LIFESTYLE_FEEDS
-
-CAT_CONFIG = {
-    "BREAKING":  {"label": "🚨  BREAKING NEWS", "color": (220,50,50)},
-    "LOCAL":     {"label": "🇲🇻  LOCAL NEWS",    "color": (41,171,226)},
-    "POLITICAL": {"label": "🏛️  POLITICAL",      "color": (180,140,40)},
-    "LIFESTYLE": {"label": "🌴  LIFESTYLE",      "color": (160,80,220)},
-    "SPORTS":    {"label": "🏅  SPORTS",         "color": (34,180,80)},
-    # Legacy aliases — mapped so old code/feeds keep working
-    "DISASTER":  {"label": "🚨  BREAKING NEWS", "color": (220,50,50)},
-    "WORLD":     {"label": "🌍  WORLD NEWS",     "color": (220,80,60)},
-    "WEATHER":   {"label": "🌴  LIFESTYLE",      "color": (160,80,220)},
-    "TOURISM":   {"label": "🌴  LIFESTYLE",      "color": (160,80,220)},
-    "FOOTBALL":  {"label": "🏅  SPORTS",         "color": (34,180,80)},
-}
-
-# Maps any legacy/raw category to one of the 5 canonical display categories
-CATEGORY_MAP = {
-    "BREAKING":"BREAKING", "DISASTER":"BREAKING",
-    "LOCAL":"LOCAL",
-    "POLITICAL":"POLITICAL",
-    "LIFESTYLE":"LIFESTYLE", "TOURISM":"LIFESTYLE", "WEATHER":"LIFESTYLE",
-    "SPORTS":"SPORTS", "FOOTBALL":"SPORTS",
-    "WORLD":"LOCAL",  # world news folded into local (only Maldives-relevant posts anyway)
-}
-
-# Keywords that mark a story as POLITICAL (split out from general LOCAL)
-POLITICAL_KEYWORDS = [
-    "parliament","majlis","president","minister","ministry","government","cabinet",
-    "mp ","ruling party","opposition","mdp","pnc","ppm","election","vote","policy",
-    "bill","law","court","supreme court","judge","attorney general","ag office",
-    "council","mayor","governor","resign","appointed","reshuffle","summit","diplomatic",
-    "ambassador","foreign ministry","budget","parliamentary","constitution","impeach"
-]
-
-def canonical_category(cat, title="", summary=""):
-    """Resolve raw category + content into one of the 5 display categories."""
-    base = CATEGORY_MAP.get(cat, "LOCAL")
-    # If it's LOCAL, check whether it's actually political
-    if base == "LOCAL":
-        text = (title + " " + summary).lower()
-        if any(kw in text for kw in POLITICAL_KEYWORDS):
-            return "POLITICAL"
-    return base
-
-# ── Core Team Session Context (in-memory only, clears on restart) ────────────
 core_team_session_context = {}  # user_id -> stored context
 
 # Pending manual card waiting for /confirm before firing to all platforms
@@ -341,37 +194,40 @@ _ai_proactive_mode = True   # on by default — team can toggle
 # ── Universal Approval Queue (in-memory) ─────────────────────────────────────
 # Every card (English + Dhivehi) waits here for Content Lab approval before posting.
 # Cards expire after 2 hours if not approved.
-ENGLISH_AUTOPOST_SECONDS = 900    # Fallback: English auto-post after 15 min if no per-item delay is set
-BREAKING_AUTOPOST_SECONDS = 0     # Low-confidence breaking does NOT auto-post; it waits for Alert approval
-TELEGRAM_GAP_SECONDS    = 120    # 2 minutes between regular Telegram posts
-DAILY_TG_POST_MAX       = 30     # Strict selection target: normal 10-15/day, big days up to ~30
-BREAKING_DAILY_MAX      = 15     # Hard cap: max breaking posts per day (prevents flood on busy news days)
+ENGLISH_AUTOPOST_SECONDS = 2700   # Regular: auto-post after 45 min if nobody reviews
+BREAKING_AUTOPOST_SECONDS = 1800  # Breaking held for confidence: auto-posts in 30 min
+TELEGRAM_GAP_SECONDS    = 7200   # 2 hours between regular Telegram posts
+DAILY_TG_POST_MAX       = 12     # Max regular posts per day to Telegram
 DHIVEHI_EXPIRY_SECONDS   = 7200   # Dhivehi: expire (delete) after 2h if not approved
-
-# ── Breaking-news daily counter (MVT-based, resets at midnight) ──────────────
-_breaking_day_count = {"date": None, "count": 0}
-
-def can_post_breaking_today():
-    """Returns True if we haven't hit the breaking daily cap yet."""
-    today = _mvt_today()
-    if _breaking_day_count["date"] != today:
-        _breaking_day_count["date"] = today
-        _breaking_day_count["count"] = 0
-    if _breaking_day_count["count"] >= BREAKING_DAILY_MAX:
-        log.warning(f"📵 Breaking daily cap reached ({_breaking_day_count['count']}/{BREAKING_DAILY_MAX}) — holding")
-        return False
-    return True
-
-def increment_breaking_count():
-    today = _mvt_today()
-    if _breaking_day_count["date"] != today:
-        _breaking_day_count["date"] = today
-        _breaking_day_count["count"] = 0
-    _breaking_day_count["count"] += 1
-    log.info(f"🔴 Breaking posts today: {_breaking_day_count['count']}/{BREAKING_DAILY_MAX}")
 
 approval_queue = {}  # key -> {card_bytes, caption, title, link, cat, lang, dv_text, created_at, ...}
 _approval_counter = [0]
+
+# ── Global state variables (removed from db block, restored here) ──────────────
+analytics           = {"posts_by_cat": {}, "breaking_count": 0, "social_success": 0, "social_fail": 0, "week_start": None}
+last_regular_post_time = None
+daily_sports_count  = {"date": None, "count": 0}
+daily_world_count   = {"date": None, "count": 0}
+daily_tourism_count = {"date": None, "count": 0}
+
+
+def can_post_cat_today(counter, max_per_day):
+    """Check a per-category daily counter against its cap. Resets on a new MVT
+    day and increments the counter when posting is allowed. Returns True if a
+    post in this category is still within today's budget."""
+    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+    if counter.get("date") != today:
+        counter["date"] = today
+        counter["count"] = 0
+    if counter["count"] >= max_per_day:
+        return False
+    counter["count"] += 1
+    try:
+        persist_state()
+    except Exception:
+        pass
+    return True
+
 
 # ── Content Lab flood control ────────────────────────────────────────────────
 # Goal: normal newsroom flow = max 4 approval cards/hour.
@@ -451,93 +307,105 @@ def store_pending_approval(card_bytes, caption, title, link, cat="LOCAL", lang="
     persist_state()
     return key
 
-def _auto_publish_approval_item(key, item, reason="auto"):
-    """Publish an approved/auto-approved English card through the 2-minute social queue."""
-    try:
-        if not item or item.get("lang") == "dv":
-            return False
-        if item.get("_auto_published"):
-            return False
-        item["_auto_published"] = True
-        buf = io.BytesIO(item["card_bytes"])
-        queue_for_social(
-            buf, item["caption"],
-            key_label=f"{key.upper()} ({reason})",
-            tg_ok=False, post_telegram=True,
-            article_id=item.get("article_id"), title=item.get("title",""),
-            summary=item.get("summary",""), cat=item.get("cat","LOCAL"),
-            source=item.get("source","Samuga Media"), link=item.get("link",""),
-            lang=item.get("lang","en"), is_breaking=item.get("is_breaking", False)
-        )
-        send_text(
-            CORE_TEAM_CHAT_ID,
-            f"⏰ <b>{key.upper()}</b> auto-sent to 2-min social queue ({reason})\n"
-            f"📰 {item.get('title','')[:90]}",
-            thread_id=CONTENT_LAB_THREAD_ID
-        )
-        return True
-    except Exception as e:
-        log.error(f"Auto publish {key}: {e}")
-        return False
-
 def expire_old_approvals():
     """
-    Approval lifecycle:
-    - Low-confidence breaking in Alert Chat does NOT auto-post; team must approve/reject.
-    - English high confidence can auto-post immediately after preview.
-    - English medium confidence auto-posts after 5 min.
-    - English lower confidence auto-posts after 15–30 min.
-    - Dhivehi never auto-posts for now; it expires after 2 hours.
+    Runs every few minutes:
+    - Breaking held (low confidence): auto-posts after 30 min if no team action
+    - Regular English: auto-posts after 45 min via queue
+    - Dhivehi breaking: auto-posts after 2h
+    - Regular Dhivehi: deleted after 2h
     """
     now = utcnow()
-    changed = False
 
-    # English confidence-based auto-post
-    en_due = []
-    for k, v in list(approval_queue.items()):
-        if v.get("lang") != "en":
-            continue
-        if v.get("_alert_only"):
-            continue
-        if not v.get("card_bytes"):
-            continue
-        delay = v.get("_autopost_after_seconds")
-        if delay is None:
-            delay = english_autopost_delay_seconds(v)
-        if delay is None:
-            continue
-        age = (now - v.get("created_at", now)).total_seconds()
-        if age >= int(delay):
-            en_due.append((k, v, int(delay)))
+    # Breaking held for confidence — auto-post after 30 min
+    breaking_held = [k for k, v in approval_queue.items()
+                     if v.get("lang") == "en"
+                     and v.get("is_breaking", False)
+                     and v.get("_held_for_confidence", False)
+                     and (now - v["created_at"]).total_seconds() > BREAKING_AUTOPOST_SECONDS]
+    for k in breaking_held:
+        item = approval_queue.pop(k)
+        log.info(f"⏰ Breaking {k} auto-posting (30min, no review): {item.get('title','')[:50]}")
+        try:
+            buf = io.BytesIO(item["card_bytes"])
+            queue_for_social(buf, item["caption"],
+                key_label=f"{k.upper()} (breaking auto)",
+                tg_ok=False, post_telegram=True, is_breaking=True,
+                article_id=item.get("article_id"), title=item.get("title",""),
+                summary=item.get("summary",""), cat=item.get("cat","BREAKING"),
+                source=item.get("source","Samuga Media"), link=item.get("link",""),
+                lang=item.get("lang","en"))
+            send_text(CORE_TEAM_CHAT_ID,
+                f"⏰ <b>{k.upper()} Breaking auto-posted</b> (30min, no review)\n"
+                f"📰 {item.get('title','')[:80]}",
+                thread_id=ALERT_THREAD_ID)
+        except Exception as e:
+            log.error(f"Breaking auto-post {k}: {e}")
 
-    for k, item, delay in en_due:
-        if k not in approval_queue:
-            continue
-        approval_queue.pop(k, None)
-        reason = "instant high-confidence" if delay <= 0 else f"{max(1, delay//60)}min no review"
-        log.info(f"⏰ English {k} auto-queueing ({reason}): {item.get('title','')[:55]}")
-        if _auto_publish_approval_item(k, item, reason=reason):
-            changed = True
+    # Regular English auto-post after 45 min
+    en_due = [k for k, v in approval_queue.items()
+              if v.get("lang") == "en"
+              and not v.get("is_breaking", False)
+              and (now - v["created_at"]).total_seconds() > ENGLISH_AUTOPOST_SECONDS]
+    for k in en_due:
+        item = approval_queue.pop(k)
+        title = item.get("title","")[:50]
+        log.info(f"⏰ English {k} auto-queuing (45min, no review): {title}")
+        try:
+            buf = io.BytesIO(item["card_bytes"])
+            queue_for_social(buf, item["caption"],
+                key_label=f"{k.upper()} (auto)",
+                tg_ok=False, post_telegram=True,
+                article_id=item.get("article_id"), title=item.get("title",""),
+                summary=item.get("summary",""), cat=item.get("cat","LOCAL"),
+                source=item.get("source","Samuga Media"), link=item.get("link",""),
+                lang=item.get("lang","en"), is_breaking=item.get("is_breaking", False))
+            send_text(CORE_TEAM_CHAT_ID,
+                f"⏰ <b>{k.upper()}</b> auto-posted (45min, no review)\n📰 {item.get('title','')[:80]}",
+                thread_id=ALERT_THREAD_ID)
+        except Exception as e:
+            log.error(f"Auto-post queue {k}: {e}")
 
-    # Dhivehi expiry — no auto-post for now
+    # Dhivehi expiry — breaking ones auto-post after 2h, regular ones delete
     dv_due = [k for k, v in approval_queue.items()
-              if v.get("lang") == "dv"
-              and (now - v.get("created_at", now)).total_seconds() > DHIVEHI_EXPIRY_SECONDS]
+              if v["lang"] == "dv" and (now - v["created_at"]).total_seconds() > DHIVEHI_EXPIRY_SECONDS]
     for k in dv_due:
-        item = approval_queue.pop(k, None)
-        if not item:
-            continue
-        log.info(f"⏰ Dhivehi {k} expired (2h, no auto-post): {item.get('title','')[:55]}")
-        send_text(
-            CORE_TEAM_CHAT_ID,
-            f"⏰ <b>{k.upper()}</b> Dhivehi card expired after 2h\n"
-            f"📰 {item.get('title','')[:90]}\n"
-            f"<i>Dhivehi auto-post is disabled for now.</i>",
-            thread_id=CONTENT_LAB_THREAD_ID
-        )
-        changed = True
+        item = approval_queue.pop(k)
+        title = item.get("title","")[:40]
+        # Breaking Dhivehi with auto-post flag → post automatically
+        if item.get("_auto_post_breaking") and item.get("dv_text"):
+            log.info(f"⏰ Breaking Dhivehi {k} auto-posting after 2h: {title}")
+            try:
+                kw = item.get("keyword","local")
+                bg = item.get("_bg_image") or fetch_background_image(kw, cat=item.get("cat"), title=item.get("title",""))
+                ts_now = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+                card = generate_card(item["dv_text"], SAMUGA_PUBLIC_SOURCE, ts_now, item.get("cat","BREAKING"), bg)
+                full_caption = (
+                    f"🇲🇻 <b>{item['title']}</b>\n\n"
+                    f"{item['dv_text']}\n\n"
+                    f"📡 <b>ސަމުގާ މީޑިއާ</b> | @samugacommunity"
+                )
+                card.seek(0)
+                tg_ok = send_to_telegram(card, full_caption)
+                if tg_ok:
+                    card.seek(0)
+                    queue_for_social(io.BytesIO(card.getvalue()), full_caption,
+                                     key_label=k.upper(), tg_ok=True,
+                                     article_id=item.get("article_id"), title=item.get("title",""),
+                                     summary=item.get("summary",""), cat=item.get("cat","BREAKING"),
+                                     source=item.get("source","Samuga Media"), link=item.get("link",""),
+                                     lang="dv", is_breaking=True)
+                    send_text(CORE_TEAM_CHAT_ID,
+                        f"⏰ <b>{k.upper()} Breaking Dhivehi auto-posted</b> (2h, no review)\n"
+                        f"📰 {item['title'][:70]}",
+                        thread_id=ALERT_THREAD_ID)
+                    log.info(f"⏰ Breaking Dhivehi {k} auto-posted to community")
+            except Exception as e:
+                log.error(f"Breaking DV auto-post {k}: {e}")
+        else:
+            log.info(f"⏰ Dhivehi {k} expired (2h, not breaking, deleted): {title}")
 
-    if changed:
+    if en_due or dv_due:
         persist_state()
 
 # Backwards-compat alias (old code references dhivehi_pending)
@@ -589,1402 +457,13 @@ REJECT_RESPONSES = [
     "Fair enough. Some stories aren't worth telling. This was one of them. Card gone. ✂️",
 ]
 
-BREAKING_KEYWORDS = [
-    "killed","dead","dies","murder","shot","stabbed","explosion","bomb","attack",
-    "tsunami","earthquake","flood","disaster","sinking","collapsed","hostage",
-    "missing person","fire broke","crash landed","emergency landing","gas leak",
-    "capsized","swept away","search and rescue"
-]
-# Note: "arrested" and "raided" removed — those go through normal news flow
-
-# Keywords that should NEVER be breaking news
-BREAKING_BLACKLIST = [
-    "world cup","football","cricket","sports","fifa","champions league","premier league","tourism","resort","hotel","travel",
-    "award","ranking","luxury","boutique","hospitality","destination","lagoon",
-    "civil war","squad","team","player","match","game","season","transfer",
-    "economy","business","market","price","investment","opening","launch","event"
-]
-
-# ── World-news gate: allow only major global stories, not random foreign filler.
-# Samuga should carry world updates when they are big enough for Maldivians to ask about
-# or when they affect the region/economy/travel/safety.
-WORLD_MAJOR_KEYWORDS = [
-    "war", "ceasefire", "airstrike", "missile", "attack", "invasion", "conflict",
-    "earthquake", "tsunami", "cyclone", "flood", "volcano", "disaster",
-    "election", "president", "prime minister", "government collapsed", "coup",
-    "oil price", "dollar", "global economy", "shipping", "red sea", "indian ocean",
-    "iran", "israel", "gaza", "palestine", "ukraine", "russia", "india", "sri lanka",
-    "china", "us", "united states", "uk", "un", "world bank", "imf",
-    "travel ban", "airport closed", "flight cancelled", "visa", "pandemic", "outbreak"
-]
-
-def is_major_world_news_text(text):
-    """True when a global story is important enough for Samuga public updates."""
-    t = (text or "").lower()
-    if any(k in t for k in ["world cup", "premier league", "champions league", "celebrity", "movie", "concert"]):
-        return False
-    return any(k in t for k in WORLD_MAJOR_KEYWORDS)
-
-# ── Source Ladder configs ───────────────────────────────────────────────────
-# Local RSS often returns 403/empty in Maldives, so every source has fallbacks:
-# RSS candidates → latest webpage scrape → public Telegram → Google News backup.
-RSS_CANDIDATE_PATHS = ["/feed", "/rss", "/rss.xml", "/feed.xml", "/index.xml", "/en/feed", "/rss/news"]
-
-LOCAL_RSS_RECOVERY_SOURCES = [
-    {"domain": "https://mihaaru.com",        "source": "Mihaaru", "cat": "LOCAL", "lang": "dv"},
-    {"domain": "https://avas.mv",            "source": "Avas",    "cat": "LOCAL", "lang": "dv"},
-    {"domain": "https://sun.mv",             "source": "Sun",     "cat": "LOCAL", "lang": "dv"},
-    {"domain": "https://sunonline.mv",       "source": "Sun",     "cat": "LOCAL", "lang": "dv"},
-    {"domain": "https://english.sun.mv",     "source": "Sun",     "cat": "LOCAL", "lang": "en"},
-    {"domain": "https://psmnews.mv",         "source": "PSM News","cat": "LOCAL", "lang": "en"},
-    {"domain": "https://edition.mv",         "source": "Edition", "cat": "LOCAL", "lang": "en"},
-    {"domain": "https://raajje.mv",          "source": "Raajje",  "cat": "LOCAL", "lang": "dv"},
-    {"domain": "https://voice.mv",           "source": "VoiceMV", "cat": "LOCAL", "lang": "dv"},
-]
-
-LOCAL_GOOGLE_BACKUP_FEEDS = [
-    {"url": "https://news.google.com/rss/search?q=site:mihaaru.com+Maldives&hl=dv-MV&gl=MV&ceid=MV:dv", "cat": "LOCAL", "lang": "dv", "source": "Mihaaru via Google"},
-    {"url": "https://news.google.com/rss/search?q=site:avas.mv+Maldives&hl=dv-MV&gl=MV&ceid=MV:dv", "cat": "LOCAL", "lang": "dv", "source": "Avas via Google"},
-    {"url": "https://news.google.com/rss/search?q=site:sun.mv+Maldives+OR+site:english.sun.mv+Maldives&hl=en-MV&gl=MV&ceid=MV:en", "cat": "LOCAL", "lang": "en", "source": "Sun via Google"},
-    {"url": "https://news.google.com/rss/search?q=site:psmnews.mv+Maldives&hl=en-MV&gl=MV&ceid=MV:en", "cat": "LOCAL", "lang": "en", "source": "PSM via Google"},
-    {"url": "https://news.google.com/rss/search?q=site:raajje.mv+Maldives&hl=en-MV&gl=MV&ceid=MV:en", "cat": "LOCAL", "lang": "en", "source": "Raajje via Google"},
-]
-
-def parse_extra_telegram_sources():
-    """Optional env: SAMUGA_EXTRA_TG_CHANNELS='handle:Source:lang:reliability,handle2:Source2:dv:85'"""
-    out = []
-    raw = os.environ.get("SAMUGA_EXTRA_TG_CHANNELS", "").strip()
-    if not raw:
-        return out
-    for part in raw.split(","):
-        bits = [b.strip() for b in part.split(":")]
-        if len(bits) >= 2 and bits[0] and bits[1]:
-            out.append({
-                "handle": bits[0].lstrip("@"),
-                "source": bits[1],
-                "lang_hint": bits[2] if len(bits) >= 3 and bits[2] else "auto",
-                "reliability": int(bits[3]) if len(bits) >= 4 and bits[3].isdigit() else 80,
-            })
-    return out
-
 # ── PostgreSQL Database Layer (v6) ────────────────────────────────────────────
 # Railway auto-injects DATABASE_URL when Postgres is in the project.
 # The bot uses Postgres for the article archive + intelligence, but ALWAYS falls
 # back to JSON files if the DB is unavailable, so it never breaks.
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-_db_pool = None
-DB_ENABLED = False
-
-def init_database():
-    """Connect to Postgres and create tables. Sets DB_ENABLED on success."""
-    global _db_pool, DB_ENABLED
-    if not DATABASE_URL:
-        log.info("🗄️ No DATABASE_URL — running in JSON-only mode")
-        return
-    try:
-        from psycopg2 import pool as _pgpool
-        # Railway sometimes gives postgres:// — psycopg2 wants postgresql://
-        url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-        _db_pool = _pgpool.SimpleConnectionPool(1, 5, dsn=url)
-        # Create schema
-        conn = _db_pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS articles (
-                        id              TEXT PRIMARY KEY,
-                        title           TEXT NOT NULL,
-                        summary         TEXT,
-                        link            TEXT,
-                        source          TEXT,
-                        category        TEXT,
-                        lang            TEXT,
-                        score           INTEGER DEFAULT 0,
-                        reliability     INTEGER DEFAULT 0,
-                        is_breaking     BOOLEAN DEFAULT FALSE,
-                        cluster_id      TEXT,
-                        status          TEXT DEFAULT 'seen',   -- seen|queued|posted|rejected|duplicate
-                        found_at        TIMESTAMPTZ DEFAULT NOW(),
-                        posted_at       TIMESTAMPTZ,
-                        tg_message_id   BIGINT,
-                        tg_views        INTEGER DEFAULT 0,
-                        meta_engagement INTEGER DEFAULT 0,   -- FB+IG reactions/comments/shares/likes
-                        match_key       TEXT,                -- normalized headline for caption matching
-                        article_slug    TEXT,
-                        article_excerpt TEXT,
-                        article_body    TEXT,
-                        article_generated_at TIMESTAMPTZ
-                    );
-                """)
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_found_at ON articles(found_at);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_status   ON articles(status);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_cluster  ON articles(cluster_id);")
-                # Key-value store for bot state (replaces bot_state.json eventually)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS bot_kv (
-                        key        TEXT PRIMARY KEY,
-                        value      JSONB,
-                        updated_at TIMESTAMPTZ DEFAULT NOW()
-                    );
-                """)
-                # Phase 2: learning table — records every team action so the bot
-                # can learn from approvals/rejections over time.
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS learning (
-                        id              SERIAL PRIMARY KEY,
-                        article_id      TEXT,
-                        action          TEXT,          -- approved | rejected | edited | auto_posted
-                        member          TEXT,          -- who did it (first_name)
-                        category        TEXT,
-                        source          TEXT,
-                        score           INTEGER,
-                        theme           TEXT,          -- trend theme if any
-                        original_caption TEXT,
-                        final_caption    TEXT,
-                        lang            TEXT,
-                        created_at      TIMESTAMPTZ DEFAULT NOW()
-                    );
-                """)
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_learning_action ON learning(action);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_learning_theme  ON learning(theme);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_msgid  ON articles(tg_message_id);")
-                # Phase 2.5: add Meta columns to an already-existing articles table (no-op if present)
-                cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS meta_engagement INTEGER DEFAULT 0;")
-                cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS match_key TEXT;")
-                # Website Article Engine columns — detailed website-first articles
-                cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS article_slug TEXT;")
-                cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS article_excerpt TEXT;")
-                cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS article_body TEXT;")
-                cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS article_generated_at TIMESTAMPTZ;")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_matchkey ON articles(match_key);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_articles_slug ON articles(article_slug);")
-                # Phase 3: team memory — persistent facts/preferences the bot learns
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS team_memory (
-                        id          SERIAL PRIMARY KEY,
-                        category    TEXT,          -- preference | decision | fact | audience | style
-                        content     TEXT NOT NULL,
-                        added_by    TEXT,          -- who added it
-                        created_at  TIMESTAMPTZ DEFAULT NOW()
-                    );
-                """)
-                # Public Samuga AI chat analytics — one public brain across Website, Telegram, and future WhatsApp.
-                # This stores what people ask, so Samuga can learn public interest trends.
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS public_chat_messages (
-                        id            SERIAL PRIMARY KEY,
-                        platform      TEXT,
-                        session_id    TEXT,
-                        user_key      TEXT,
-                        user_message  TEXT,
-                        bot_reply     TEXT,
-                        lang          TEXT,
-                        intent        TEXT,
-                        topics        TEXT[],
-                        used_search   BOOLEAN DEFAULT FALSE,
-                        created_at    TIMESTAMPTZ DEFAULT NOW()
-                    );
-                """)
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_public_chat_created ON public_chat_messages(created_at);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_public_chat_platform ON public_chat_messages(platform);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_public_chat_intent ON public_chat_messages(intent);")
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS public_interest_daily (
-                        day           DATE,
-                        topic         TEXT,
-                        platform      TEXT,
-                        count         INTEGER DEFAULT 0,
-                        updated_at    TIMESTAMPTZ DEFAULT NOW(),
-                        PRIMARY KEY (day, topic, platform)
-                    );
-                """)
-                # Phase 4: STORY INTELLIGENCE — ongoing story threads ("Story #248")
-                # A story groups many article updates about the same real-world event.
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS stories (
-                        id            SERIAL PRIMARY KEY,
-                        title         TEXT NOT NULL,      -- canonical headline of the story
-                        slug          TEXT,               -- cluster signature for matching
-                        category      TEXT,
-                        status        TEXT DEFAULT 'active',  -- active | developing | closed
-                        place         TEXT,               -- detected location
-                        event_type    TEXT,               -- fire/accident/death/etc
-                        update_count  INTEGER DEFAULT 0,
-                        first_seen    TIMESTAMPTZ DEFAULT NOW(),
-                        last_update   TIMESTAMPTZ DEFAULT NOW()
-                    );
-                """)
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS story_updates (
-                        id          SERIAL PRIMARY KEY,
-                        story_id    INTEGER REFERENCES stories(id),
-                        article_id  TEXT,
-                        headline    TEXT NOT NULL,
-                        summary     TEXT,
-                        source      TEXT,
-                        link        TEXT,
-                        created_at  TIMESTAMPTZ DEFAULT NOW()
-                    );
-                """)
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_stories_status ON stories(status);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_stories_slug   ON stories(slug);")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_stupd_story    ON story_updates(story_id);")
-            conn.commit()
-        finally:
-            _db_pool.putconn(conn)
-        DB_ENABLED = True
-        log.info("🗄️ ✅ PostgreSQL connected — article archive active")
-    except Exception as e:
-        log.error(f"🗄️ Database init failed (falling back to JSON): {e}")
-        DB_ENABLED = False
-
-def db_execute(query, params=None, fetch=None):
-    """
-    Run a query safely with pooled connection.
-    fetch: None (no result), 'one', or 'all'. Returns result or None on failure.
-    """
-    if not DB_ENABLED or not _db_pool:
-        return None
-    conn = None
-    try:
-        conn = _db_pool.getconn()
-        with conn.cursor() as cur:
-            cur.execute(query, params or ())
-            result = None
-            if fetch == "one":
-                result = cur.fetchone()
-            elif fetch == "all":
-                result = cur.fetchall()
-        conn.commit()
-        return result
-    except Exception as e:
-        log.error(f"🗄️ db_execute: {e}")
-        if conn:
-            try: conn.rollback()
-            except Exception: pass
-        return None
-    finally:
-        if conn and _db_pool:
-            _db_pool.putconn(conn)
-
-def db_record_article(article, score=0, reliability=0, status="seen", is_breaking=False):
-    """
-    Insert or update an article in the archive. Safe no-op if DB disabled.
-
-    Important website fix:
-    Never downgrade an article that is already website-visible/public.
-    Previously, a later db_record_article(... status='seen') could overwrite
-    'posted', which made English website stories disappear or stop updating.
-    """
-    if not DB_ENABLED:
-        return
-    db_execute("""
-        INSERT INTO articles (id, title, summary, link, source, category, lang, score, reliability, is_breaking, status)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        ON CONFLICT (id) DO UPDATE SET
-            title=COALESCE(NULLIF(EXCLUDED.title,''), articles.title),
-            summary=COALESCE(NULLIF(EXCLUDED.summary,''), articles.summary),
-            link=COALESCE(NULLIF(EXCLUDED.link,''), articles.link),
-            source=COALESCE(NULLIF(EXCLUDED.source,''), articles.source),
-            category=COALESCE(NULLIF(EXCLUDED.category,''), articles.category),
-            lang=COALESCE(NULLIF(EXCLUDED.lang,''), articles.lang),
-            score=GREATEST(COALESCE(articles.score,0), COALESCE(EXCLUDED.score,0)),
-            reliability=GREATEST(COALESCE(articles.reliability,0), COALESCE(EXCLUDED.reliability,0)),
-            is_breaking=COALESCE(EXCLUDED.is_breaking, articles.is_breaking),
-            status=CASE
-                WHEN articles.status IN ('posted','published','social_posted') THEN articles.status
-                ELSE EXCLUDED.status
-            END
-    """, (
-        article.get("id"), article.get("title","")[:500], article.get("summary","")[:2000],
-        article.get("link",""), article.get("source",""),
-        canonical_category(article.get("cat","LOCAL"), article.get("title",""), article.get("summary","")),
-        article.get("lang","en"), score, reliability, is_breaking, status
-    ))
-
-def db_mark_status(article_id, status, posted=False):
-    """
-    Update an article's lifecycle status.
-
-    Website fix:
-    English stories are published to website as soon as they enter Content Lab.
-    After that, old code called db_mark_status(id, 'queued') and accidentally
-    hid them from /api/stories. This function now blocks queued/seen from
-    downgrading posted/published/social_posted rows.
-    """
-    if not DB_ENABLED or not article_id:
-        return
-    if posted:
-        db_execute("UPDATE articles SET status=%s, posted_at=COALESCE(posted_at, NOW()) WHERE id=%s", (status, article_id))
-    else:
-        db_execute("""
-            UPDATE articles
-            SET status = CASE
-                WHEN status IN ('posted','published','social_posted') AND %s IN ('queued','seen')
-                    THEN status
-                ELSE %s
-            END
-            WHERE id=%s
-        """, (status, status, article_id))
-
-def db_publish_article_for_website(article_id, title="", summary="", category="LOCAL",
-                                   source="Samuga Media", link="", lang="en",
-                                   score=0, reliability=0, is_breaking=False):
-    """
-    Make sure any public story is visible on the website.
-
-    Samuga Article Engine:
-    - Social captions stay short.
-    - Website gets article_excerpt + article_body for full article pages.
-    - English articles are generated immediately.
-    - Dhivehi public posts remain visible, but Article Engine focuses on English first.
-    - No external source links are exposed; public link remains Samuga Community.
-    """
-    if not DB_ENABLED or not article_id:
-        return
-
-    lang = (lang or "en").lower()
-    article_id = str(article_id)
-    if lang in ("dv", "dhivehi") and not article_id.endswith("_dv"):
-        article_id = f"{article_id}_dv"
-
-    public_title = strip_source_links(title or "")[:500]
-    public_summary = samuga_public_summary(public_title, summary or "")[:2600]
-
-    if not public_text_is_safe(public_title, public_summary):
-        log.warning(f"🌐 Website publish blocked — unsafe placeholder text: {public_title[:70]}")
-        return
-
-    # Quality gate: never publish Latin Thaana as broken English/Dhivehi.
-    # Gemini converts it to proper English or Thaana. If conversion fails, hold it back.
-    public_title, public_summary, lang, lang_ok = normalize_article_language_for_public(
-        public_title, public_summary, lang=lang
-    )
-    if not lang_ok:
-        log.warning(f"🌐 Website publish held — language cleanup failed: {public_title[:70]}")
-        return
-
-    public_link = SAMUGA_PUBLIC_LINK
-    public_source = SAMUGA_PUBLIC_SOURCE
-    safe_cat = canonical_category(category or "LOCAL", public_title, public_summary)
-    slug = make_article_slug(public_title, article_id)
-
-    article_excerpt = make_article_excerpt(public_title, public_summary, lang=lang)
-    article_body = ""
-    if lang == "en":
-        article_body = generate_website_article_body(
-            title=public_title,
-            summary=public_summary,
-            category=safe_cat,
-            source=public_source,
-            is_breaking=is_breaking
-        )
-    else:
-        # Dhivehi body can be improved later with a dedicated Thaana article engine.
-        article_body = public_summary or public_title
-
-    db_execute("""
-        INSERT INTO articles
-            (id, title, summary, link, source, category, lang, score, reliability,
-             is_breaking, status, posted_at, match_key, article_slug, article_excerpt,
-             article_body, article_generated_at)
-        VALUES
-            (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'posted',NOW(),%s,%s,%s,%s,NOW())
-        ON CONFLICT (id) DO UPDATE SET
-            title=COALESCE(NULLIF(EXCLUDED.title,''), articles.title),
-            summary=COALESCE(NULLIF(EXCLUDED.summary,''), articles.summary),
-            link=EXCLUDED.link,
-            source=EXCLUDED.source,
-            category=COALESCE(NULLIF(EXCLUDED.category,''), articles.category),
-            lang=COALESCE(NULLIF(EXCLUDED.lang,''), articles.lang),
-            score=GREATEST(COALESCE(articles.score,0), COALESCE(EXCLUDED.score,0)),
-            reliability=GREATEST(COALESCE(articles.reliability,0), COALESCE(EXCLUDED.reliability,0)),
-            is_breaking=COALESCE(EXCLUDED.is_breaking, articles.is_breaking),
-            status='posted',
-            posted_at=COALESCE(articles.posted_at, NOW()),
-            match_key=COALESCE(NULLIF(EXCLUDED.match_key,''), articles.match_key),
-            article_slug=COALESCE(NULLIF(EXCLUDED.article_slug,''), articles.article_slug),
-            article_excerpt=COALESCE(NULLIF(EXCLUDED.article_excerpt,''), articles.article_excerpt),
-            article_body=COALESCE(NULLIF(EXCLUDED.article_body,''), articles.article_body),
-            article_generated_at=COALESCE(articles.article_generated_at, EXCLUDED.article_generated_at)
-    """, (
-        article_id, public_title, public_summary, public_link,
-        public_source, safe_cat, lang or "en", score or 0,
-        reliability or 0, bool(is_breaking), _caption_match_key(public_title or ""),
-        slug, article_excerpt, article_body
-    ))
-
-# ── Samuga Article Engine helpers ─────────────────────────────────────────────
-
-def make_article_slug(title, article_id=""):
-    """Create a clean URL slug for website article pages."""
-    try:
-        import unicodedata
-        t = strip_source_links(title or "").lower()
-        t = unicodedata.normalize("NFKD", t).encode("ascii", "ignore").decode("ascii")
-        t = re.sub(r"[^a-z0-9]+", "-", t).strip("-")
-        t = re.sub(r"-{2,}", "-", t)
-        if not t:
-            t = "samuga-story"
-        suffix = str(article_id or "")[:10].replace("_", "-")
-        return f"{t[:70]}-{suffix}" if suffix else t[:80]
-    except Exception:
-        return f"samuga-story-{str(article_id or '')[:10]}"
-
-
-def make_article_excerpt(title="", summary="", lang="en"):
-    """Short homepage excerpt separate from full article body."""
-    text = strip_source_links(summary or title or "")
-    text = re.sub(r"\s+", " ", text).strip()
-    if not text:
-        return strip_source_links(title or "")[:220]
-    max_len = 280 if lang == "en" else 220
-    if len(text) > max_len:
-        text = text[:max_len].rsplit(" ", 1)[0] + "..."
-    return text
-
-
-def _clean_article_engine_output(text, title=""):
-    """Clean AI output into readable website article paragraphs."""
-    text = strip_source_links(text or "")
-    text = text.replace("**", "").replace("__", "")
-    text = re.sub(r"^#+\s*", "", text, flags=re.M)
-    text = re.sub(r"\n\s*[-*]\s+", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    text = text.strip()
-    # Avoid the model repeating headline as first paragraph only.
-    if title and text.lower().startswith(title.lower()[:60]):
-        parts = text.split("\n\n", 1)
-        if len(parts) > 1:
-            text = parts[1].strip()
-    return text[:4200]
-
-
-def fallback_website_article_body(title="", summary="", category="LOCAL"):
-    """Fallback article when AI call fails."""
-    title = strip_source_links(title or "Samuga Media update")
-    summary = strip_source_links(summary or title)
-    cat = (category or "LOCAL").title()
-    paragraphs = [
-        summary,
-        f"This is a developing {cat.lower()} update carried by Samuga Media as part of its live Maldives news coverage.",
-        "The story is being followed for its public relevance, and further confirmed updates will be reflected through Samuga Media channels.",
-        "Readers can follow Samuga Community for live discussion, updates and context around this story."
-    ]
-    return "\n\n".join(p for p in paragraphs if p)
-
-
-def generate_website_article_body(title="", summary="", category="LOCAL", source="Samuga Media", is_breaking=False):
-    """
-    Generate a website-first article, not a social caption.
-    3–5 paragraphs, context, why it matters, Samuga voice, no external links.
-    """
-    title = strip_source_links(title or "")
-    summary = strip_source_links(summary or "")
-    if not title and not summary:
-        return ""
-
-    prompt = f"""You are writing for Samuga Media's website.
-Turn the information below into a short news article, not a social media caption.
-
-Rules:
-- Write in clean English.
-- 4 to 6 short paragraphs.
-- First paragraph: what happened, clearly.
-- Middle paragraphs: context/background and why it matters to people in Maldives.
-- Final paragraph: what Samuga Media will continue to watch.
-- Do not mention original source websites.
-- Do not include external links.
-- Do not invent names, numbers, quotes, locations or allegations not present in the input.
-- If details are limited, say the story is developing and keep it careful.
-- No markdown symbols, no hashtags, no bullet points.
-- Voice: professional, direct, people-first.
-
-Category: {category}
-Breaking: {bool(is_breaking)}
-Headline: {title}
-Known details: {summary}
-"""
-    try:
-        msg = ai.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=900,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        body = msg.content[0].text.strip()
-        body = _clean_article_engine_output(body, title=title)
-        if len(body.split()) < 45:
-            return fallback_website_article_body(title, summary, category)
-        return body
-    except Exception as e:
-        log.error(f"Website Article Engine failed: {e}")
-        return fallback_website_article_body(title, summary, category)
-
-
-def ensure_article_engine_body(article_id, title="", summary="", category="LOCAL", lang="en", is_breaking=False):
-    """Generate and save article_body if an old website row does not have one yet."""
-    if not DB_ENABLED or not article_id:
-        return fallback_website_article_body(title, summary, category)
-    try:
-        row = db_execute("SELECT article_body FROM articles WHERE id=%s", (article_id,), fetch="one")
-        if row and row[0] and len(str(row[0]).strip()) > 80:
-            return str(row[0]).strip()
-    except Exception:
-        pass
-
-    if (lang or "en").lower() == "en":
-        body = generate_website_article_body(title, summary, category, is_breaking=is_breaking)
-    else:
-        body = strip_source_links(summary or title or "")
-    excerpt = make_article_excerpt(title, summary, lang=lang)
-    slug = make_article_slug(title, article_id)
-    try:
-        db_execute("""
-            UPDATE articles
-            SET article_body=%s,
-                article_excerpt=COALESCE(NULLIF(article_excerpt,''), %s),
-                article_slug=COALESCE(NULLIF(article_slug,''), %s),
-                article_generated_at=NOW()
-            WHERE id=%s
-        """, (body, excerpt, slug, article_id))
-    except Exception as e:
-        log.error(f"Article Engine save failed: {e}")
-    return body
-
-
-def related_articles_for_api(article_id, category="LOCAL", limit=4):
-    """Related stories for article pages: same category, recent, no external links."""
-    try:
-        rows = db_execute("""
-            SELECT id, title, summary, category, posted_at, found_at, lang
-            FROM articles
-            WHERE id <> %s
-              AND status IN ('posted','published','social_posted')
-              AND category = %s
-            ORDER BY COALESCE(posted_at, found_at) DESC NULLS LAST
-            LIMIT %s
-        """, (article_id, category, limit), fetch="all") or []
-        out = []
-        for rid, title, summary, cat, posted_at, found_at, lang in rows:
-            dt = posted_at or found_at
-            safe_title = strip_source_links(title or "")[:220]
-            if not safe_title:
-                continue
-            out.append({
-                "id": rid,
-                "title": safe_title,
-                "summary": make_article_excerpt(safe_title, summary or "", lang=lang or "en"),
-                "category": cat or "LOCAL",
-                "url": f"article.html?id={rid}",
-                "time": mvt_display_time(dt)
-            })
-        return out
-    except Exception as e:
-        log.error(f"Related articles API failed: {e}")
-        return []
-
-# ── Phase 2: bot_kv helpers + learning logger ────────────────────────────────
-def kv_get(key, default=None):
-    """Read a JSON value from bot_kv. Returns default if missing or DB off."""
-    if not DB_ENABLED:
-        return default
-    row = db_execute("SELECT value FROM bot_kv WHERE key=%s", (key,), fetch="one")
-    if row and row[0] is not None:
-        return row[0]   # psycopg2 returns JSONB already parsed to dict/list
-    return default
-
-def kv_set(key, value):
-    """Write a JSON value to bot_kv (upsert). No-op if DB off."""
-    if not DB_ENABLED:
-        return
-    db_execute("""
-        INSERT INTO bot_kv (key, value, updated_at)
-        VALUES (%s, %s::jsonb, NOW())
-        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
-    """, (key, json.dumps(value)))
-
-# ── Phase 3: Team memory helpers ─────────────────────────────────────────────
-def mem_add(content, category="fact", added_by="team"):
-    """Store a memory item in the team_memory table."""
-    db_execute(
-        "INSERT INTO team_memory (category, content, added_by) VALUES (%s, %s, %s)",
-        (category, content.strip(), added_by)
-    )
-
-def mem_list(limit=30):
-    """Return recent memory items as a list of strings."""
-    rows = db_execute(
-        "SELECT category, content, added_by FROM team_memory ORDER BY created_at DESC LIMIT %s",
-        (limit,), fetch="all"
-    )
-    if not rows:
-        return []
-    return [f"[{r[0]}] {r[1]} (by {r[2]})" for r in rows]
-
-def mem_clear_all():
-    """Wipe all team memories (destructive — needs /forget confirm)."""
-    db_execute("DELETE FROM team_memory")
-
-def mem_delete_last(n=1):
-    """Delete the N most recent memories."""
-    db_execute("""
-        DELETE FROM team_memory WHERE id IN (
-            SELECT id FROM team_memory ORDER BY created_at DESC LIMIT %s
-        )
-    """, (n,))
-
-# ── Public DM rate limiter ────────────────────────────────────────────────────
-DM_DAILY_LIMIT = 10  # max messages per user per day
-
-def dm_check_and_increment(user_id):
-    """
-    Returns (allowed: bool, count: int, limit: int).
-    Increments counter if allowed. Resets daily at midnight UTC.
-    Uses bot_kv for persistence — key = dm_rl:{user_id}
-    """
-    today = utcnow().strftime("%Y-%m-%d")
-    key = f"dm_rl:{user_id}"
-    record = kv_get(key, default={"date": today, "count": 0})
-
-    # Reset if new day
-    if record.get("date") != today:
-        record = {"date": today, "count": 0}
-
-    if record["count"] >= DM_DAILY_LIMIT:
-        return False, record["count"], DM_DAILY_LIMIT
-
-    record["count"] += 1
-    kv_set(key, record)
-    return True, record["count"], DM_DAILY_LIMIT
-
-def db_log_learning(article_id, action, member="", category="", source="",
-                    score=0, theme="", original_caption="", final_caption="", lang="en"):
-    """Record a team action so the bot can learn from approvals/rejections."""
-    if not DB_ENABLED:
-        return
-    db_execute("""
-        INSERT INTO learning (article_id, action, member, category, source, score,
-                              theme, original_caption, final_caption, lang)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """, (
-        article_id, action, (member or "")[:60], (category or "")[:40],
-        (source or "")[:80], score, (theme or "")[:40],
-        (original_caption or "")[:1000], (final_caption or "")[:1000], lang
-    ))
-
-def db_set_article_message(article_id, message_id):
-    """Store the Telegram message_id for an article so we can fetch its views later."""
-    if not DB_ENABLED or not article_id or not message_id:
-        return
-    db_execute("UPDATE articles SET tg_message_id=%s WHERE id=%s", (message_id, article_id))
-
-def _caption_match_key(text):
-    """
-    Normalize a headline/caption to a stable key for matching the same story
-    across Telegram, Facebook and Instagram. Lowercase, strip punctuation/emoji,
-    collapse whitespace, take the first ~60 chars of meaningful words.
-    """
-    if not text:
-        return ""
-    import re as _re, unicodedata as _ud
-    t = text.lower()
-    # Drop the boilerplate Samuga tagline so it doesn't dominate the key
-    for junk in ["samuga media", "samuga creative", "@samugacommunity",
-                 "ސަމުގާ މީޑިއާ", "📡", "🇲🇻"]:
-        t = t.replace(junk.lower(), " ")
-    # Fold accents to plain ASCII per-character so "Malé"->"male", but keep
-    # thaana characters exactly in place (NFKD on thaana would corrupt them).
-    out = []
-    for ch in t:
-        if "\u0780" <= ch <= "\u07bf":
-            out.append(ch)                       # thaana — keep as-is
-        else:
-            folded = _ud.normalize("NFKD", ch).encode("ascii", "ignore").decode("ascii")
-            out.append(folded)
-    t = "".join(out)
-    # Keep latin letters, digits, thaana; drop everything else
-    t = _re.sub(r"[^a-z0-9\u0780-\u07bf ]", " ", t)
-    t = _re.sub(r"\s+", " ", t).strip()
-    return t[:60]
-
-def db_set_article_matchkey(article_id, title):
-    """Store the normalized match key for an article (for FB/IG caption matching)."""
-    if not DB_ENABLED or not article_id:
-        return
-    mk = _caption_match_key(title)
-    if mk:
-        db_execute("UPDATE articles SET match_key=%s WHERE id=%s", (mk, article_id))
-
-# ── TREND DETECTOR (v6 Intelligence) ─────────────────────────────────────────
-# Reads the Postgres archive, extracts topics from article titles, counts how
-# often each topic appears in 24h. 5+ mentions = a trending story.
-# This is the "Understand + Rank" layer — the bot starts to see patterns.
-
-# Topic keywords grouped by theme — what Maldives actually talks about.
-# Each theme has trigger words; an article counts toward a theme if any match.
-TREND_THEMES = {
-    "Cost of Living":     ["cost of living","price","prices","inflation","expensive","rufiyaa","dollar rate","import","grocery","staple"],
-    "Housing":            ["housing","flat","flats","land","plot","gedhoru","apartment","rent","hiya","vinares","social housing"],
-    "Corruption":         ["corruption","bribe","embezzle","graft","acc ","anti-corruption","scandal","misuse","fraud","laundering"],
-    "Drugs":              ["drug","drugs","narcotic","trafficking","heroin","cannabis","addict","rehab"],
-    "Politics":           ["parliament","majlis","president","minister","cabinet","mp ","party","election","vote","impeach","no-confidence"],
-    "Tourism":            ["tourism","resort","arrival","occupancy","tourist","visitor","bed night","travel"],
-    "Fishing":            ["fishing","fisheries","fishermen","tuna","catch","mifco","masveriya"],
-    "Crime":              ["murder","stabbing","assault","robbery","theft","arrested","police","gang","violence"],
-    "Economy":            ["economy","gdp","budget","debt","loan","reserve","imf","world bank","deficit","sovereign"],
-    "Weather/Disaster":   ["storm","flood","rain","swell","udha","fire","accident","sinking","capsize","rescue"],
-    "Health":             ["hospital","health","disease","dengue","outbreak","aasandha","medical","clinic","doctor"],
-    "Infrastructure":     ["bridge","harbour","airport","road","construction","project","development","sewerage","water"],
-    "Education":          ["school","education","student","university","exam","teacher","scholarship"],
-    "India/Foreign":      ["india","china","indian","chinese","foreign","diplomatic","embassy","bilateral","agreement"],
-}
-
-def _detect_themes(text):
-    """Return the set of themes an article touches based on its text."""
-    t = text.lower()
-    hits = set()
-    for theme, kws in TREND_THEMES.items():
-        if any(kw in t for kw in kws):
-            hits.add(theme)
-    return hits
-
-def detect_trends(hours=24, min_mentions=3):
-    """
-    Analyze the article archive for trending themes.
-    Returns a sorted list of (theme, count, sample_titles) for themes with
-    >= min_mentions in the time window. DB-only — returns [] if no Postgres.
-    """
-    if not DB_ENABLED:
-        return []
-    rows = db_execute(
-        "SELECT title, summary FROM articles WHERE found_at > NOW() - INTERVAL %s",
-        (f"{hours} hours",), fetch="all")
-    if not rows:
-        return []
-    theme_counts = {}
-    theme_titles = {}
-    for title, summary in rows:
-        text = f"{title or ''} {summary or ''}"
-        for theme in _detect_themes(text):
-            theme_counts[theme] = theme_counts.get(theme, 0) + 1
-            theme_titles.setdefault(theme, [])
-            if title and len(theme_titles[theme]) < 3:
-                theme_titles[theme].append(title[:70])
-    trends = [(th, c, theme_titles.get(th, []))
-              for th, c in theme_counts.items() if c >= min_mentions]
-    trends.sort(key=lambda x: x[1], reverse=True)
-    return trends
-
-def is_trending_topic(title, summary="", min_mentions=4):
-    """
-    Quick check: does this article belong to a currently-trending theme?
-    Used to BOOST scoring for stories about hot topics.
-    Returns (is_trending, theme_name, mention_count) or (False, None, 0).
-    """
-    if not DB_ENABLED:
-        return (False, None, 0)
-    themes = _detect_themes(f"{title} {summary}")
-    if not themes:
-        return (False, None, 0)
-    trends = {t[0]: t[1] for t in detect_trends(hours=24, min_mentions=min_mentions)}
-    for theme in themes:
-        if theme in trends:
-            return (True, theme, trends[theme])
-    return (False, None, 0)
-
-
-# ── Storage ───────────────────────────────────────────────────────────────────
-DATA_DIR  = "/data"
-os.makedirs(DATA_DIR, exist_ok=True)
-SEEN_FILE  = os.path.join(DATA_DIR, "seen_articles.json")
-STATE_FILE = os.path.join(DATA_DIR, "bot_state.json")
-
-def load_seen():
-    try:
-        if os.path.exists(SEEN_FILE):
-            with open(SEEN_FILE) as f: return set(json.load(f))
-    except Exception as e:
-        log.error(f"load_seen: {e}")
-    return set()
-
-def save_seen(seen):
-    try:
-        with open(SEEN_FILE,"w") as f: json.dump(list(seen)[-1000:], f)
-    except Exception as e:
-        log.error(f"save_seen: {e}")
-
-# ── Generic State Persistence (survives Railway restarts) ─────────────────────
-# Saves volatile state (dedup memory, daily counters, analytics, throttle timer,
-# approval queue metadata) to /data so a restart doesn't wipe everything.
-_state_lock = threading.Lock()
-
-def _load_state():
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE) as f:
-                return json.load(f)
-    except Exception as e:
-        log.error(f"load_state: {e}")
-    return {}
-
-def _save_state(state):
-    try:
-        with _state_lock:
-            tmp = STATE_FILE + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(state, f)
-            os.replace(tmp, STATE_FILE)  # atomic write — no half-written files
-    except Exception as e:
-        log.error(f"save_state: {e}")
-
-_poll_offset = [0]  # Telegram update offset — persisted so bot never misses messages on restart
-
-def persist_state():
-    """Snapshot all volatile state to disk. Called after any meaningful change."""
-    try:
-        # Serialize social queue (no image bytes — too large; just caption + queued_at)
-        sq_serialized = []
-        with _social_queue_lock:
-            for item in _social_queue:
-                sq_serialized.append({
-                    "img_bytes_b64": __import__("base64").b64encode(item["img_bytes"]).decode(),
-                    "caption": item["caption"],
-                    "queued_at": item["queued_at"].isoformat(),
-                    "article_id": item.get("article_id"),
-                    "title": item.get("title",""),
-                    "summary": item.get("summary",""),
-                    "cat": item.get("cat","LOCAL"),
-                    "source": item.get("source","Samuga Media"),
-                    "link": item.get("link",""),
-                    "lang": item.get("lang","en"),
-                    "is_breaking": item.get("is_breaking", False),
-                    "key_label": item.get("key_label","Post"),
-                    "tg_ok": item.get("tg_ok", False),
-                    "post_telegram": item.get("post_telegram", True),
-                    "notify_chat_id": item.get("notify_chat_id"),
-                    "notify_thread_id": item.get("notify_thread_id"),
-                })
-        state = {
-            "recent_story_titles": [(t, ts.isoformat()) for (t, ts) in recent_story_titles],
-            "recent_posts": recent_posts[-50:],
-            "analytics": analytics,
-            "daily_sports_count": daily_sports_count,
-            "daily_world_count": daily_world_count,
-            "daily_tourism_count": daily_tourism_count,
-            "social_post_counts": _serialize_social_counts(),
-            "polls_today": polls_today,
-            "last_regular_post_time": last_regular_post_time.isoformat() if last_regular_post_time else None,
-            "last_social_post_time": _last_social_post_time.isoformat() if _last_social_post_time else None,
-            "approval_counter": _approval_counter[0],
-            "approval_queue": _serialize_approval_queue(),
-            "poll_offset": _poll_offset[0],
-            "social_queue": sq_serialized,
-        }
-        _save_state(state)
-    except Exception as e:
-        log.error(f"persist_state: {e}")
-
-def _serialize_social_counts():
-    sc = dict(social_post_counts)
-    if sc.get("date") and not isinstance(sc["date"], str):
-        sc["date"] = sc["date"].isoformat()
-    return sc
-
-def _serialize_approval_queue():
-    """Approval queue minus the heavy card image bytes (those are rebuilt on approval)."""
-    import base64
-    out = {}
-    for k, v in approval_queue.items():
-        item = dict(v)
-        # Encode card bytes as base64 so English cards survive restart with their image
-        if item.get("card_bytes"):
-            try:
-                item["card_bytes"] = base64.b64encode(item["card_bytes"]).decode()
-                item["_card_b64"] = True
-            except Exception:
-                item["card_bytes"] = None
-                item["_card_b64"] = False
-        item["created_at"] = item["created_at"].isoformat() if item.get("created_at") else None
-        out[k] = item
-    return out
-
-def restore_state():
-    """Load persisted state back into memory on startup."""
-    global recent_story_titles, recent_posts, analytics
-    global daily_sports_count, daily_world_count, daily_tourism_count
-    global social_post_counts, polls_today, last_regular_post_time
-    state = _load_state()
-    if not state:
-        log.info("📦 No saved state — starting fresh")
-        return
-    import base64
-    try:
-        # Dedup memory
-        recent_story_titles.clear()
-        for (t, ts) in state.get("recent_story_titles", []):
-            try: recent_story_titles.append((t, datetime.fromisoformat(ts)))
-            except Exception: pass
-
-        recent_posts.clear()
-        recent_posts.extend(state.get("recent_posts", []))
-
-        analytics.update(state.get("analytics", {}))
-
-        daily_sports_count.update(state.get("daily_sports_count", {}))
-        daily_world_count.update(state.get("daily_world_count", {}))
-        daily_tourism_count.update(state.get("daily_tourism_count", {}))
-        social_post_counts.update(state.get("social_post_counts", {}))
-        polls_today.update(state.get("polls_today", {}))
-
-        lrt = state.get("last_regular_post_time")
-        if lrt:
-            try: last_regular_post_time = datetime.fromisoformat(lrt)
-            except Exception: pass
-
-        _approval_counter[0] = state.get("approval_counter", 0)
-        _poll_offset[0] = state.get("poll_offset", 0)
-
-        # Restore social queue (posts that were waiting when bot restarted)
-        global _last_social_post_time
-        lspt = state.get("last_social_post_time")
-        if lspt:
-            try: _last_social_post_time = datetime.fromisoformat(lspt)
-            except Exception: pass
-        sq = state.get("social_queue", [])
-        if sq:
-            import base64 as _b64
-            with _social_queue_lock:
-                for item in sq:
-                    try:
-                        _social_queue.append({
-                            "img_bytes": _b64.b64decode(item["img_bytes_b64"]),
-                            "caption": item["caption"],
-                            "queued_at": datetime.fromisoformat(item["queued_at"]),
-                            "article_id": item.get("article_id"),
-                            "title": item.get("title",""),
-                            "summary": item.get("summary",""),
-                            "cat": item.get("cat","LOCAL"),
-                            "source": item.get("source","Samuga Media"),
-                            "link": item.get("link",""),
-                            "lang": item.get("lang","en"),
-                            "is_breaking": item.get("is_breaking", False),
-                            "key_label": item.get("key_label","Post"),
-                            "tg_ok": item.get("tg_ok", False),
-                            "post_telegram": item.get("post_telegram", True),
-                            "notify_chat_id": item.get("notify_chat_id"),
-                            "notify_thread_id": item.get("notify_thread_id"),
-                        })
-                    except Exception: pass
-            log.info(f"📲 Social queue restored: {len(_social_queue)} post(s) waiting")
-
-        # Restore approval queue (with card images)
-        for k, item in state.get("approval_queue", {}).items():
-            try:
-                if item.get("_card_b64") and item.get("card_bytes"):
-                    item["card_bytes"] = base64.b64decode(item["card_bytes"])
-                item.pop("_card_b64", None)
-                item["created_at"] = datetime.fromisoformat(item["created_at"]) if item.get("created_at") else utcnow()
-                approval_queue[k] = item
-            except Exception as e:
-                log.error(f"restore approval {k}: {e}")
-
-        log.info(f"📦 State restored: {len(recent_story_titles)} dedup titles, "
-                 f"{len(approval_queue)} pending cards, {len(recent_posts)} recent posts")
-    except Exception as e:
-        log.error(f"restore_state: {e}")
-
-# ── Memory ────────────────────────────────────────────────────────────────────
-recent_posts = []
-user_conversations = {}
-
-# ── Duplicate Story Detection ─────────────────────────────────────────────────
-# Tracks recently posted/queued story titles so the same event from different
-# sources (Mihaaru / Sun / PSM) doesn't get posted multiple times.
-recent_story_titles = []  # list of (title, timestamp)
-DUP_WINDOW_HOURS = 18     # consider stories within this window for dedup
-DUP_THRESHOLD = 0.55      # similarity above which two stories are "the same"
-
-_DUP_STOPWORDS = {
-    "the","a","an","of","in","on","at","to","for","and","or","is","are","was","were",
-    "has","have","had","with","by","from","as","that","this","it","its","their","they",
-    "maldives","maldivian","male","reported","says","said","after","over","amid","new",
-    "breaking","news","update","live","video","photo","watch","near","into","out","be","will"
-}
-
-# Synonym groups — different outlets use different words for the same event
-_DUP_SYNONYMS = {
-    "parliament":"majlis","majlis":"majlis",
-    "passes":"approve","approves":"approve","approved":"approve","passed":"approve","endorses":"approve","endorsed":"approve",
-    "crash":"accident","accident":"accident","collision":"accident","collide":"accident",
-    "injures":"injured","injured":"injured","hurt":"injured","wounded":"injured",
-    "visits":"visit","visit":"visit","arrives":"visit","arrival":"visit","trip":"visit","arrived":"visit",
-    "dies":"dead","died":"dead","killed":"dead","death":"dead","dead":"dead","passes away":"dead",
-    "fire":"fire","blaze":"fire",
-    "boat":"boat","speedboat":"boat","vessel":"boat","dhoni":"boat","launch":"boat","ferry":"boat",
-    "arrested":"arrest","arrest":"arrest","detained":"arrest","held":"arrest",
-    "minister":"minister","ministry":"minister",
-    "president":"president","raees":"president",
-}
-
-def _dup_canon(word):
-    return _DUP_SYNONYMS.get(word, word)
-
-def _dup_keywords(title):
-    """Extract canonicalized meaningful keywords from a title."""
-    import re as _re
-    t = title.lower()
-    t = _re.sub(r"[^a-z0-9\u0780-\u07bf ]", " ", t)  # keep latin, digits, thaana
-    return set(_dup_canon(w) for w in t.split() if w not in _DUP_STOPWORDS and len(w) > 2)
-
-def _title_similarity(a, b):
-    """Similarity 0-1 using canonicalized keyword overlap + containment."""
-    ka, kb = _dup_keywords(a), _dup_keywords(b)
-    if not ka or not kb:
-        return 0.0
-    overlap = len(ka & kb) / max(1, len(ka | kb))          # Jaccard
-    contain = len(ka & kb) / max(1, min(len(ka), len(kb))) # smaller-set containment
-    return max(overlap, contain * 0.85)
-
-def is_duplicate_story(title):
-    """True if a very similar story was posted/queued within the dedup window."""
-    global recent_story_titles
-    now = utcnow()
-    recent_story_titles = [(t, ts) for (t, ts) in recent_story_titles
-                           if (now - ts).total_seconds() < DUP_WINDOW_HOURS * 3600]
-    for (past_title, _ts) in recent_story_titles:
-        sim = _title_similarity(title, past_title)
-        if sim >= DUP_THRESHOLD:
-            log.info(f"🔁 Duplicate ({sim:.2f}): '{title[:45]}' ≈ '{past_title[:45]}'")
-            return True
-    return False
-
-def remember_story_title(title):
-    """Record a title so future similar stories are flagged as duplicates."""
-    recent_story_titles.append((title, utcnow()))
-    if len(recent_story_titles) > 200:
-        recent_story_titles.pop(0)
-    persist_state()
-
-# ── Story Clustering (v6) — group same event from multiple sources ───────────
-# When 3 outlets report the same fire, the bot doesn't post 3 times. It detects
-# they're the same story and posts ONCE as "🔥 Multiple sources reporting...".
-# story_clusters: cluster_key -> {"sources": set, "first_title": str, "ts": datetime}
-story_clusters = {}
-
-def _cluster_key(title):
-    """A stable-ish key for a story so the same event maps to the same cluster."""
-    kws = sorted(_dup_keywords(title))
-    return " ".join(kws[:6])  # top keywords as the signature
-
-# Maldivian place names + event types — strong signals two stories are the same event
-_CLUSTER_PLACES = ["hulhumale","male","male'","villingili","addu","fuvahmulah","kulhudhuffushi",
-    "thinadhoo","gan","hithadhoo","naifaru","dharavandhoo","maafushi","guraidhoo","thulusdhoo",
-    "vilimale","gulhi","dhiffushi","raa","baa","laamu","gaafu","seenu","haa","noonu","thaa"]
-_CLUSTER_EVENTS = {
-    "fire":["fire","blaze","burn"], "accident":["accident","crash","collision"],
-    "death":["dies","died","dead","killed","death","passed away"], "arrest":["arrest","arrested","detained"],
-    "drowning":["drown","drowned"], "sinking":["sink","sank","capsize","capsized"],
-    "robbery":["robbery","theft","stolen","burgle"], "stabbing":["stab","stabbed","stabbing"],
-    "protest":["protest","demonstration","rally"], "storm":["storm","flood","swell","udha"],
-}
-
-def _cluster_similarity(a, b):
-    """Looser similarity for clustering: same PLACE + same EVENT TYPE = same story."""
-    base = _title_similarity(a, b)
-    ta, tb = a.lower(), b.lower()
-    # Shared place?
-    place_a = next((p for p in _CLUSTER_PLACES if p in ta), None)
-    place_b = next((p for p in _CLUSTER_PLACES if p in tb), None)
-    same_place = place_a and place_a == place_b
-    # Shared event type?
-    def event_of(t):
-        for ev, kws in _CLUSTER_EVENTS.items():
-            if any(k in t for k in kws): return ev
-        return None
-    ev_a, ev_b = event_of(ta), event_of(tb)
-    same_event = ev_a and ev_a == ev_b
-    # Same place AND same event = almost certainly the same story
-    if same_place and same_event:
-        return max(base, 0.75)
-    # Same event + decent word overlap
-    if same_event and base >= 0.25:
-        return max(base, 0.60)
-    return base
-
-def register_in_cluster(title, source):
-    """
-    Record that `source` is reporting this story. Returns (cluster_size, sources_list).
-    If multiple sources report the same event, cluster_size > 1 = a corroborated story.
-    """
-    now = utcnow()
-    # Clean old clusters
-    expired = [k for k, v in story_clusters.items()
-               if (now - v["ts"]).total_seconds() > DUP_WINDOW_HOURS * 3600]
-    for k in expired:
-        del story_clusters[k]
-
-    # Find an existing cluster this title belongs to (cluster-aware fuzzy match)
-    matched_key = None
-    for k, v in story_clusters.items():
-        if _cluster_similarity(title, v["first_title"]) >= 0.58:
-            matched_key = k
-            break
-    if matched_key is None:
-        matched_key = _cluster_key(title)
-        story_clusters[matched_key] = {"sources": set(), "first_title": title, "ts": now}
-
-    story_clusters[matched_key]["sources"].add(source or "Unknown")
-    srcs = sorted(story_clusters[matched_key]["sources"])
-    return (len(srcs), srcs)
-
-# ── Phase 4: STORY INTELLIGENCE ──────────────────────────────────────────────
-# Groups article updates into ongoing story threads. Each real-world event
-# (a ferry sinking, a fire, an election) becomes ONE story with many updates.
-
-def _detect_place(title):
-    """Detect a Maldivian place name in a headline."""
-    t = title.lower()
-    for p in _CLUSTER_PLACES:
-        if p in t:
-            return p.title()
-    return None
-
-def _detect_event_type(title):
-    """Detect the event type (fire, accident, death, etc)."""
-    t = title.lower()
-    for ev, kws in _CLUSTER_EVENTS.items():
-        if any(k in t for k in kws):
-            return ev
-    return None
-
-def _notify_developing_story(story_id, title, source_count, source_list):
-    """Proactively alert the team when a story is confirmed by multiple sources."""
-    try:
-        msg = (
-            f"🔥 <b>Developing Story Alert</b>\n\n"
-            f"<b>{title[:100]}</b>\n\n"
-            f"This story is now confirmed by <b>{source_count} sources</b> "
-            f"({source_list}).\n"
-            f"It's likely becoming a lead story today.\n\n"
-            f"📚 Full timeline: <code>/story {story_id}</code>"
-        )
-        send_text(CORE_TEAM_CHAT_ID, msg, thread_id=ALERT_THREAD_ID)
-        log.info(f"🔥 Developing story alert → Alert thread: Story #{story_id}")
-    except Exception as e:
-        log.debug(f"Notify developing story: {e}")
-
-def find_or_create_story(title, category, article_id, summary, source, link):
-    """
-    Find an existing active story this article belongs to, or create a new one.
-    Returns (story_id, is_new, update_number) or (None, False, 0) if DB off.
-
-    Matching: an article joins an existing story if it shares the same place +
-    event type, OR has high title similarity to the story's canonical title,
-    AND the story is still active (last update within 72 hours).
-    """
-    if not DB_ENABLED:
-        return (None, False, 0)
-
-    try:
-        place = _detect_place(title)
-        event = _detect_event_type(title)
-        slug  = _cluster_key(title)
-
-        # Look at active stories from the last 72 hours
-        candidates = db_execute("""
-            SELECT id, title, place, event_type, update_count
-            FROM stories
-            WHERE status IN ('active','developing')
-              AND last_update > NOW() - INTERVAL '72 hours'
-            ORDER BY last_update DESC
-            LIMIT 40
-        """, fetch="all") or []
-
-        matched_id = None
-        best_score = 0
-        for sid, stitle, splace, sevent, ucount in candidates:
-            score = 0
-            # Strong match: same place + same event type
-            if place and event and splace == place and sevent == event:
-                score = 100
-            # Same place + good title similarity (event may drift: sinking→rescue→investigation)
-            elif place and splace == place and _cluster_similarity(title, stitle) >= 0.30:
-                score = 70
-            # Title similarity match (no place needed)
-            elif _cluster_similarity(title, stitle) >= 0.60:
-                score = 60
-            # Same place, shared significant keyword
-            elif place and splace == place:
-                shared = set(_dup_keywords(title)) & set(_dup_keywords(stitle))
-                if len(shared) >= 2:
-                    score = 55
-            if score > best_score:
-                best_score = score
-                matched_id = sid
-        if best_score < 50:
-            matched_id = None
-
-        if matched_id:
-            # Add this as an update to the existing story
-            db_execute("""
-                INSERT INTO story_updates (story_id, article_id, headline, summary, source, link)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (matched_id, article_id, title, summary, source, link))
-            db_execute("""
-                UPDATE stories
-                SET update_count = update_count + 1,
-                    last_update = NOW(),
-                    status = CASE WHEN update_count + 1 >= 3 THEN 'developing' ELSE status END
-                WHERE id = %s
-            """, (matched_id,))
-            cnt = db_execute("SELECT update_count FROM stories WHERE id=%s",
-                             (matched_id,), fetch="one")
-            update_num = cnt[0] if cnt else 1
-            log.info(f"📚 Story #{matched_id} updated (update #{update_num}): {title[:50]}")
-
-            # ── PROACTIVE ALERT — story just crossed 3 updates = likely lead story ──
-            # Fires exactly once, when update_count hits 3, so we don't spam.
-            if update_num == 3:
-                try:
-                    # Count distinct sources on this story
-                    src_rows = db_execute("""
-                        SELECT DISTINCT source FROM story_updates WHERE story_id=%s AND source IS NOT NULL
-                    """, (matched_id,), fetch="all") or []
-                    sources = [s[0] for s in src_rows if s[0]]
-                    src_list = ", ".join(sources[:5]) if sources else "multiple outlets"
-                    _notify_developing_story(matched_id, title, len(sources), src_list)
-                except Exception as e:
-                    log.debug(f"Proactive alert: {e}")
-
-            return (matched_id, False, update_num)
-        else:
-            # Create a new story
-            new_id = db_execute("""
-                INSERT INTO stories (title, slug, category, place, event_type, update_count)
-                VALUES (%s, %s, %s, %s, %s, 1)
-                RETURNING id
-            """, (title, slug, category, place, event), fetch="one")
-            story_id = new_id[0] if new_id else None
-            if story_id:
-                db_execute("""
-                    INSERT INTO story_updates (story_id, article_id, headline, summary, source, link)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                """, (story_id, article_id, title, summary, source, link))
-                log.info(f"📚 New Story #{story_id} created: {title[:50]}")
-            return (story_id, True, 1)
-
-    except Exception as e:
-        log.error(f"Story intelligence: {e}")
-        return (None, False, 0)
-
-def get_story_timeline(story_id):
-    """Return the full timeline of a story as a list of update dicts."""
-    if not DB_ENABLED:
-        return None
-    story = db_execute("""
-        SELECT id, title, category, status, place, event_type, update_count, first_seen, last_update
-        FROM stories WHERE id=%s
-    """, (story_id,), fetch="one")
-    if not story:
-        return None
-    updates = db_execute("""
-        SELECT headline, summary, source, created_at
-        FROM story_updates WHERE story_id=%s ORDER BY created_at ASC
-    """, (story_id,), fetch="all") or []
-    return {
-        "id": story[0], "title": story[1], "category": story[2], "status": story[3],
-        "place": story[4], "event_type": story[5], "update_count": story[6],
-        "first_seen": story[7], "last_update": story[8],
-        "updates": [{"headline": u[0], "summary": u[1], "source": u[2], "time": u[3]} for u in updates]
-    }
-
-def search_stories(query, limit=5):
-    """Find stories matching a free-text query (by title keywords)."""
-    if not DB_ENABLED:
-        return []
-    # Pull recent stories and rank by keyword overlap
-    rows = db_execute("""
-        SELECT id, title, status, update_count, last_update, place, event_type
-        FROM stories
-        ORDER BY last_update DESC LIMIT 100
-    """, fetch="all") or []
-    q_words = set(_dup_keywords(query))
-    scored = []
-    for sid, title, status, ucount, last_up, place, event in rows:
-        t_words = set(_dup_keywords(title))
-        overlap = len(q_words & t_words)
-        # Boost if place or event type mentioned in query
-        ql = query.lower()
-        if place and place.lower() in ql: overlap += 2
-        if event and event in ql: overlap += 2
-        if overlap > 0:
-            scored.append((overlap, sid, title, status, ucount, last_up))
-    scored.sort(reverse=True)
-    return [{"id": s[1], "title": s[2], "status": s[3],
-             "update_count": s[4], "last_update": s[5]} for s in scored[:limit]]
-
-def get_active_stories(limit=10):
-    """List currently developing/active stories."""
-    if not DB_ENABLED:
-        return []
-    rows = db_execute("""
-        SELECT id, title, status, update_count, last_update, place, event_type
-        FROM stories
-        WHERE status IN ('active','developing')
-          AND last_update > NOW() - INTERVAL '72 hours'
-          AND update_count >= 2
-        ORDER BY update_count DESC, last_update DESC
-        LIMIT %s
-    """, (limit,), fetch="all") or []
-    return [{"id": r[0], "title": r[1], "status": r[2], "update_count": r[3],
-             "last_update": r[4], "place": r[5], "event_type": r[6]} for r in rows]
-
 # ── Source Reliability Scoring ────────────────────────────────────────────────
 # Higher = more trusted. Used as a tie-breaker and a scoring boost so a direct
 # Mihaaru/MvCrisis story outranks a Google News scrape of the same topic.
-SOURCE_RELIABILITY = {
-    "mvcrisis":    70,  # fast but mixes ads — lowered, filtered separately
-    "mihaaru":     95,
-    "sun":         92,
-    "sunonline":   92,
-    "psm":         90,
-    "psmnews":     90,
-    "presidency":  90,  # official gov source
-    "edition":     88,
-    "avas":        85,
-    "see":         82,
-    "maldivesindependent": 82,
-    "oneonline":   80,
-    "maldivesvoice": 78,
-    "visitmaldives": 75,
-    "voice":       80,
-    "raajje":      82,
-    "police":      94,
-    "mndf":        94,
-    "thepress":    78,
-    "world news":  70,
-    "reuters":     82,
-    "ap":          82,
-    "bbc":         80,
-    "google news": 55,  # aggregator — least trusted, often duplicates
-}
-DEFAULT_RELIABILITY = 60
-
-def source_reliability(source_name):
-    """Return a 0-100 reliability score for a source string."""
-    if not source_name:
-        return DEFAULT_RELIABILITY
-    s = source_name.lower()
-    for key, val in SOURCE_RELIABILITY.items():
-        if key in s:
-            return val
-    return DEFAULT_RELIABILITY
-
-# Analytics counters (reset weekly)
-analytics = {"posts_by_cat": {}, "breaking_count": 0, "social_success": 0, "social_fail": 0, "week_start": None}
-
 def track_analytics(cat, is_breaking=False, social_ok=None):
     global analytics
     from datetime import timezone as _tz
@@ -2018,210 +497,21 @@ def add_to_conversation(uid, role, content):
 def get_mvt_hour(): return (utcnow().hour + 5) % 24
 def is_day_mode(): return 6 <= get_mvt_hour() < 22
 
-def _parse_any_datetime(value):
-    """Best-effort datetime parser for RSS, Telegram ISO strings, and article dicts."""
+def is_fresh(entry, hours=24):
     try:
-        if not value:
-            return None
-        if isinstance(value, datetime):
-            dt = value
-        else:
-            s = str(value).strip()
-            if not s:
-                return None
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            try:
-                dt = datetime.fromisoformat(s)
-            except Exception:
-                dt = parsedate_to_datetime(s)
-        if getattr(dt, "tzinfo", None):
-            dt = dt.astimezone(_tz.utc).replace(tzinfo=None)
-        return dt
-    except Exception:
-        return None
-
-def entry_published_dt(entry):
-    """Extract published timestamp from feedparser entry."""
-    for key in ("published", "updated", "created"):
-        dt = _parse_any_datetime(entry.get(key, ""))
-        if dt:
-            return dt
-    return None
-
-def is_fresh(entry, hours=3):
-    """RSS freshness gate. 12h+ is never treated as new; unknown dates pass to source-specific gates."""
-    try:
-        dt = entry_published_dt(entry)
-        if dt:
+        pub = entry.get("published","")
+        if pub:
+            dt = parsedate_to_datetime(pub)
+            if dt.tzinfo: dt = dt.replace(tzinfo=None)
             return utcnow() - dt < timedelta(hours=hours)
-    except Exception as e:
-        log.debug(f"is_fresh parse: {e}")
+    except Exception as e: log.debug(f"is_fresh parse: {e}")
     return True
-
-def article_published_at(article):
-    """Return article published datetime when known. Unknown homepage items are treated as just discovered."""
-    return _parse_any_datetime((article or {}).get("published")) or _parse_any_datetime((article or {}).get("found_at")) or utcnow()
-
-def article_age_minutes(article):
-    try:
-        return max(0, (utcnow() - article_published_at(article)).total_seconds() / 60)
-    except Exception:
-        return 0
-
-def freshness_bonus(article):
-    """
-    Freshness scoring — 0–15 min is the sweet spot Samuga wants to publish in.
-    Scores drop sharply after that to naturally deprioritize older stories.
-    0–15m:  +70  (sweet spot — surface immediately)
-    15–30m: +45  (still very fresh)
-    30–60m: +20  (acceptable)
-    60–90m: +5   (borderline — only posts if score is otherwise strong)
-    90m–3h: -30  (effectively filtered out unless breaking)
-    3h+:    -999 (blocked by should_skip_for_freshness anyway)
-    """
-    age = article_age_minutes(article)
-    if age <= 15: return 70
-    if age <= 30: return 45
-    if age <= 60: return 20
-    if age <= 90: return 5
-    if age <= 180: return -30
-    return -999
-
-def freshness_label(article):
-    age = article_age_minutes(article)
-    if age < 2: return "just now"
-    if age < 60: return f"{int(age)}m old"
-    return f"{age/60:.1f}h old"
-
-def should_skip_for_freshness(article, score=None, breaking=False):
-    """
-    Strict recency gate — Samuga only posts news from the last 3 hours.
-    Breaking news bypasses this entirely (has its own path).
-    'Developing' stories (active incidents) get up to 4h max.
-    'minister'/'president' are NOT developing keywords — they're just regular news
-    that happens to mention officials, and should NOT get an age bypass.
-    """
-    score = score if score is not None else score_article(article)
-    age = article_age_minutes(article)
-    text = ((article or {}).get("title","") + " " + (article or {}).get("summary","")).lower()
-    # Only genuine live-incident keywords grant the developing bypass
-    developing = any(k in text for k in ["update", "developing", "confirmed", "breaking",
-                                          "court", "police", "mndf", "fire", "flood", "crash"])
-    # Hard outer cap — nothing older than 4h ever posts, even breaking confirmed stories
-    if age > 240:
-        return True, f"too old ({age/60:.1f}h) — hard 4h cap"
-    # Regular news: 3h max
-    if age > 180 and not (breaking or developing):
-        return True, f"older than 3h and not a developing story ({age/60:.1f}h, score {score})"
-    # Lower-scoring stories: 90min max
-    if age > 90 and not (breaking or score >= 145 or developing):
-        return True, f"older than 90m and not strong enough ({age:.0f}m, score {score})"
-    return False, ""
-
-def should_skip_low_value(article):
-    """Skip weak/duplicate/low-value stories before Content Lab or website."""
-    if not article:
-        return True, "empty article"
-    title = article.get("title","")
-    summary = article.get("summary","")
-    cat = article.get("cat","LOCAL")
-    text = (title + " " + summary).lower()
-    if len(title.strip()) < 12:
-        return True, "title too short"
-    if _looks_like_ad(text):
-        return True, "ad/promo"
-    # Keep public website/social Maldives-focused; public chat can answer global questions separately.
-    mv_terms = ["maldives","maldivian","raajje","dhivehi","male","malé","hulhumale","atoll","island","mvr","rufiyaa","majlis","mndf","police","president","minister"]
-    if cat in ("WORLD", "DISASTER") and not any(t in text for t in mv_terms):
-        if not is_major_world_news_text(text):
-            return True, "global story without Maldives angle or major-world signal"
-    score = score_article(article)
-    breaking = is_breaking(title, summary, cat)
-    skip_old, reason = should_skip_for_freshness(article, score=score, breaking=breaking)
-    if skip_old:
-        return True, reason
-    min_score = 60 if breaking else 105
-    if score < min_score:
-        return True, f"low score {score} < {min_score}"
-    return False, ""
-
-def english_autopost_delay_seconds(item_or_article):
-    """
-    Confidence-based English auto-post:
-    - Very high confidence/priority: immediately after Content Lab preview
-    - Medium confidence: 5 minutes
-    - Lower confidence: 15–30 minutes
-    Dhivehi never auto-posts here.
-    """
-    lang = (item_or_article or {}).get("lang", "en")
-    if lang == "dv":
-        return None
-    priority = int((item_or_article or {}).get("_priority") or (item_or_article or {}).get("score") or 0)
-    confidence = int((item_or_article or {}).get("_confidence") or 0)
-    if (item_or_article or {}).get("is_breaking") and confidence >= 55:
-        return 0
-    if confidence >= 85 and priority >= 155:
-        return 0
-    if confidence >= 70:
-        return 300
-    if confidence >= 55:
-        return 900
-    return 1800
-
-def is_breaking(title, summary="", cat=""):
-    text = (title + " " + summary).lower()
-
-    # Never breaking for these categories
-    if cat in ["FOOTBALL", "TOURISM", "WEATHER", "SPORTS", "LIFESTYLE"]: return False
-
-    # Never breaking if it looks like an ad/promo (submarine hire, speedboat rental, etc.)
-    if _looks_like_ad(text): return False
-
-    # Check blacklist first — if any blacklist term present, not breaking
-    if any(bl in text for bl in BREAKING_BLACKLIST): return False
-
-    # Must match a real breaking keyword
-    if not any(kw in text for kw in BREAKING_KEYWORDS): return False
-
-    # For LOCAL category — must be Maldives related
-    if cat == "LOCAL":
-        mv_terms = ["maldives","male","malé","dhivehi","maldivian","raajje","atoll",
-                    "police","court","majlis","minister","president","island"]
-        if not any(t in text for t in mv_terms): return False
-
-    return True
-
-last_regular_post_time = None
-
-# ── Daily posting counters (reset at midnight MVT) ────────────────────────────
-def _mvt_today():
-    return (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
-
-daily_sports_count  = {"date": None, "count": 0}
-daily_world_count   = {"date": None, "count": 0}
-daily_tourism_count = {"date": None, "count": 0}
-
-def can_post_cat_today(counter_dict, max_count):
-    today = _mvt_today()
-    if counter_dict["date"] != today:
-        counter_dict["date"] = today
-        counter_dict["count"] = 0
-    return counter_dict["count"] < max_count
-
-def increment_cat_count(counter_dict):
-    today = _mvt_today()
-    if counter_dict["date"] != today:
-        counter_dict["date"] = today
-        counter_dict["count"] = 0
-    counter_dict["count"] += 1
-    persist_state()
 
 def can_post_regular():
     """
     Returns True only if:
-    1. At least 2 minutes have passed since last regular post, AND
-    2. Daily regular post cap has not been hit.
+    1. At least 2 hours have passed since last regular post, AND
+    2. Daily regular post cap (12) hasn't been hit.
     Breaking news ignores this entirely.
     """
     global last_regular_post_time
@@ -2247,10 +537,10 @@ def allowed_for_social(article):
     if cat in ["SPORTS", "FOOTBALL", "WEATHER", "TOURISM"]:
         return False
     if cat == "WORLD":
-        # Maldives/region/economy relevant OR major global story. Daily world cap still limits volume.
+        # Only Maldives-relevant world news
         text = (article["title"] + " " + article.get("summary","")).lower()
-        mv_terms = ["maldives","indian ocean","south asia","india","sri lanka","china","un ","dollar","oil price","global economy"]
-        return any(t in text for t in mv_terms) or is_major_world_news_text(text)
+        mv_terms = ["maldives","indian ocean","south asia","india","china","un ","dollar","oil price","global economy"]
+        return any(t in text for t in mv_terms)
     # LOCAL and DISASTER always allowed
     return True
 
@@ -2268,12 +558,12 @@ def is_day_social():
     return 6 <= h < 22
 
 def can_post_social():
-    """Check if social daily limit not reached: 30 posts 6AM-10PM, 5 posts night"""
+    """Check if social daily limit not reached: 20 posts 6AM-10PM, 5 posts night"""
     global social_post_counts
     today = mvt_now().date()
     if social_post_counts["date"] != today:
         social_post_counts = {"date": today, "count": 0}
-    limit = 30 if is_day_social() else 5
+    limit = 20 if is_day_social() else 3
     return social_post_counts["count"] < limit
 
 def increment_social_count():
@@ -2283,915 +573,18 @@ def increment_social_count():
         social_post_counts = {"date": today, "count": 0}
     social_post_counts["count"] += 1
     persist_state()
-    log.info(f"📊 Social posts today: {social_post_counts['count']} ({'day' if is_day_social() else 'night'} limit: {30 if is_day_social() else 5})")
-
-# ── Gemini Translate ──────────────────────────────────────────────────────────
-def gemini_translate(text):
-    """Translate Dhivehi to English using Gemini (with model fallback)."""
-    if not GEMINI_API_KEY: return text
-    result = _gemini_post(f"Translate this Dhivehi text to English. Return ONLY the English translation:\n\n{text}")
-    return result if result else text
-
-# ── Fetch News ────────────────────────────────────────────────────────────────
-# Words that signal an ad/promo/spam — never treat these as news
-MVCRISIS_AD_MARKERS = [
-    "hire","rent","for sale","available","booking","book now","contact","call now",
-    "whatsapp","viber","discount","offer","promo","cheap","price","mvr ","rufiyaa ",
-    "delivery","order now","dm ","inbox","trip","package","tour","charter","ferry service",
-    "submarine","speed boat hire","speedboat hire","private trips","advertise","sponsored",
-    "sale!","%","https://sauvees","buy ","sell ","service available","we offer"
-]
-
-def _looks_like_ad(text):
-    """Heuristic: is this MvCrisis post an ad/promo rather than news?"""
-    t = text.lower()
-    hits = sum(1 for m in MVCRISIS_AD_MARKERS if m in t)
-    # Multiple ad markers, or a phone number pattern, or a price = likely ad
-    import re as _re
-    has_phone = bool(_re.search(r"\b[79]\d{6}\b", t))  # Maldivian mobile pattern
-    has_price = bool(_re.search(r"\b\d+\s*(mvr|rf|rufiyaa|usd|\$)\b", t))
-    return hits >= 2 or (hits >= 1 and (has_phone or has_price))
-
-
-def _html_unescape(text):
-    try:
-        import html
-        return html.unescape(text or "")
-    except Exception:
-        return str(text or "")
-
-def _extract_telegram_messages(html_text, limit=12):
-    """
-    Extract public Telegram channel messages with their real timestamp.
-    This prevents old t.me/s posts from being treated as fresh on every deploy.
-    """
-    import re as _re
-    blocks = _re.findall(r'<div class="tgme_widget_message[^>]*?>(.*?)(?=<div class="tgme_widget_message|</section>|\Z)', html_text, _re.DOTALL)
-    out = []
-    for block in blocks:
-        txt_m = _re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', block, _re.DOTALL)
-        if not txt_m:
-            continue
-        raw = txt_m.group(1)
-        clean = _re.sub(r"<br\s*/?>", "\n", raw)
-        clean = _re.sub(r"<[^>]+>", "", clean).strip()
-        clean = _html_unescape(clean)
-        dt = None
-        time_m = _re.search(r'<time[^>]+datetime="([^"]+)"', block)
-        if time_m:
-            dt = _parse_any_datetime(time_m.group(1))
-        out.append((clean, dt or utcnow()))
-        if len(out) >= limit:
-            break
-    # Fallback for Telegram HTML changes
-    if not out:
-        texts = _re.findall(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', html_text, _re.DOTALL)
-        dates = [_parse_any_datetime(x) for x in _re.findall(r'<time[^>]+datetime="([^"]+)"', html_text)]
-        for i, raw in enumerate(texts[:limit]):
-            clean = _re.sub(r"<br\s*/?>", "\n", raw)
-            clean = _re.sub(r"<[^>]+>", "", clean).strip()
-            clean = _html_unescape(clean)
-            out.append((clean, dates[i] if i < len(dates) and dates[i] else utcnow()))
-    return out[:limit]
-
-def fetch_mvcrisis():
-    """Scrape MvCrisis public Telegram channel — filters ads, only keeps real news."""
-    try:
-        resp = requests.get("https://t.me/s/mvcrisis", timeout=10,
-                           headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code != 200:
-            return []
-        articles = []
-        skipped_ads = 0
-        for text, published in _extract_telegram_messages(resp.text, limit=15):
-            if len(text) < 25:
-                continue
-            if _looks_like_ad(text):
-                skipped_ads += 1
-                continue
-            art_id = "mvc_" + hashlib.md5((text[:80] + str(published)).encode()).hexdigest()[:10]
-            lang = "dv" if any("ހ" <= ch <= "޿" for ch in text) else "en"
-            articles.append({
-                "id": art_id,
-                "title": text[:150],
-                "summary": text,
-                "link": "https://t.me/mvcrisis",
-                "source": "MvCrisis",
-                "cat": "LOCAL",
-                "lang": lang,
-                "published": published
-            })
-        log.info(f"📡 MvCrisis: {len(articles)} news kept, {skipped_ads} ads skipped")
-        return articles
-    except Exception as e:
-        log.error(f"MvCrisis fetch: {e}")
-        return []
-
-# ── Dhivehi Telegram channel scrapers ────────────────────────────────────────
-# Maldivian news sites block RSS with 403. Their Telegram channels are public
-# and scrapeable — same technique as MvCrisis. Each returns native Dhivehi text.
-
-DV_TELEGRAM_CHANNELS = [
-    # Keep multiple known/likely handles where needed. /diag will show which ones work.
-    {"handle": "mihaarulive",      "source": "Mihaaru",   "reliability": 95},
-    {"handle": "mihaaru",          "source": "Mihaaru",   "reliability": 95},
-    {"handle": "avasonline",       "source": "Avas",      "reliability": 88},
-    {"handle": "avasmv",           "source": "Avas",      "reliability": 88},
-    {"handle": "sunmvmv",          "source": "Sun",       "reliability": 92},
-    {"handle": "sunonlinemv",      "source": "Sun",       "reliability": 92},
-    {"handle": "raajjemvlive",     "source": "Raajje",    "reliability": 85},
-    {"handle": "raajjemv",         "source": "Raajje",    "reliability": 85},
-    {"handle": "voicemaldives",    "source": "VoiceMV",   "reliability": 80},
-    {"handle": "voice_mv",         "source": "VoiceMV",   "reliability": 80},
-    {"handle": "mvplusmedia",      "source": "MV+",       "reliability": 82},
-    {"handle": "mvcrisis",         "source": "MvCrisis",  "reliability": 70},
-] + parse_extra_telegram_sources()
-
-
-# Direct latest-page sources. RSS is blocked/weak on many Maldives sites, so this
-# browser-like fallback watches public latest/home pages for fresh headlines.
-WEB_LATEST_SOURCES = [
-    {"url": "https://mihaaru.com/",          "source": "Mihaaru",    "cat": "LOCAL", "lang": "dv"},
-    {"url": "https://avas.mv/",              "source": "Avas",       "cat": "LOCAL", "lang": "dv"},
-    {"url": "https://sun.mv/",               "source": "Sun",        "cat": "LOCAL", "lang": "dv"},
-    {"url": "https://english.sun.mv/",       "source": "Sun",        "cat": "LOCAL", "lang": "en"},
-    {"url": "https://psmnews.mv/en",         "source": "PSM News",   "cat": "LOCAL", "lang": "en"},
-    {"url": "https://raajje.mv/",            "source": "Raajje",     "cat": "LOCAL", "lang": "dv"},
-    {"url": "https://voice.mv/",             "source": "VoiceMV",    "cat": "LOCAL", "lang": "dv"},
-    {"url": "https://edition.mv/",           "source": "Edition",    "cat": "LOCAL", "lang": "en"},
-    {"url": "https://maldivesvoice.com/",    "source": "Maldives Voice", "cat": "LOCAL", "lang": "en"},
-    {"url": "https://thepress.mv/",          "source": "ThePress",   "cat": "LOCAL", "lang": "dv"},
-    {"url": "https://www.mndf.gov.mv/",      "source": "MNDF",       "cat": "LOCAL", "lang": "en"},
-    {"url": "https://www.police.gov.mv/",    "source": "Police",     "cat": "LOCAL", "lang": "en"},
-    {"url": "https://presidency.gov.mv/",    "source": "Presidency", "cat": "LOCAL", "lang": "en"},
-]
-
-
-def fetch_dv_telegram(handle, source, reliability=80):
-    """
-    Scrape a public Telegram channel for Dhivehi/news posts with real Telegram timestamps.
-    Returns lang='dv' when Thaana is present, lang='en' for English/mixed posts.
-    """
-    try:
-        url = f"https://t.me/s/{handle}"
-        resp = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code != 200:
-            log.debug(f"[FETCH] {source} Telegram: HTTP {resp.status_code}")
-            return []
-        articles = []
-        for text, published in _extract_telegram_messages(resp.text, limit=12):
-            if len(text) < 20:
-                continue
-            if _looks_like_ad(text):
-                continue
-            if (utcnow() - published).total_seconds() > 12 * 3600:
-                continue
-            dv_chars = sum(1 for ch in text if "ހ" <= ch <= "޿")
-            lang = "dv" if dv_chars >= 1 else "en"
-            art_id = f"tg_{handle}_" + hashlib.md5((text[:80] + str(published)).encode()).hexdigest()[:10]
-            articles.append({
-                "id":          art_id,
-                "title":       text[:150],
-                "summary":     text,
-                "link":        f"https://t.me/{handle}",
-                "source":      source,
-                "cat":         "LOCAL",
-                "lang":        lang,
-                "reliability": reliability,
-                "published":   published
-            })
-        log.info(f"[FETCH] {source} Telegram: {len(articles)} items")
-        return articles
-    except Exception as e:
-        log.error(f"[FETCH] {source} Telegram: {e}")
-        return []
-
-def fetch_all_dv_channels():
-    """Fetch all Dhivehi Telegram channels in parallel threads."""
-    results = []
-    lock = threading.Lock()
-
-    def _fetch(ch):
-        arts = fetch_dv_telegram(ch["handle"], ch["source"], ch["reliability"])
-        with lock:
-            results.extend(arts)
-
-    threads = [threading.Thread(target=_fetch, args=(ch,), daemon=True)
-               for ch in DV_TELEGRAM_CHANNELS]
-    for t in threads: t.start()
-    for t in threads: t.join(timeout=15)
-    return results
-
-def _feed_source_name(url):
-    """Map a feed URL to a clean source name for reliability scoring + display."""
-    u = url.lower()
-    if "news.google.com" in u: return "Google News"
-    if "mihaaru" in u:         return "Mihaaru"
-    if "sunonline" in u:       return "SunOnline"
-    if "sun.mv" in u:          return "Sun"
-    if "psmnews" in u:         return "PSM News"
-    if "presidency" in u:      return "Presidency"
-    if "edition" in u:         return "Edition"
-    if "avas" in u:            return "Avas"
-    if "see.mv" in u:          return "See"
-    if "maldivesindependent" in u: return "Maldives Independent"
-    if "oneonline" in u:       return "One Online"
-    if "maldivesvoice" in u:   return "Maldives Voice"
-    if "visitmaldives" in u:   return "Visit Maldives"
-    if "vnewsmv" in u:         return "VNews"
-    if "raajjemv" in u:        return "Raajje"
-    if "thepress_mv" in u:     return "ThePress"
-    return ""
-
-def _build_article_from_feed_entry(entry, fc, fallback_source=""):
-    """Convert a feedparser entry into a Samuga article dict with safe defaults."""
-    title = entry.get("title", "") or ""
-    summary = entry.get("summary", title) or title
-    lang = fc.get("lang", "en")
-    if lang == "dv" and not is_dhivehi(title + " " + summary):
-        # If a Dhivehi feed returns Latin/English, keep it as English unless Gemini can clean it later.
-        lang = "en"
-    entry_src = entry.get("source", {}).get("title", "") if isinstance(entry.get("source"), dict) else ""
-    src_name = fc.get("source") or entry_src or fallback_source or _feed_source_name(fc.get("url", "")) or fc.get("cat", "LOCAL")
-    return {
-        "id": hashlib.md5((entry.get("link", "") or title).encode()).hexdigest(),
-        "title": strip_source_links(title)[:180],
-        "summary": strip_source_links(summary)[:1500],
-        "link": entry.get("link", ""),
-        "cat": fc.get("cat", "LOCAL"),
-        "lang": lang,
-        "source": src_name,
-        "published": entry_published_dt(entry) or utcnow(),
-    }
-
-def fetch_rss_feed_items(fc, limit=8, max_age_hours=3):
-    """Safe RSS fetch wrapper used by normal feeds + local RSS recovery + world feeds."""
-    out = []
-    url = fc.get("url", "")
-    if not url:
-        return out
-    try:
-        feed = feedparser.parse(url)
-        entries = getattr(feed, "entries", []) or []
-        if not entries:
-            return out
-        for entry in entries[:limit]:
-            if not is_fresh(entry, hours=max_age_hours):
-                continue
-            a = _build_article_from_feed_entry(entry, fc)
-            if not a.get("title"):
-                continue
-            out.append(a)
-    except Exception as e:
-        log.debug(f"[RSS] feed failed {url}: {e}")
-    return out
-
-def fetch_local_rss_recovery(limit_per_source=4):
-    """
-    Try common RSS paths for local sources, then Google News per-source backups.
-    This does not replace latest-page/Telegram; it is one extra ladder step.
-    """
-    articles, seen_keys = [], set()
-    # Direct candidate paths first
-    for src in LOCAL_RSS_RECOVERY_SOURCES:
-        found_for_source = 0
-        base = src["domain"].rstrip("/")
-        for path in RSS_CANDIDATE_PATHS:
-            fc = {"url": base + path, "cat": src.get("cat", "LOCAL"), "lang": src.get("lang", "en"), "source": src.get("source", "LOCAL")}
-            items = fetch_rss_feed_items(fc, limit=limit_per_source, max_age_hours=3)
-            if not items:
-                continue
-            for a in items:
-                key = _caption_match_key(a.get("title", ""))
-                if not key or key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                articles.append(a)
-                found_for_source += 1
-                if found_for_source >= limit_per_source:
-                    break
-            if found_for_source:
-                log.info(f"[RSS] {src['source']} recovery working via {path}: {found_for_source} item(s)")
-                break
-    # Google News per-source backup
-    for fc in LOCAL_GOOGLE_BACKUP_FEEDS:
-        items = fetch_rss_feed_items(fc, limit=limit_per_source, max_age_hours=3)
-        kept = 0
-        for a in items:
-            key = _caption_match_key(a.get("title", ""))
-            if not key or key in seen_keys:
-                continue
-            seen_keys.add(key)
-            articles.append(a)
-            kept += 1
-        if kept:
-            log.info(f"[RSS] Google local backup {fc.get('source','')}: {kept} item(s)")
-    return articles
-
-def fetch_world_updates(limit=8):
-    """Fetch major world updates separately so Samuga has global awareness without filler."""
-    articles, seen_keys = [], set()
-    for fc in WORLD_FEEDS:
-        for a in fetch_rss_feed_items(fc, limit=limit, max_age_hours=3):
-            text = a.get("title", "") + " " + a.get("summary", "")
-            if not is_major_world_news_text(text):
-                continue
-            key = _caption_match_key(a.get("title", ""))
-            if not key or key in seen_keys:
-                continue
-            seen_keys.add(key)
-            a["cat"] = "DISASTER" if a.get("cat") == "DISASTER" else "WORLD"
-            a["source"] = a.get("source") or "World News"
-            articles.append(a)
-    if articles:
-        log.info(f"[FETCH] World updates: {len(articles)} major item(s)")
-    return articles
-
-def fetch_latest_web_pages(limit_per_source=6):
-    """
-    RSS fallback: scrape public latest/home pages like a browser.
-    This is intentionally lightweight and only extracts headline links; the bot
-    still rewrites in Samuga style and never exposes source links publicly.
-    """
-    articles = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,dv;q=0.8",
-        "Cache-Control": "no-cache",
-    }
-    try:
-        from urllib.parse import urljoin, urlparse
-    except Exception:
-        return articles
-
-    for src in WEB_LATEST_SOURCES:
-        try:
-            resp = requests.get(src["url"], timeout=12, headers=headers)
-            if resp.status_code != 200 or not resp.text:
-                log.debug(f"[FETCH] {src['source']} latest page HTTP {resp.status_code}")
-                continue
-            try:
-                from bs4 import BeautifulSoup
-                soup = BeautifulSoup(resp.text, "html.parser")
-                anchors = soup.find_all("a", href=True)
-                candidates = []
-                for a in anchors:
-                    title = " ".join(a.get_text(" ", strip=True).split())
-                    if len(title) < 18 or len(title) > 180:
-                        continue
-                    href = urljoin(src["url"], a.get("href", ""))
-                    host = urlparse(src["url"]).netloc.replace("www.", "")
-                    if host not in urlparse(href).netloc:
-                        continue
-                    candidates.append((title, href))
-            except Exception:
-                import re as _re
-                candidates = []
-                for href, title in _re.findall(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', resp.text, _re.I|_re.S):
-                    title = _re.sub(r"<[^>]+>", " ", title)
-                    title = " ".join(_html_unescape(title).split())
-                    if 18 <= len(title) <= 180:
-                        candidates.append((title, urljoin(src["url"], href)))
-
-            seen_local = set()
-            kept = 0
-            for title, href in candidates:
-                key = re.sub(r"\W+", " ", title.lower()).strip()[:70]
-                if key in seen_local:
-                    continue
-                seen_local.add(key)
-                if _looks_like_ad(title):
-                    continue
-                lang = "dv" if is_dhivehi(title) else src.get("lang","en")
-                art_id = "web_" + hashlib.md5((href or title).encode()).hexdigest()[:12]
-                articles.append({
-                    "id": art_id,
-                    "title": title[:150],
-                    "summary": title,
-                    "link": href,
-                    "source": src["source"],
-                    "cat": src.get("cat","LOCAL"),
-                    "lang": lang,
-                    "published": utcnow(),  # latest pages rarely expose clean dates; seen DB prevents repeats
-                })
-                kept += 1
-                if kept >= limit_per_source:
-                    break
-            if kept:
-                log.info(f"[FETCH] {src['source']} latest page: {kept} headline(s)")
-        except Exception as e:
-            log.debug(f"[FETCH] latest page {src.get('source')}: {e}")
-    return articles
-
-def fetch_news():
-    articles, seen_titles = [], set()
-    # MvCrisis first — #1 Maldives breaking news source
-    for a in fetch_mvcrisis():
-        if a["title"] not in seen_titles:
-            seen_titles.add(a["title"])
-            articles.append(a)
-    # Dhivehi Telegram channels — native Dhivehi content from Mihaaru, Avas, VNews etc
-    for a in fetch_all_dv_channels():
-        key = re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
-        if key not in seen_titles:
-            seen_titles.add(key)
-            articles.append(a)
-
-    # Website latest pages — fallback for Maldives sites that block RSS.
-    for a in fetch_latest_web_pages():
-        key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
-        if key not in seen_titles:
-            seen_titles.add(key)
-            articles.append(a)
-
-    # Local RSS recovery ladder: common RSS paths + Google News per-source backups.
-    for a in fetch_local_rss_recovery():
-        key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
-        if key not in seen_titles:
-            seen_titles.add(key)
-            articles.append(a)
-
-    # Normal configured RSS feeds.
-    for fc in RSS_FEEDS:
-        for a in fetch_rss_feed_items(fc, limit=10, max_age_hours=3):
-            key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
-            if key in seen_titles:
-                continue
-            seen_titles.add(key)
-            articles.append(a)
-
-    # Major world updates — limited by strict scoring later, but fetched here for awareness.
-    for a in fetch_world_updates(limit=6):
-        key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
-        if key not in seen_titles:
-            seen_titles.add(key)
-            articles.append(a)
-
-    log.info(f"Found {len(articles)} fresh articles from source ladder")
-    return articles
-
-def get_local_headlines():
-    headlines = []
-    try:
-        for fc in RSS_FEEDS[:5]:
-            feed = feedparser.parse(fc["url"])
-            for entry in feed.entries[:3]:
-                title = entry.get("title","")
-                if title and is_fresh(entry, hours=3):
-                    headlines.append(f"• [{fc['cat']}] {title}")
-            if len(headlines) >= 10: break
-    except Exception as e: log.debug(f"get_local_headlines: {e}")
-    return headlines[:10]
-
-# ── Rewrite with Claude ───────────────────────────────────────────────────────
-DEFAULT_KEYWORDS = {"LOCAL":"maldives government","FOOTBALL":"football stadium","WORLD":"world politics","DISASTER":"emergency rescue","WEATHER":"tropical weather","TOURISM":"maldives resort beach"}
-
-def rewrite_news(title, summary, cat):
-    cat_ctx = {"LOCAL":"local Maldivian news","FOOTBALL":"football news","WORLD":"world news","DISASTER":"disaster/emergency","WEATHER":"weather news","TOURISM":"tourism news"}.get(cat,"news")
-    extra = "Note: Only headline available. Expand with relevant context." if not summary or summary.strip()==title.strip() or len(summary)<30 else ""
-    prompt = f"""You are a news writer for Samuga Media, a Maldivian digital media outlet.
-Rewrite this {cat_ctx} into a short punchy engaging English Telegram post.
-- Max 3 sentences, clear and direct, no hashtags, no emojis, professional
-- IMPORTANT: Use gender-neutral terms (they/their, "the accused", "the suspect", "the individual") unless the original text explicitly states gender. Do not assume gender from names.
-{extra}
-Also give a specific 2-3 word Pexels image keyword for this topic.
-
-Title: {title}
-Summary: {summary}
-
-Return exactly two lines, with no brackets and no placeholder text:
-TEXT: final rewritten news post
-IMAGE: 2-3 word visual search keyword
-
-Never return bracketed placeholder text or instruction labels as the final answer."""
-    try:
-        msg = ai.messages.create(model="claude-haiku-4-5-20251001", max_tokens=400, messages=[{"role":"user","content":prompt}])
-        text, kw = "", DEFAULT_KEYWORDS.get(cat,"maldives")
-        for line in msg.content[0].text.strip().split('\n'):
-            clean_line = line.strip()
-            if clean_line.upper().startswith("TEXT:"):
-                text = clean_ai_line(clean_line[5:])
-            elif clean_line.upper().startswith("IMAGE:"):
-                kw = clean_ai_line(clean_line[6:])
-        if has_public_placeholder(text):
-            log.warning(f"[AI] Placeholder rewrite blocked; using fallback: {title[:70]}")
-            text = fallback_rewritten_news(title, summary, cat)
-        kw = safe_image_keyword(kw, cat=cat, title=title)
-        return (text or fallback_rewritten_news(title, summary, cat)), kw
-    except Exception as e:
-        log.error(f"Claude rewrite: {e}")
-        return fallback_rewritten_news(title, summary, cat), DEFAULT_KEYWORDS.get(cat,"maldives")
-
-# ── Pexels ────────────────────────────────────────────────────────────────────
-# Category-specific Pexels keyword pools for manual cards with no photo attached
-CAT_BG_KEYWORDS = {
-    "BREAKING":  ["emergency lights dark", "crisis night city", "dark dramatic sky", "police lights night", "siren emergency"],
-    "LOCAL":     ["maldives aerial ocean", "male maldives cityscape", "maldives island aerial", "tropical island drone", "maldives lagoon blue"],
-    "POLITICAL": ["parliament building architecture", "government building columns", "official meeting room", "flag government building", "diplomatic hall"],
-    "LIFESTYLE": ["maldives resort overwater", "maldives sunset beach", "tropical luxury resort", "maldives turquoise water", "maldives bungalow ocean"],
-    "SPORTS":    ["football stadium lights night", "soccer field aerial", "athlete stadium crowd", "sport arena lights", "football pitch green"],
-    "DISASTER":  ["emergency lights dark", "crisis rescue night", "dark storm dramatic", "fire rescue dark", "disaster rescue"],
-    "WORLD":     ["world globe dark", "city skyline night", "international airport", "global city lights", "urban skyline dramatic"],
-    "TOURISM":   ["maldives resort luxury", "tropical beach aerial", "maldives overwater villa", "island paradise blue", "resort pool tropical"],
-    "WEATHER":   ["storm clouds dramatic", "tropical rain dark", "monsoon ocean waves", "dark clouds sea", "storm lightning ocean"],
-    "FOOTBALL":  ["football stadium lights night", "soccer field green aerial", "football match crowd", "sport arena lights", "football pitch"],
-}
-DEFAULT_BG_KEYWORDS = ["maldives ocean aerial", "island blue lagoon", "tropical dark dramatic", "maldives night city", "ocean waves dark"]
-
-def _safe_bg_keyword(title, cat):
-    """
-    Extract a safe, visually appropriate Pexels search keyword from the article title.
-    The goal: get a relevant but GENERIC image — never something that could show
-    wrong flags, wrong faces, or misleading visuals.
-    """
-    import random as _r
-    t = title.lower()
-
-    # Maldives-specific topic mapping — most specific first
-    if any(k in t for k in ["maldives", "male", "hulhumale", "addu", "atoll",
-                             "mndf", "mps", "police", "coast guard"]):
-        return _r.choice(["maldives aerial ocean", "male city maldives", "maldives island drone",
-                          "maldives lagoon blue", "tropical island aerial"])
-    if any(k in t for k in ["parliament", "majlis", "government", "minister",
-                             "president", "cabinet", "policy", "law", "bill"]):
-        return _r.choice(["parliament building architecture", "government building dark",
-                          "official hall columns", "legislative building aerial"])
-    if any(k in t for k in ["court", "judge", "verdict", "sentence", "criminal", "trial"]):
-        return _r.choice(["court building architecture", "justice scales dark",
-                          "legal building exterior", "court hall dramatic"])
-    if any(k in t for k in ["fire", "blaze", "burned", "flames"]):
-        return _r.choice(["fire night dark dramatic", "emergency lights night",
-                          "fire rescue dark", "flames dark dramatic"])
-    if any(k in t for k in ["accident", "crash", "collision", "vehicle"]):
-        return _r.choice(["emergency lights night", "accident scene dark",
-                          "road night dramatic", "rescue operation night"])
-    if any(k in t for k in ["boat", "ferry", "ship", "vessel", "sea", "ocean", "coast"]):
-        return _r.choice(["boat ocean maldives", "sea vessel dramatic", "ocean dark waves",
-                          "maldives boat lagoon", "ferry ocean dark"])
-    if any(k in t for k in ["hospital", "health", "medical", "disease", "drug", "dengue"]):
-        return _r.choice(["hospital building exterior", "medical blue dark",
-                          "healthcare building", "medical technology dark"])
-    if any(k in t for k in ["school", "education", "student", "university", "exam"]):
-        return _r.choice(["school building exterior", "education building",
-                          "university campus aerial", "classroom empty dramatic"])
-    if any(k in t for k in ["economy", "finance", "bank", "budget", "mvr", "usd", "money"]):
-        return _r.choice(["finance building city", "economy dark dramatic",
-                          "bank building architecture", "business district night"])
-    if any(k in t for k in ["weather", "storm", "rain", "flood", "wind"]):
-        return _r.choice(["storm clouds ocean", "dark rain dramatic",
-                          "monsoon waves tropical", "storm lightning sea"])
-    if any(k in t for k in ["football", "soccer", "sport", "game", "match", "tournament"]):
-        return _r.choice(["football stadium night", "soccer pitch aerial",
-                          "sport arena lights", "football match crowd"])
-    if any(k in t for k in ["tourism", "resort", "tourist", "hotel", "visit"]):
-        return _r.choice(["maldives resort luxury", "overwater villa tropical",
-                          "maldives beach sunset", "tropical resort aerial"])
-    if any(k in t for k in ["arrest", "murder", "kill", "crime", "robbery", "theft"]):
-        return _r.choice(["police lights night", "crime scene dark dramatic",
-                          "investigation dark city", "night city dramatic dark"])
-    if any(k in t for k in ["earthquake", "tsunami", "disaster", "emergency"]):
-        return _r.choice(["disaster rescue dramatic", "emergency response night",
-                          "crisis dark dramatic", "emergency lights dark"])
-
-    # Category fallbacks — safe and generic
-    fallbacks = CAT_BG_KEYWORDS.get(cat, DEFAULT_BG_KEYWORDS)
-    return _r.choice(fallbacks)
-
-def fetch_background_image(keyword, cat=None, title=None):
-    """
-    Fetch background from Pexels using smart keyword extraction.
-    Uses title for best accuracy — never shows wrong flags or misleading visuals.
-    """
-    if not PEXELS_API_KEY: return None
-    import random as _rand
-    try:
-        if title:
-            search_kw = _safe_bg_keyword(title, cat or "LOCAL")
-        elif cat and cat in CAT_BG_KEYWORDS:
-            search_kw = _rand.choice(CAT_BG_KEYWORDS[cat])
-        elif not keyword or keyword in ["maldives news", "news", "local"]:
-            search_kw = _rand.choice(DEFAULT_BG_KEYWORDS)
-        else:
-            # Sanitize raw keyword — never use person names or country names directly
-            dangerous = ["president", "minister", "india", "china", "pakistan",
-                         "israel", "america", "flag", "person", "man", "woman"]
-            if any(d in keyword.lower() for d in dangerous):
-                search_kw = _rand.choice(DEFAULT_BG_KEYWORDS)
-            else:
-                search_kw = keyword
-
-        resp = requests.get(
-            f"https://api.pexels.com/v1/search?query={search_kw}&per_page=10&orientation=square",
-            headers={"Authorization": PEXELS_API_KEY}, timeout=15)
-        if resp.status_code == 200:
-            photos = resp.json().get("photos", [])
-            if photos:
-                photo = _rand.choice(photos)
-                r = requests.get(photo["src"]["large"], timeout=20)
-                if r.status_code == 200:
-                    log.info(f"✅ Pexels bg: '{search_kw}' (title={title[:30] if title else '—'})")
-                    return Image.open(BytesIO(r.content)).convert("RGB")
-    except Exception as e:
-        log.error(f"Pexels: {e}")
-    return None
-
-# ── Generate Card ─────────────────────────────────────────────────────────────
-WHITE=(255,255,255); LIGHT_GRAY=(200,215,230); BG_TOP=(10,40,75); BG_BOTTOM=(5,20,45)
-
-
-# ── Dhivehi Card Generator (Pango/Cairo — proper Thaana shaping) ──────────────
-def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
-    """Generate card with proper Thaana shaping using Pango/Cairo"""
-    try:
-        import gi
-        gi.require_version("Pango", "1.0")
-        gi.require_version("PangoCairo", "1.0")
-        from gi.repository import Pango, PangoCairo
-        import cairo
-    except Exception as e:
-        log.error(f"Pango not available (falling back to PIL): {e}")
-        log.info("Tip: ensure python3-gi is installed in Dockerfile")
-        return generate_card(text, source, timestamp, cat, bg_image, _skip_dhivehi=True)
-
-    import numpy as np
-
-    W, H = 1080, 1080
-    DV_CAT = {
-        "BREAKING": {"label": "ބްރޭކިން ނިއުސް", "color": (220, 50, 50)},
-        "LOCAL":    {"label": "ލޯކަލް ނިއުސް",   "color": (0, 180, 255)},
-        "POLITICAL":{"label": "ސިޔާސީ",          "color": (180, 140, 40)},
-        "LIFESTYLE":{"label": "ލައިފްސްޓައިލް",  "color": (160, 80, 220)},
-        "SPORTS":   {"label": "ކުޅިވަރު",        "color": (34, 180, 80)},
-        # Legacy aliases
-        "DISASTER": {"label": "ބްރޭކިން ނިއުސް", "color": (220, 50, 50)},
-        "WORLD":    {"label": "ދުނިޔެ",          "color": (50, 180, 100)},
-        "FOOTBALL": {"label": "ކުޅިވަރު",        "color": (34, 180, 80)},
-        "TOURISM":  {"label": "ލައިފްސްޓައިލް",  "color": (160, 80, 220)},
-        "WEATHER":  {"label": "ލައިފްސްޓައިލް",  "color": (160, 80, 220)},
-    }
-    cfg = DV_CAT.get(cat, DV_CAT["LOCAL"])
-    accent = cfg["color"]
-    label_dv = cfg["label"]
-
-    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, W, H)
-    ctx = cairo.Context(surface)
-
-    # Background
-    if bg_image:
-        try:
-            bg = bg_image.copy().convert("RGB")
-            r = bg.width / bg.height
-            nh, nw = (H, int(H*r)) if r > 1 else (int(W/r), W)
-            bg = bg.resize((nw, nh), Image.LANCZOS)
-            bg = bg.crop(((nw-W)//2, (nh-H)//2, (nw-W)//2+W, (nh-H)//2+H))
-            bg = ImageEnhance.Brightness(bg).enhance(0.32)
-            navy = Image.new("RGB", (W, H), (8, 30, 65))
-            bg = Image.blend(bg, navy, 0.45).convert("RGBA")
-            bg_arr = np.array(bg)
-            bg_bgra = np.ascontiguousarray(bg_arr[:, :, [2, 1, 0, 3]])
-            bg_surf = cairo.ImageSurface.create_for_data(bg_bgra, cairo.FORMAT_ARGB32, W, H)
-            ctx.set_source_surface(bg_surf, 0, 0)
-            ctx.paint()
-        except Exception as e:
-            log.error(f"BG paste: {e}")
-            ctx.set_source_rgb(0.008, 0.047, 0.107)
-            ctx.paint()
-    else:
-        ctx.set_source_rgb(0.008, 0.047, 0.107)
-        ctx.paint()
-
-    # Gradients
-    grad = cairo.LinearGradient(0, H//2, 0, H)
-    grad.add_color_stop_rgba(0, 0.02, 0.08, 0.2, 0)
-    grad.add_color_stop_rgba(1, 0.02, 0.08, 0.2, 0.85)
-    ctx.set_source(grad); ctx.rectangle(0, 0, W, H); ctx.fill()
-
-    grad2 = cairo.LinearGradient(0, 0, 0, 170)
-    grad2.add_color_stop_rgba(0, 0.02, 0.08, 0.2, 0.75)
-    grad2.add_color_stop_rgba(1, 0, 0, 0, 0)
-    ctx.set_source(grad2); ctx.rectangle(0, 0, W, H); ctx.fill()
-
-    # Accent bar
-    ctx.set_source_rgb(accent[0]/255, accent[1]/255, accent[2]/255)
-    ctx.rectangle(0, 0, W, 5); ctx.fill()
-
-    # PIL overlay for logo + footer
-    from PIL import ImageDraw as _ID, ImageFont as _IF
-    ov = Image.new("RGBA", (W, H), (0,0,0,0))
-    od = _ID.Draw(ov)
-    try:
-        logo = Image.open("logo.png").convert("RGBA")
-        lh = 72; lw = int(logo.width * lh / logo.height)
-        logo = logo.resize((lw, lh), Image.LANCZOS)
-        ov.paste(logo, (50, 38), logo)
-    except Exception as e: log.debug(f"logo overlay: {e}")
-    try:
-        f_sm = _IF.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 21)
-        od.text((W-310, 50), "t.me/samugacommunity", font=f_sm, fill=(200,230,255,220))
-        od.text((50, H-52), f"Source: {source}", font=f_sm, fill=(180,200,220,220))
-        tw = od.textlength(timestamp, font=f_sm)
-        od.text((W-50-int(tw), H-52), timestamp, font=f_sm, fill=(180,200,220,220))
-        od.line([(0, H-65),(W, H-65)], fill=(255,255,255,50), width=1)
-    except Exception as e: log.debug(f"timestamp draw: {e}")
-    ov_arr = np.array(ov)
-    ov_bgra = np.ascontiguousarray(ov_arr[:, :, [2, 1, 0, 3]])
-    ov_surf = cairo.ImageSurface.create_for_data(ov_bgra, cairo.FORMAT_ARGB32, W, H)
-    ctx.set_source_surface(ov_surf, 0, 0); ctx.paint()
-
-    # Category label (Dhivehi Pango)
-    tag_y = 580
-    cat_lo = PangoCairo.create_layout(ctx)
-    # Use English label if no Thaana chars, otherwise use Dhivehi label
-    cat_text = label_dv if any("\u0780" <= ch <= "\u07BF" for ch in label_dv) else label_dv
-    cat_lo.set_text(cat_text, -1)
-    cat_lo.set_font_description(Pango.FontDescription("Noto Sans Thaana Bold 20"))
-    tw, _ = cat_lo.get_pixel_size()
-    ctx.set_source_rgb(accent[0]/255, accent[1]/255, accent[2]/255)
-    ctx.rectangle(50, tag_y, tw+26, 36); ctx.fill()
-    ctx.set_source_rgb(1,1,1)
-    ctx.move_to(63, tag_y+6); PangoCairo.show_layout(ctx, cat_lo)
-
-    # Headline
-    words = text.split()
-    hw, bw = [], []
-    cc = 0
-    for i, w in enumerate(words):
-        if cc < 80: hw.append(w); cc += len(w)+1
-        else: bw = words[i:]; break
-    headline = " ".join(hw)
-    body = " ".join(bw)
-
-    def to_arabic_nums(t):
-        """Convert Western digits to Arabic-Indic numerals for RTL Thaana rendering"""
-        return t.translate(str.maketrans("0123456789", "\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669"))
-
-    h_lo = PangoCairo.create_layout(ctx)
-    h_lo.set_width(980 * Pango.SCALE)
-    h_lo.set_alignment(Pango.Alignment.RIGHT)
-    h_fd = Pango.FontDescription("Noto Sans Thaana 50")
-    h_fd.set_weight(Pango.Weight.ULTRABOLD)
-    h_lo.set_font_description(h_fd)
-    h_lo.set_text(to_arabic_nums(headline), -1)
-    ctx.set_source_rgb(1,1,1)
-    ctx.move_to(50, tag_y+44); PangoCairo.show_layout(ctx, h_lo)
-
-    if body:
-        _, hh = h_lo.get_pixel_size()
-        b_lo = PangoCairo.create_layout(ctx)
-        b_lo.set_width(980 * Pango.SCALE)
-        b_lo.set_alignment(Pango.Alignment.RIGHT)
-        b_lo.set_font_description(Pango.FontDescription("Noto Sans Thaana 26"))
-        b_lo.set_text(to_arabic_nums(body), -1)
-        ctx.set_source_rgba(0.78, 0.86, 1, 0.85)
-        ctx.move_to(50, tag_y+44+hh+8); PangoCairo.show_layout(ctx, b_lo)
-
-    # Export
-    png_buf = io.BytesIO()
-    surface.write_to_png(png_buf)
-    png_buf.seek(0)
-    return png_buf
-
-def generate_card(text, source, timestamp, cat, bg_image=None, morning=False, _skip_dhivehi=False):
-    # Route Dhivehi text to Pango-based card generator
-    if not morning and not _skip_dhivehi and any('\u0780' <= ch <= '\u07BF' for ch in text):
-        return generate_dhivehi_card(text, source, timestamp, cat, bg_image)
-
-    W, H = 1080, 1080
-    accent = (255,180,0) if morning else CAT_CONFIG.get(cat,CAT_CONFIG["LOCAL"])["color"]
-    label  = "🌅  MORNING BRIEF" if morning else CAT_CONFIG.get(cat,CAT_CONFIG["LOCAL"])["label"]
-
-    img = Image.new("RGB",(W,H),BG_TOP)
-    if bg_image:
-        bg = bg_image.copy()
-        r = bg.width/bg.height
-        nh,nw = (H,int(H*r)) if r>1 else (int(W/r),W)
-        bg = bg.resize((nw,nh),Image.LANCZOS).crop(((nw-W)//2,(nh-H)//2,(nw-W)//2+W,(nh-H)//2+H))
-        bg = ImageEnhance.Brightness(bg).enhance(0.32)
-        img = Image.blend(bg, Image.new("RGB",(W,H),(8,30,65)), 0.45)
-    else:
-        d = ImageDraw.Draw(img)
-        for y in range(H):
-            t=y/H
-            d.line([(0,y),(W,y)],fill=(int(BG_TOP[0]+(BG_BOTTOM[0]-BG_TOP[0])*t),int(BG_TOP[1]+(BG_BOTTOM[1]-BG_TOP[1])*t),int(BG_TOP[2]+(BG_BOTTOM[2]-BG_TOP[2])*t)))
-
-    ov=Image.new("RGBA",(W,H),(0,0,0,0)); od=ImageDraw.Draw(ov)
-    for y in range(H//2,H):
-        t=(y-H//2)/(H//2); od.line([(0,y),(W,y)],fill=(5,20,50,int(185*t)))
-    img=Image.alpha_composite(img.convert("RGBA"),ov).convert("RGB")
-
-    ov2=Image.new("RGBA",(W,H),(0,0,0,0)); od2=ImageDraw.Draw(ov2)
-    for y in range(0,170):
-        t=1-y/170; od2.line([(0,y),(W,y)],fill=(5,20,50,int(190*t)))
-    img=Image.alpha_composite(img.convert("RGBA"),ov2).convert("RGB")
-
-    draw=ImageDraw.Draw(img)
-    draw.rectangle([(0,0),(W,5)],fill=accent)
-
-    try:
-        logo=Image.open("logo.png").convert("RGBA")
-        lh=72; lw=int(logo.width*lh/logo.height)
-        logo=logo.resize((lw,lh),Image.LANCZOS)
-        img.paste(logo,(50,38),logo)
-    except Exception as e: log.debug(f"logo paste: {e}")
-
-    # Detect Thaana script and use Noto Sans Thaana font for Dhivehi
-    has_thaana = any('\u0780' <= ch <= '\u07BF' for ch in text)
-    # Look for font in: /app (repo), /data (volume), system
-    def find_thaana_font(name):
-        for path in [f"/app/{name}", f"/data/{name}", f"/usr/share/fonts/truetype/noto/{name}"]:
-            if os.path.exists(path): return path
-        return None
-    THAANA_BOLD = find_thaana_font("NotoSansThaana-Bold.ttf")
-    THAANA_REG  = find_thaana_font("NotoSansThaana-Regular.ttf")
-    try:
-        if has_thaana and THAANA_BOLD:
-            f_tag  = ImageFont.truetype(THAANA_BOLD, 22)
-            f_title= ImageFont.truetype(THAANA_BOLD, 46)
-            f_body = ImageFont.truetype(THAANA_REG or THAANA_BOLD, 27)
-            f_sm   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 21)
-            log.info(f"🇲🇻 Thaana font loaded: {THAANA_BOLD}")
-        else:
-            f_tag  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
-            f_title= ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 46)
-            f_body = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 27)
-            f_sm   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 21)
-    except Exception as e:
-        log.debug(f"font load fallback: {e}")
-        f_tag=f_title=f_body=f_sm=ImageFont.load_default()
-
-    draw.text((W-310,50),"t.me/samugacommunity",font=f_sm,fill=(200,230,255))
-    # For Thaana cards use plain English label (no emoji, DejaVu renders it)
-    tag_label = {"BREAKING":"BREAKING NEWS","LOCAL":"LOCAL NEWS","POLITICAL":"POLITICAL",
-                 "LIFESTYLE":"LIFESTYLE","SPORTS":"SPORTS",
-                 "DISASTER":"BREAKING NEWS","WORLD":"WORLD NEWS","WEATHER":"LIFESTYLE",
-                 "TOURISM":"LIFESTYLE","FOOTBALL":"SPORTS"}.get(cat, cat) if has_thaana else label
-    f_tag_en = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
-    tag_y=590; tw=draw.textbbox((0,0),tag_label,font=f_tag_en)[2]+26
-    draw.rectangle([(50,tag_y),(50+tw,tag_y+34)],fill=accent)
-    draw.text((63,tag_y+6),tag_label,font=f_tag_en,fill=WHITE if not morning else (0,0,0))
-
-    def wrap(t,f,mw):
-        words=t.split(); lines,cur=[],""
-        for w in words:
-            test=(cur+" "+w).strip()
-            if draw.textbbox((0,0),test,font=f)[2]<=mw: cur=test
-            else:
-                if cur: lines.append(cur)
-                cur=w
-        if cur: lines.append(cur)
-        return lines
-
-    # Convert Western digits to Arabic-Indic for RTL Thaana rendering
-    if has_thaana:
-        text = text.translate(str.maketrans("0123456789", "\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669"))
-
-    # For Thaana text — don't split on '. ' as it breaks Dhivehi sentences
-    if has_thaana:
-        words = text.split()
-        headline_words = []
-        body_words = []
-        char_count = 0
-        for i, w in enumerate(words):
-            if char_count < 80:
-                headline_words.append(w)
-                char_count += len(w) + 1
-            else:
-                body_words = words[i:]
-                break
-        headline = ' '.join(headline_words)
-        body = ' '.join(body_words)
-    else:
-        sentences=text.split('. ')
-        headline=sentences[0]+('.' if len(sentences)>1 else '')
-        body='. '.join(sentences[1:]) if len(sentences)>1 else ''
-
-    y=tag_y+48
-    for line in wrap(headline,f_title,W-100)[:4]:
-        draw.text((50,y),line,font=f_title,fill=WHITE); y+=56
-    if body:
-        y+=4
-        for line in wrap(body,f_body,W-100)[:3]:
-            draw.text((50,y),line,font=f_body,fill=LIGHT_GRAY); y+=36
-
-    draw.rectangle([(0,H-78),(W,H)],fill=(3,12,30))
-    draw.rectangle([(0,H-78),(W,H-75)],fill=accent)
-    draw.text((50,H-53),f"Source: {source}",font=f_sm,fill=LIGHT_GRAY)
-    draw.text((W-260,H-53),timestamp,font=f_sm,fill=LIGHT_GRAY)
-
-    buf=BytesIO(); img.save(buf,format="PNG",quality=95); buf.seek(0)
-    return buf
-
+    log.info(f"📊 Social posts today: {social_post_counts['count']} ({'day' if is_day_social() else 'night'} limit: {20 if is_day_social() else 3})")
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def send_to_telegram(buf, caption):
     """Post a photo to the community channel. Returns message_id (int) or False."""
-    if not public_text_is_safe(caption):
-        log.error("🛑 Telegram blocked unsafe placeholder caption")
-        return False
     try:
+        safe_caption = samuga_public_caption(caption)
+        if not public_text_is_safe(safe_caption):
+            log.error(f"🚫 Telegram blocked unsafe public caption: {str(safe_caption)[:120]}")
+            return False
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-            data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": samuga_public_caption(caption), "parse_mode": "HTML"},
+            data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": safe_caption, "parse_mode": "HTML"},
             files={"photo": ("card.png", buf, "image/png")}, timeout=30)
         resp.raise_for_status()
         mid = resp.json().get("result", {}).get("message_id")
@@ -3317,101 +710,7 @@ Summary:
 
 
 # ── Dhivehi Quality Layer: Latin Thaana → Proper Thaana / English ─────────────
-_LATIN_THAANA_WORDS = [
-    "raajje","mihaaru","avas","dhuvas","dhivehi","vaguthu","gothun","medhu",
-    "hurihaa","dhathuru","furusathu","baakee","haftaa","majlis","sarukaaru",
-    "rayyithun","tharaggee","qanoon","fuluhun","khabaru","miadhu","airport",
-    "guriathulun","govaalaifi","kuri","mahchah","mifaharu","dhaaira","kanthah"
-]
-
-def looks_latin_thaana(text):
-    """Detect romanized Dhivehi/Latin Thaana so it does not leak into website as English."""
-    s = str(text or "").lower()
-    if not s or is_dhivehi(s):
-        return False
-    hits = sum(1 for w in _LATIN_THAANA_WORDS if w in s)
-    # Romanized Dhivehi often has aa/ee/oo/dh/th/haa patterns.
-    pattern_hits = len(re.findall(r"\b[a-z]*(?:dh|th|aa|ee|oo|vv|lh|sh)[a-z]*\b", s))
-    return hits >= 2 or (hits >= 1 and pattern_hits >= 3)
-
-def gemini_latin_thaana_to_thaana(text):
-    """Rewrite Latin Thaana / romanized Dhivehi into clean Thaana news style."""
-    if not GEMINI_API_KEY:
-        return None
-    prompt = f"""Rewrite the following romanized Dhivehi / Latin Thaana into proper Dhivehi Thaana script.
-
-Rules:
-- Output ONLY Dhivehi Thaana.
-- Clean newsroom style.
-- Do not add new facts.
-- Do not use Latin letters unless it is a brand name that cannot be translated.
-- Keep it concise.
-
-Text:
-{text}
-"""
-    out = _gemini_post(prompt, timeout=20)
-    if out and is_dhivehi(out):
-        return strip_source_links(out).strip()
-    return None
-
-def gemini_latin_thaana_to_english(text):
-    """Translate romanized Dhivehi / Latin Thaana to clean English for English website articles."""
-    if not GEMINI_API_KEY:
-        return None
-    prompt = f"""Translate this romanized Dhivehi / Latin Thaana news text into clean English.
-
-Rules:
-- Output ONLY English.
-- Do not add new facts.
-- Keep names and places accurate.
-- Clean news style.
-
-Text:
-{text}
-"""
-    out = _gemini_post(prompt, timeout=20)
-    if out and not is_dhivehi(out):
-        return strip_source_links(out).strip()
-    return None
-
-def normalize_article_language_for_public(title="", summary="", lang="en", prefer="auto"):
-    """
-    Public quality gate:
-    - Dhivehi public text must be real Thaana.
-    - Latin Thaana is converted by Gemini before public website/social use.
-    - If conversion fails, caller can hold/skip instead of publishing ugly text.
-    Returns (title, summary, lang, ok).
-    """
-    title = strip_source_links(title or "")
-    summary = strip_source_links(summary or "")
-    combined = f"{title} {summary}".strip()
-    current_lang = (lang or "en").lower()
-    has_thaana = is_dhivehi(combined)
-    latin_dv = looks_latin_thaana(combined)
-
-    if current_lang in ("dv", "dhivehi") or has_thaana:
-        if has_thaana:
-            return title, summary, "dv", True
-        if latin_dv:
-            converted = gemini_latin_thaana_to_thaana(combined)
-            if converted:
-                return converted[:500], converted[:2600], "dv", True
-            return title, summary, "dv", False
-        return title, summary, "en", True
-
-    if latin_dv:
-        # For English website side, convert Latin Thaana to English. If Gemini cannot,
-        # do not publish it publicly as broken English.
-        converted = gemini_latin_thaana_to_english(combined)
-        if converted:
-            # Use first sentence as title-ish if original title was romanized.
-            sent = re.split(r"(?<=[.!?])\s+", converted.strip(), maxsplit=1)
-            new_title = sent[0][:500] if sent else converted[:500]
-            return new_title, converted[:2600], "en", True
-        return title, summary, "en", False
-
-    return title, summary, "en", True
+# (Implemented in db.normalize_article_language_for_public — imported above.)
 
 # ── Auto Poll ─────────────────────────────────────────────────────────────────
 POLL_KEYWORDS = [
@@ -3523,14 +822,11 @@ def resolve_url(url):
 
 def post_to_buffer(image_url, caption, channel_id, metadata=None):
     """Post to a single Buffer channel. Returns True on success."""
-    if SOCIAL_PAUSED or POSTING_PAUSED:
-        log.warning("⏸️ Social posting paused (SOCIAL_PAUSED or POSTING_PAUSED) — Buffer call blocked")
-        return False
     if not BUFFER_TOKEN or not channel_id: return False
     clean = re.sub(r'<[^>]+>', '', caption)
     clean = clean.replace('&amp;', '&').replace('&#039;', "'").replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>').strip()
     if not public_text_is_safe(clean):
-        log.error(f"🛑 Buffer blocked unsafe placeholder caption [{channel_id[:8]}]")
+        log.error(f"🚫 Buffer blocked unsafe caption: {clean[:120]}")
         return False
 
     query = """
@@ -3585,14 +881,14 @@ mutation CreatePost($input: CreatePostInput!) {
 _social_queue = []
 _social_queue_lock = threading.Lock()
 _last_social_post_time = None
-SOCIAL_GAP_SECONDS = 120  # 2 minutes — protects Buffer/Meta from burst posting
+SOCIAL_GAP_SECONDS = 600  # 10 minutes
 
 # Personality messages for queue notifications
 QUEUE_PERSONALITY = [
     "yea yea it's in the queue. 😮‍💨",
     "queued. The algorithm likes it spaced out. Unlike Uly's approvals. 😅",
     "in the queue. Good things take time. 🕐",
-    "queued. You're too bossy today, I need my 2 minutes. 😤",
+    "queued. You're too bossy today, I need my 10 minutes. 😤",
     "in the queue. Quality over quantity. 💅",
     "queued. I'm tired, not lazy. There's a difference. 😴",
     "queued. Back-to-back posting is so 2022. ⏳",
@@ -3614,7 +910,7 @@ def _calc_eta_seconds():
 
 def _social_queue_worker():
     """
-    Background thread — drains one post every 2 minutes.
+    Background thread — drains one post every 10 minutes.
     Each item posts to Telegram community + FB + IG + X in sequence.
     BREAKING news bypasses this queue entirely and posts immediately.
     """
@@ -3631,22 +927,21 @@ def _social_queue_worker():
                     continue
                 item = _social_queue.pop(0)
 
+            combined_public_text = f"{item.get('title','')}\n{item.get('summary','')}\n{item.get('caption','')}"
+            if not public_text_is_safe(combined_public_text):
+                log.error(f"🚫 Social queue dropped unsafe post: {item.get('key_label','Post')} — {str(item.get('title',''))[:80]}")
+                notify_cid = item.get("notify_chat_id")
+                notify_tid = item.get("notify_thread_id")
+                if notify_cid:
+                    send_text(notify_cid, "🚫 Post blocked by placeholder safety gate before publishing.", thread_id=notify_tid)
+                continue
+
             _last_social_post_time = utcnow()
             remaining = len(_social_queue)
             key_label  = item.get("key_label", "Post")
             notify_cid = item.get("notify_chat_id")
             notify_tid = item.get("notify_thread_id")
             log.info(f"[QUEUE] Posting {key_label} (Telegram + FB+IG+X) — {remaining} remaining")
-
-            if not public_text_is_safe(item.get("title",""), item.get("summary",""), item.get("caption","")):
-                log.error(f"🛑 QUEUE blocked unsafe placeholder post: {key_label}")
-                if notify_cid:
-                    send_text(notify_cid, f"🛑 <b>{key_label}</b> blocked — unsafe AI placeholder text detected.", thread_id=notify_tid)
-                else:
-                    send_text(CORE_TEAM_CHAT_ID, f"🛑 <b>{key_label}</b> blocked — unsafe AI placeholder text detected.", thread_id=CONTENT_LAB_THREAD_ID)
-                try: persist_state()
-                except Exception: pass
-                continue
 
             # 1. Post to Telegram community (respects daily cap + 2hr gap for regular posts)
             tg_ok = False
@@ -3721,7 +1016,7 @@ def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=Non
                      article_id=None, title="", summary="", cat="LOCAL",
                      source="Samuga Media", link="", lang="en", is_breaking=False):
     """
-    Add a card to the 2-minute publish queue.
+    Add a card to the 10-minute publish queue.
     post_telegram=True  → queue will post to Telegram community too (standard flow)
     post_telegram=False → Telegram was already posted separately (breaking news)
 
@@ -3730,13 +1025,11 @@ def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=Non
     immediately when it enters the public publishing queue.
     """
     img_bytes = img_buf.getvalue() if hasattr(img_buf, "getvalue") else img_buf
-
-    if not public_text_is_safe(title, summary, caption):
-        log.error(f"🛑 SOCIAL QUEUE blocked unsafe placeholder post: {(title or key_label)[:70]}")
+    combined_public_text = f"{title}\n{summary}\n{caption}"
+    if not public_text_is_safe(combined_public_text):
+        log.error(f"🚫 Social queue refused unsafe post: {str(title)[:90]}")
         if notify_chat_id:
-            send_text(notify_chat_id,
-                f"🛑 {key_label} blocked — AI/template placeholder detected. Not posted.",
-                thread_id=notify_thread_id)
+            send_text(notify_chat_id, "🚫 Post blocked by placeholder safety gate. It was not queued.", thread_id=notify_thread_id)
         return False
 
     if article_id:
@@ -3816,6 +1109,9 @@ def _post_to_social_now(img_buf, caption):
         # Public Samuga posts must never expose original source links.
         # Send viewers to Samuga Community only.
         clean = strip_source_links(clean)
+        if not public_text_is_safe(clean):
+            log.error(f"🚫 Social post blocked unsafe caption: {clean[:120]}")
+            return results
         community_link = SAMUGA_PUBLIC_LINK
 
         # FB/IG: full text + Samuga community link only
@@ -3858,7 +1154,7 @@ def post_to_social(img_buf, caption):
         log.warning("Social: no BUFFER_TOKEN, skipping")
         return
     if not can_post_social():
-        limit = 30 if is_day_social() else 5
+        limit = 20 if is_day_social() else 3
         log.info(f"📵 Social limit reached ({30 if is_day_social() else 5} posts {'day' if is_day_social() else 'night'}) — skipping")
         return
     try:
@@ -3875,6 +1171,9 @@ def post_to_social(img_buf, caption):
         # Public Samuga posts must never expose original source links.
         # Send viewers to Samuga Community only.
         clean = strip_source_links(clean)
+        if not public_text_is_safe(clean):
+            log.error(f"🚫 Social post blocked unsafe caption: {clean[:120]}")
+            return {}
         community_link = SAMUGA_PUBLIC_LINK
 
         # FB/IG: full text + Samuga community link only
@@ -3925,10 +1224,10 @@ def _build_card_and_caption(article):
     else:
         display_cat = canonical_category(raw_cat, article["title"], article.get("summary",""))
     rewritten, keyword = rewrite_news(article["title"], article["summary"], raw_cat)
-    if has_public_placeholder(rewritten):
-        log.warning(f"[SAFETY] Bad rewrite blocked before card: {article['title'][:70]}")
-        rewritten = fallback_rewritten_news(article["title"], article.get("summary",""), raw_cat)
-    keyword = safe_image_keyword(keyword, cat=display_cat, title=article["title"])
+    if not public_text_is_safe(rewritten):
+        log.warning(f"🚫 Card rewrite unsafe; using fallback for: {article['title'][:80]}")
+        rewritten = fallback_rewritten_news(article.get("title",""), article.get("summary",""))
+    keyword = safe_image_keyword(keyword, cat=raw_cat)
     bg = fetch_background_image(keyword, cat=display_cat, title=article["title"])
     ts = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
     card = generate_card(rewritten, SAMUGA_PUBLIC_SOURCE, ts, display_cat, bg)
@@ -3954,26 +1253,18 @@ def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_
     article_id: if given, the Telegram message_id is stored for later view tracking.
     """
     global last_regular_post_time
-    # ── Kill-switch check ────────────────────────────────────────────────────
-    if POSTING_PAUSED:
-        log.warning(f"⏸️ POSTING_PAUSED=true — blocked publish: {title[:60]}")
-        return False, {}
-    if not public_text_is_safe(title, summary, rewritten, caption):
-        log.error(f"🛑 PUBLIC SAFETY blocked publish: {title[:70]}")
-        try:
-            send_text(CORE_TEAM_CHAT_ID,
-                f"🛑 <b>Public post blocked</b> — AI/template placeholder detected.\n\n"
-                f"<b>{strip_source_links(title)[:90]}</b>\n"
-                f"<i>Kept out of Telegram/socials. Please rewrite manually if needed.</i>",
-                thread_id=ALERT_THREAD_ID)
-        except Exception:
-            pass
-        return False, {}
     buf = io.BytesIO(card_bytes)
     ts = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
     social_results = {}
 
     log.info(f"📰 [{'🔴BREAKING' if is_breaking_flag else '🟡REGULAR'}][{cat}] {title[:60]}...")
+    combined_public_text = f"{title}\n{summary}\n{rewritten}\n{caption}"
+    if not public_text_is_safe(combined_public_text):
+        log.error(f"🚫 Publish blocked unsafe public text: {str(title)[:90]}")
+        if report_to:
+            rchat, rthread = report_to
+            send_text(rchat, "🚫 Post blocked by placeholder safety gate. It was not published.", thread_id=rthread)
+        return False, {}
     buf.seek(0)
     tg_ok = send_to_telegram(buf, caption)
 
@@ -4078,21 +1369,12 @@ def _send_approval_card(key, item, force=False):
     footer += f"❌ <code>/reject {key}</code>\n\n"
     # Tell the team the auto-post / expiry behaviour
     if item["lang"] == "en":
-        delay = item.get("_autopost_after_seconds")
-        if delay is None:
-            delay = english_autopost_delay_seconds(item)
-        if delay is None:
-            footer += "<i>⏰ Manual review required.</i>"
-        elif int(delay) <= 0:
-            footer += "<i>⏰ High confidence — posts to the 2-min social queue immediately after this preview.</i>"
-        elif int(delay) <= 300:
-            footer += "<i>⏰ Medium confidence — auto-posts in 5 min if not rejected.</i>"
-        elif int(delay) <= 900:
-            footer += "<i>⏰ Lower confidence — auto-posts in 15 min if not rejected.</i>"
-        else:
-            footer += "<i>⏰ Low confidence — auto-posts in 30 min if not rejected.</i>"
+        footer += "<i>⏰ Auto-posts in 15 min if not reviewed</i>"
     else:
-        footer += "<i>⏰ Expires in 2h if not approved. Dhivehi auto-post is disabled for now.</i>"
+        if item.get("_auto_post_breaking"):
+            footer += "<i>⏰ Breaking Dhivehi — auto-posts in 2h if no action taken</i>"
+        else:
+            footer += "<i>⏰ Expires in 2h if not approved (regular Dhivehi never auto-posts)</i>"
     msg = header + footer
 
     # If we have a finished card image, send it as a photo with the caption
@@ -4114,36 +1396,8 @@ def post_article(article, seen, social_only=False, allow_social=True):
     Marks article as seen immediately so it isn't re-queued every scan.
     """
     cat = article["cat"]
-
-    # Public language cleanup before any card/website decision.
-    # Latin Thaana must not leak as broken English/Dhivehi. Gemini converts it;
-    # if conversion fails, the story is skipped/held instead of damaging quality.
-    try:
-        nt, ns, nlang, ok_lang = normalize_article_language_for_public(
-            article.get("title",""), article.get("summary",""), lang=article.get("lang","en")
-        )
-        if not ok_lang:
-            log.warning(f"⏭️ Skipping language-unclean article: {article.get('title','')[:60]}")
-            return False
-        article["title"], article["summary"], article["lang"] = nt, ns, nlang
-    except Exception as e:
-        log.debug(f"language normalize: {e}")
-
     breaking = is_breaking(article["title"], article["summary"], cat)
     is_dv = article.get("lang") == "dv"
-
-    # Strict low-value / old-story gate.
-    skip, reason = should_skip_low_value(article)
-    if skip and not breaking:
-        log.info(f"⏭️ Skipping low-value story: {reason} — {article.get('title','')[:65]}")
-        seen.add(article["id"]); save_seen(seen)
-        try:
-            db_record_article(article, score=score_article(article),
-                              reliability=source_reliability(article.get("source","")),
-                              status="seen", is_breaking=False)
-        except Exception:
-            pass
-        return False
 
     # Mark seen now so the same article isn't re-processed on the next scan
     seen.add(article["id"]); save_seen(seen)
@@ -4261,7 +1515,7 @@ def post_article(article, seen, social_only=False, allow_social=True):
                         is_breaking=True, allow_social=True
                     )
                     approval_queue[key]["article_id"] = f"{_aid}_dv"
-                    approval_queue[key]["_auto_post_breaking"] = False  # Dhivehi auto-post disabled for now
+                    approval_queue[key]["_auto_post_breaking"] = True   # 2hr auto-post flag
                     approval_queue[key]["summary"] = article.get("summary","")
                     # Pre-fetch bg
                     bg = fetch_background_image(_kw, cat=_cat, title=_title)
@@ -4273,7 +1527,7 @@ def post_article(article, seen, social_only=False, allow_social=True):
                         f"🇲🇻 <b>Dhivehi version ready</b> — <code>{key}</code>\n"
                         f"<i>{_title[:80]}</i>\n\n"
                         f"Approve, edit or reject within 2 hours.\n"
-                        f"If no action taken — <b>expires after 2h.</b>\n\n"
+                        f"If no action taken — <b>posts automatically at 2h mark.</b>\n\n"
                         f"/approved {key} · /approved {key} [corrected text] · /reject {key}",
                         thread_id=CONTENT_LAB_THREAD_ID)
                     log.info(f"🇲🇻 Breaking Dhivehi version queued: {key}")
@@ -4331,7 +1585,6 @@ def post_article(article, seen, social_only=False, allow_social=True):
         approval_queue[key]["article_id"] = article["id"]
         approval_queue[key]["_priority"] = article.get("_priority", priority)
         approval_queue[key]["_confidence"] = confidence
-        approval_queue[key]["_autopost_after_seconds"] = english_autopost_delay_seconds(approval_queue[key])
 
         # Website-first publishing: every English story selected by the bot
         # goes to the website immediately, even while Telegram/socials wait for
@@ -4356,18 +1609,12 @@ def post_article(article, seen, social_only=False, allow_social=True):
         approval_queue[key]["_cluster_size"] = article.get("_cluster_size", 1)
         approval_queue[key]["_trend_theme"] = article.get("_trend_theme", "")
         _send_approval_card(key, approval_queue[key])
-        # High-confidence English does not wait for approval; the preview is sent
-        # for team visibility, then the card enters the 2-minute social queue.
-        if approval_queue.get(key, {}).get("_autopost_after_seconds") == 0:
-            item_now = approval_queue.pop(key, None)
-            if item_now:
-                _auto_publish_approval_item(key, item_now, reason="instant high-confidence")
         db_mark_status(article["id"], "queued")
 
         # ── Auto-generate Dhivehi version in background ──────────────────────
         # Every English article also gets a Dhivehi card queued for approval.
         # Runs in a thread so it doesn't delay the English card.
-        if GEMINI_API_KEY and (breaking or priority >= CONTENT_LAB_HIGH_SCORE):
+        if GEMINI_API_KEY:
             def _auto_dv(_rewritten=rewritten, _title=article["title"],
                          _link=article["link"], _cat=cat, _keyword=keyword,
                          _source=article.get("source","LOCAL"), _aid=article["id"],
@@ -4398,292 +1645,19 @@ def post_article(article, seen, social_only=False, allow_social=True):
 
 
 # ── Run Job ───────────────────────────────────────────────────────────────────
-def score_article(a):
-    """Score article by Maldives relevance + breaking priority"""
-    score = 0
-    title_lower = a["title"].lower()
-    summary_lower = a.get("summary","").lower()
-    cat = a["cat"]
-    # Category priority — LOCAL is king
-    if cat == "LOCAL": score += 80
-    elif cat == "DISASTER": score += 70
-    elif cat == "WEATHER": score += 30
-    elif cat == "TOURISM": score += 20
-    elif cat == "WORLD": score += 10
-    elif cat in ["FOOTBALL", "SPORTS"]: score += 2  # Very low priority
-    # Maldives keywords boost
-    mv_kws = ["maldives","male","dhivehi","raajje","mvr","atoll","island","gaa",
-              "parliament","majlis","president","minister","police","court","malé",
-              "hulhumale","addu","fuvahmulah","laamu","economy","rufiyaa"]
-    for kw in mv_kws:
-        if kw in title_lower or kw in summary_lower: score += 20
-    # Sports penalty — only post if really relevant
-    if cat in ["FOOTBALL", "SPORTS"]:
-        maldives_sports = ["maldives","dhivehi","raajje","team maldives","national team"]
-        if not any(kw in title_lower + summary_lower for kw in maldives_sports):
-            score -= 30  # Heavy penalty for non-Maldives sports
-    # World news — support major global updates, but still penalize random foreign filler.
-    if cat == "WORLD":
-        txt = title_lower + " " + summary_lower
-        if any(kw in txt for kw in ["maldives","indian ocean","south asia","india","sri lanka","economy","oil","dollar"]):
-            score += 35
-        elif is_major_world_news_text(txt):
-            score += 25
-        else:
-            score -= 35
-    # Breaking boost
-    if is_breaking(a["title"], a.get("summary",""), cat): score += 80
-    # Source reliability — trusted sources rank higher (0-25 boost)
-    rel = source_reliability(a.get("source",""))
-    score += int((rel - 50) / 2)  # 100→+25, 55→+2, 60→+5
-    # Trending boost — stories about hot topics rank higher (+30 if trending)
-    try:
-        trending, theme, count = is_trending_topic(a["title"], a.get("summary",""))
-        if trending:
-            score += 30
-            a["_trend_theme"] = theme  # stash for display
-    except Exception as e:
-        log.debug(f"trend check in score: {e}")
-    # Corroboration boost — if multiple outlets are covering the same event,
-    # it's a bigger story. +12 per extra source (capped at +36). The bot SEES
-    # the consensus and ranks accordingly — but never credits competitors publicly.
-    cluster_size = a.get("_cluster_size", 1)
-    if cluster_size >= 2:
-        score += min((cluster_size - 1) * 12, 36)
-    # Freshness boost — Samuga should be fastest, not posting old stories as latest.
-    try:
-        fpts = freshness_bonus(a)
-        score += fpts
-        a["_freshness_pts"] = fpts
-    except Exception as e:
-        log.debug(f"freshness boost: {e}")
-
-    # ── Engagement nudge (Phase 2) — ±LEARN_CAP, INERT until /learning on ──
-    try:
-        eng_pts, eng_theme = topic_weight_for(a["title"], a.get("summary",""))
-        if eng_pts:
-            score += eng_pts
-            a["_engagement_pts"] = eng_pts
-            a["_engagement_theme"] = eng_theme
-    except Exception as e:
-        log.debug(f"engagement nudge: {e}")
-    return score
-
-def score_breakdown(a):
-    """
-    Return (total, [(label, points), ...]) explaining how an article scored.
-    Mirrors score_article() so the team can see exactly why a story ranked.
-    """
-    items = []
-    title_lower = a["title"].lower()
-    summary_lower = a.get("summary", "").lower()
-    text = title_lower + " " + summary_lower
-    cat = a["cat"]
-
-    cat_base = {"LOCAL": 80, "DISASTER": 70, "WEATHER": 30, "TOURISM": 20,
-                "WORLD": 10, "FOOTBALL": 2, "SPORTS": 2}.get(cat, 0)
-    if cat_base:
-        items.append((f"Category ({cat})", cat_base))
-
-    mv_kws = ["maldives","male","dhivehi","raajje","mvr","atoll","island","gaa",
-              "parliament","majlis","president","minister","police","court","malé",
-              "hulhumale","addu","fuvahmulah","laamu","economy","rufiyaa"]
-    mv_hits = sum(1 for kw in mv_kws if kw in title_lower or kw in summary_lower)
-    if mv_hits:
-        items.append((f"Maldives keywords (x{mv_hits})", mv_hits * 20))
-
-    if cat in ["FOOTBALL", "SPORTS"]:
-        maldives_sports = ["maldives","dhivehi","raajje","team maldives","national team"]
-        if not any(kw in text for kw in maldives_sports):
-            items.append(("Non-Maldives sports penalty", -30))
-
-    if cat == "WORLD":
-        if not any(kw in text for kw in ["maldives","indian ocean","south asia","economy"]):
-            items.append(("Non-relevant world penalty", -20))
-
-    try:
-        if is_breaking(a["title"], a.get("summary",""), cat):
-            items.append(("Breaking news", 80))
-    except Exception:
-        pass
-
-    rel = source_reliability(a.get("source", ""))
-    rel_pts = int((rel - 50) / 2)
-    if rel_pts:
-        items.append((f"Source trust ({a.get('source','?')}, {rel}/100)", rel_pts))
-
-    try:
-        trending, theme, count = is_trending_topic(a["title"], a.get("summary",""))
-        if trending:
-            items.append((f"Trending topic ({theme}, {count} stories)", 30))
-    except Exception:
-        pass
-
-    cluster_size = a.get("_cluster_size", 1)
-    if cluster_size >= 2:
-        corr = min((cluster_size - 1) * 12, 36)
-        items.append((f"Corroborated ({cluster_size} sources)", corr))
-
-    try:
-        eng_pts, eng_theme = topic_weight_for(a["title"], a.get("summary",""))
-        if eng_pts:
-            items.append((f"Audience nudge ({eng_theme})", eng_pts))
-    except Exception:
-        pass
-
-    total = sum(p for _, p in items)
-    return total, items
-
-def confidence_score(a):
-    """
-    Returns (confidence_pct, [(reason, points), ...]).
-
-    Confidence ≠ Priority.
-    Priority = "how important is this story"
-    Confidence = "how sure are we it's real and accurate"
-
-    A story can be HIGH priority but LOW confidence (big claim, one shaky source)
-    → that should be held for human review, not auto-posted.
-
-    Confidence is built from:
-      - Source reliability (official/trusted = high)
-      - Multiple sources reporting the same event (corroboration)
-      - Story Intelligence confirmation (part of a developing thread)
-      - Official source language (president office, police, MNDF, court)
-    """
-    confidence = 0
-    reasons = []
-    source = a.get("source", "").lower()
-    title_lower = a["title"].lower()
-    summary_lower = a.get("summary", "").lower()
-    text = title_lower + " " + summary_lower
-
-    # 1. Base confidence from source reliability (0-50 of the score)
-    rel = source_reliability(a.get("source", ""))
-    base = int(rel * 0.5)  # 95 reliability → 47 base
-    confidence += base
-    reasons.append((f"Source reliability ({a.get('source','?')})", base))
-
-    # 2. Corroboration — multiple independent sources = much higher confidence
-    cluster_size = a.get("_cluster_size", 1)
-    if cluster_size >= 3:
-        confidence += 35
-        reasons.append((f"Confirmed by {cluster_size} sources", 35))
-    elif cluster_size == 2:
-        confidence += 20
-        reasons.append(("Confirmed by 2 sources", 20))
-    else:
-        # Single source — confidence depends heavily on who it is
-        if rel < 75:
-            confidence -= 15
-            reasons.append(("Single unverified source", -15))
-
-    # 3. Official source language — government/authority confirmation
-    official_markers = ["president", "police", "mndf", "ministry", "court",
-                        "majlis", "parliament", "official", "government",
-                        "hdc", "customs", "mma", "health protection"]
-    if any(m in source for m in ["presidency", "psm", "police", "mndf"]):
-        confidence += 15
-        reasons.append(("Official source", 15))
-    elif any(m in text for m in official_markers):
-        confidence += 8
-        reasons.append(("Cites official authority", 8))
-
-    # 4. Story Intelligence — part of a confirmed developing thread
-    if a.get("_story_id") and not a.get("_story_is_new", True):
-        confidence += 10
-        reasons.append(("Part of developing story", 10))
-
-    # 5. Rumor/uncertainty language lowers confidence
-    rumor_markers = ["allegedly", "rumor", "rumour", "unconfirmed", "claims",
-                     "reportedly", "sources say", "believed to"]
-    if any(m in text for m in rumor_markers):
-        confidence -= 12
-        reasons.append(("Uncertain language", -12))
-
-    # Clamp 0-100
-    confidence = max(0, min(100, confidence))
-    return confidence, reasons
-
-# Threshold: stories above this priority but below this confidence get HELD
-HIGH_PRIORITY_THRESHOLD = 140   # important story
-LOW_CONFIDENCE_THRESHOLD = 55   # but we're not sure
-
-def should_hold_for_review(priority, confidence, is_breaking_flag):
-    """
-    Returns (hold, reason) — True if a high-priority but low-confidence story
-    should be held for human review instead of auto-posting.
-    """
-    if priority >= HIGH_PRIORITY_THRESHOLD and confidence < LOW_CONFIDENCE_THRESHOLD:
-        return (True, f"High priority ({priority}) but low confidence ({confidence}%) — needs review")
-    # Breaking news with very low confidence is especially risky
-    if is_breaking_flag and confidence < 45:
-        return (True, f"Breaking but unconfirmed ({confidence}% confidence) — verify first")
-    return (False, "")
-
-
-def format_score_breakdown(a):
-    """Pretty HTML block for Telegram showing the itemized score + confidence."""
-    total, items = score_breakdown(a)
-    lines = [f"🧮 <b>Why this scored {total}</b>", f"<i>{a['title'][:90]}</i>", ""]
-    lines.append("<b>PRIORITY — how important:</b>")
-    for label, pts in items:
-        sign = "➕" if pts > 0 else "➖"
-        lines.append(f"  {sign} {label}: <b>{pts:+d}</b>")
-    if not items:
-        lines.append("  <i>(no scoring signals matched)</i>")
-
-    # ── Confidence breakdown ──
-    try:
-        conf, conf_reasons = confidence_score(a)
-        lines.append("")
-        lines.append(f"<b>CONFIDENCE — how sure: {conf}%</b>")
-        for label, pts in conf_reasons:
-            sign = "➕" if pts > 0 else "➖"
-            lines.append(f"  {sign} {label}: <b>{pts:+d}</b>")
-        # Verdict
-        breaking_flag = is_breaking(a["title"], a.get("summary",""), a["cat"])
-        hold, hold_reason = should_hold_for_review(total, conf, breaking_flag)
-        lines.append("")
-        if hold:
-            lines.append(f"🛑 <b>HOLD:</b> {hold_reason}")
-        elif conf >= 75:
-            lines.append("✅ <b>High confidence</b> — safe to post.")
-        elif conf >= 55:
-            lines.append("🟡 <b>Moderate confidence</b> — fine to post.")
-        else:
-            lines.append("⚠️ <b>Low confidence</b> — consider verifying.")
-    except Exception as e:
-        log.debug(f"confidence in breakdown: {e}")
-
-    lines.append("")
-    try:
-        if is_breaking(a["title"], a.get("summary",""), a["cat"]):
-            lines.append("📌 <b>Breaking</b> → posts immediately (if confidence OK).")
-        elif a.get("lang") == "dv":
-            lines.append("📌 <b>Dhivehi</b> → always queued for Content Lab review.")
-        else:
-            lines.append("📌 <b>Regular English</b> → confidence-based auto-post: high now, medium 5m, lower 15–30m if not reviewed.")
-    except Exception:
-        pass
-    return "\n".join(lines)
-
-def run_job(social_only=False, breaking_only=False, website_only=False):
+def run_job(social_only=False, breaking_only=False):
     """
     Every 15-min scan:
       - Breaking news: posts immediately to all platforms (no queue, no limit)
-      - Breaking low-confidence: goes to Alert Chat with approve/reject commands; no auto-post
-      - Regular English: strict best stories only; website immediate, socials auto by confidence
-      - Regular Dhivehi: manual-only, expires after 2h
-      - Total Content Lab cards: normal max 4/hour, high-priority drip can reach 6/hour
-      - Breaking is completely separate — never counts toward hourly budget
-      - Website-only mode: used at night; publishes selected English stories to website 24/7
-        without sending Content Lab previews or social posts.
+      - Breaking low-confidence: goes to Alert, auto-posts in 30 min if no action
+      - Regular English: max 2-3 best per HOUR go to Content Lab - bot picks, not all
+      - Regular Dhivehi: max 2-3 best per HOUR go to Content Lab
+      - Total Content Lab cards: max 6 per hour (3 EN + 3 DV)
+      - Breaking is completely separate - never counts toward hourly budget
     """
     global daily_sports_count, daily_world_count, daily_tourism_count, _pending_article
     h = get_mvt_hour()
-    mode_label = "WEBSITE-ONLY" if website_only else ("DAY" if is_day_mode() else "NIGHT")
-    log.info(f"🕐 MVT {h:02d}:xx | {mode_label}")
+    log.info(f"🕐 MVT {h:02d}:xx | {'DAY' if is_day_mode() else 'NIGHT'}")
     seen = load_seen()
     articles = fetch_news()
 
@@ -4697,30 +1671,6 @@ def run_job(social_only=False, breaking_only=False, website_only=False):
         a["_cluster_size"] = size
         a["_cluster_sources"] = srcs
 
-    # Strict selection first: Samuga should publish fewer, faster, better stories.
-    qualified = []
-    skipped = 0
-    for a in fresh:
-        skip, reason = should_skip_low_value(a)
-        if skip:
-            skipped += 1
-            log.info(f"⏭️ Selection skip: {reason} — {a.get('title','')[:65]}")
-            seen.add(a["id"])
-            try:
-                db_record_article(a, score=score_article(a),
-                                  reliability=source_reliability(a.get("source","")),
-                                  status="seen", is_breaking=is_breaking(a.get("title",""), a.get("summary",""), a.get("cat","")))
-            except Exception:
-                pass
-            continue
-        qualified.append(a)
-    if skipped:
-        save_seen(seen)
-        log.info(f"🧹 Strict selection skipped {skipped} low-value/old item(s)")
-    fresh = qualified
-    if not fresh:
-        log.info("No fresh articles passed strict selection."); return
-
     fresh.sort(key=score_article, reverse=True)
 
     breaking_articles = [a for a in fresh if is_breaking(a["title"], a.get("summary",""), a["cat"])]
@@ -4731,59 +1681,6 @@ def run_job(social_only=False, breaking_only=False, website_only=False):
 
     log.info(f"🔴 {len(breaking_articles)} breaking | 🟡 {len(regular_articles)} regular")
 
-    # ── Website-only night mode ──────────────────────────────────────────────
-    # The website is the live archive and should update 24/7.
-    # At night we do NOT flood Content Lab or socials with regular stories;
-    # we only publish selected English articles to the website. Breaking still
-    # runs through breaking_news_check() every 5 minutes.
-    if website_only:
-        website_published = 0
-        website_seen_titles = set()
-        website_candidates = [a for a in fresh if a.get("lang", "en") == "en"]
-        for a in website_candidates:
-            if website_published >= 5:
-                break
-            if a.get("id") in seen:
-                continue
-            title_key = _caption_match_key(a.get("title", "")) or a.get("title", "").lower()[:80]
-            if title_key in website_seen_titles:
-                continue
-            website_seen_titles.add(title_key)
-            if is_duplicate_story(a.get("title", "")):
-                log.info(f"🌐 Night website skip duplicate: {a.get('title','')[:60]}")
-                seen.add(a["id"])
-                db_mark_status(a.get("id"), "duplicate")
-                continue
-            try:
-                priority = score_article(a)
-                db_record_article(a, score=priority,
-                                  reliability=source_reliability(a.get("source", "")),
-                                  status="seen",
-                                  is_breaking=is_breaking(a.get("title", ""), a.get("summary", ""), a.get("cat", "LOCAL")))
-                db_publish_article_for_website(
-                    article_id=a["id"],
-                    title=a.get("title", ""),
-                    summary=samuga_public_summary(a.get("title", ""), a.get("summary", ""), ""),
-                    category=a.get("cat", "LOCAL"),
-                    source=SAMUGA_PUBLIC_SOURCE,
-                    link=SAMUGA_PUBLIC_LINK,
-                    lang="en",
-                    score=priority,
-                    reliability=source_reliability(a.get("source", "")),
-                    is_breaking=is_breaking(a.get("title", ""), a.get("summary", ""), a.get("cat", "LOCAL"))
-                )
-                remember_story_title(a.get("title", ""))
-                seen.add(a["id"])
-                website_published += 1
-                log.info(f"🌐 Night website-only published EN story: {a.get('title','')[:70]}")
-            except Exception as e:
-                log.error(f"🌐 Night website-only publish failed: {e}")
-        if website_published:
-            save_seen(seen)
-            persist_state()
-        log.info(f"✅ website-only run done — {website_published} EN article(s) published to website")
-        return
-
     # ── 1. BREAKING — fires immediately, no budget, no throttle ─────────────
     if breaking_articles:
         a = breaking_articles[0]
@@ -4793,7 +1690,7 @@ def run_job(social_only=False, breaking_only=False, website_only=False):
     if breaking_only:
         return
 
-    # ── 2. HOURLY BUDGET — Content Lab gets strict limited previews ───
+    # ── 2. HOURLY BUDGET — Content Lab gets max 6 cards/hr (3 EN + 3 DV) ───
     # Count how many cards were already sent to Content Lab THIS hour
     now_mvt = utcnow() + timedelta(hours=5)
     hour_start = now_mvt.replace(minute=0, second=0, microsecond=0)
@@ -4807,16 +1704,13 @@ def run_job(social_only=False, breaking_only=False, website_only=False):
                        if v.get("lang") == "dv"
                        and v.get("created_at", utcnow()) >= hour_start_utc)
 
-    total_this_hour = en_this_hour + dv_this_hour
-    total_budget = max(0, CONTENT_LAB_NORMAL_MAX_PER_HOUR - total_this_hour)
-    # Dhivehi is manual-only for now, so keep it tighter to avoid flooding Uly.
-    dv_budget = max(0, min(1, total_budget))
-    en_budget = max(0, total_budget)
+    en_budget = max(0, 3 - en_this_hour)   # max 3 English per hour
+    dv_budget = max(0, 3 - dv_this_hour)   # max 3 Dhivehi per hour
 
-    log.info(f"📊 Hourly Content Lab budget: {total_budget} total remaining "
-             f"({en_this_hour} EN + {dv_this_hour} DV already this hour)")
+    log.info(f"📊 Hourly budget: {en_budget} EN + {dv_budget} DV remaining "
+             f"({en_this_hour}+{dv_this_hour} already sent this hour)")
 
-    if total_budget == 0:
+    if en_budget == 0 and dv_budget == 0:
         log.info("📵 Hourly Content Lab budget exhausted — skipping regular articles")
         return
 
@@ -4832,12 +1726,11 @@ def run_job(social_only=False, breaking_only=False, website_only=False):
             dv_sent += 1
     if dv_sent:
         log.info(f"🇲🇻 {dv_sent} Dhivehi card(s) sent to Content Lab")
-    en_budget = max(0, total_budget - dv_sent)
 
     # ── 2b. English — best EN articles up to budget ──────────────────────────
     if not can_post_regular():
         secs_left = int(TELEGRAM_GAP_SECONDS - (utcnow() - last_regular_post_time).total_seconds())
-        log.info(f"⏳ Telegram 2-min gap active — {secs_left//60}m left (but still sending to Content Lab)")
+        log.info(f"⏳ Telegram 2hr gap active — {secs_left//60}m left (but still sending to Content Lab)")
         # Still queue for Content Lab review even if Telegram window is closed
         # The approval/auto-expiry handles the actual posting timing
 
@@ -4860,13 +1753,13 @@ def run_job(social_only=False, breaking_only=False, website_only=False):
             if not can_post_cat_today(daily_sports_count, 1):
                 continue
 
-        # World: major global/region/economy updates only, max 3/day
+        # World: Maldives-relevant only, max 2/day
         elif cat == "WORLD":
-            mv_world = ["maldives","indian ocean","south asia","india","sri lanka","china",
+            mv_world = ["maldives","indian ocean","south asia","india","china",
                         "un ","dollar","oil","global economy"]
-            if not (any(kw in text_lower for kw in mv_world) or is_major_world_news_text(text_lower)):
+            if not any(kw in text_lower for kw in mv_world):
                 continue
-            if not can_post_cat_today(daily_world_count, 3):
+            if not can_post_cat_today(daily_world_count, 2):
                 continue
 
         # Tourism: max 2/day
@@ -4909,45 +1802,34 @@ def fetch_breaking_sources():
         if a["title"] not in seen_titles:
             seen_titles.add(a["title"])
             articles.append(a)
-    for a in fetch_latest_web_pages(limit_per_source=3):
-        if is_breaking(a.get("title",""), a.get("summary",""), a.get("cat","LOCAL")):
-            key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
-            if key not in seen_titles:
-                seen_titles.add(key)
-                articles.append(a)
-
-    # Telegram can be faster than RSS for Maldives breaking alerts.
-    for a in fetch_all_dv_channels():
-        if is_breaking(a.get("title",""), a.get("summary",""), a.get("cat","LOCAL")):
-            key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
-            if key not in seen_titles:
-                seen_titles.add(key)
-                articles.append(a)
-
     for fc in BREAKING_SOURCES:
-        for a in fetch_rss_feed_items(fc, limit=5, max_age_hours=12):
-            key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
-            if key in seen_titles:
-                continue
-            seen_titles.add(key)
-            articles.append(a)
-
-    # Major global disasters/conflicts can also be breaking if hard-news criteria match.
-    for a in fetch_world_updates(limit=4):
-        if a.get("cat") == "DISASTER" or is_breaking(a.get("title",""), a.get("summary",""), a.get("cat","WORLD")):
-            key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
-            if key not in seen_titles:
+        try:
+            feed = feedparser.parse(fc["url"])
+            for entry in feed.entries[:5]:
+                title   = entry.get("title", "")
+                summary = entry.get("summary", title)
+                if fc["lang"] == "dv":
+                    title   = gemini_translate(title)
+                    summary = gemini_translate(summary[:300])
+                key = title.lower()[:50]
+                if key in seen_titles or not is_fresh(entry): continue
                 seen_titles.add(key)
-                articles.append(a)
+                articles.append({
+                    "id":      hashlib.md5(entry.get("link", title).encode()).hexdigest(),
+                    "title":   title,
+                    "summary": summary,
+                    "link":    entry.get("link", ""),
+                    "cat":     fc["cat"],
+                    "lang":    fc["lang"],
+                    "source":  entry.get("source", {}).get("title", fc["cat"]),
+                })
+        except Exception as e:
+            log.error(f"Breaking source feed error ({fc['url']}): {e}")
     return articles
 
 def breaking_news_check():
     """Fast check every 5 min — priority sources only, no Telegram throttle"""
     try:
-        if POSTING_PAUSED:
-            log.info("⏸️ POSTING_PAUSED=true — breaking check skipped"); return
-        if not can_post_breaking_today():
-            return  # cap already logged inside can_post_breaking_today
         seen = load_seen()
         articles = fetch_breaking_sources()
         for a in articles:
@@ -4957,19 +1839,16 @@ def breaking_news_check():
             # Score for Maldives relevance
             if score_article(a) < 60: continue
             log.info(f"🔴 BREAKING FAST: {a['title'][:60]}")
-            increment_breaking_count()
             post_article(a, seen, social_only=False, allow_social=True)
             break  # one at a time
     except Exception as e:
         log.error(f"Breaking check: {e}")
 
 def scheduled_check():
-    if POSTING_PAUSED:
-        log.info("⏸️ POSTING_PAUSED=true — scheduled_check skipped entirely"); return
     h=get_mvt_hour()
     if not is_day_mode():
-        log.info(f"🌙 Night mode (MVT {h:02d}:xx) — website keeps updating 24/7; socials/content lab stay protected")
-        run_job(website_only=True); return
+        log.info(f"🌙 Night mode (MVT {h:02d}:xx) — breaking news only")
+        run_job(breaking_only=True); return
     run_job()
 
 # ── Morning Brief (7AM MVT) ───────────────────────────────────────────────────
@@ -5008,1444 +1887,6 @@ def send_tip_cta():
     send_text(TELEGRAM_CHANNEL_ID, msg)
     log.info("📣 Tip CTA sent")
 
-# ── Weather Card ──────────────────────────────────────────────────────────────
-def _tomorrow_code_to_wmo(code):
-    """
-    Map Tomorrow.io weatherCode to the nearest WMO code so weather_code_to_info()
-    works unchanged. Tomorrow.io codes: 1000=clear, 1100=mostly clear,
-    1101=partly cloudy, 1102=mostly cloudy, 1001=cloudy, 2000=fog,
-    4000=drizzle, 4001=rain, 4200=light rain, 4201=heavy rain,
-    8000=thunderstorm, 5000=snow (won't happen in Maldives but handled).
-    """
-    mapping = {
-        1000: 0,    # clear sky
-        1100: 1,    # mostly clear
-        1101: 2,    # partly cloudy
-        1102: 3,    # mostly cloudy
-        1001: 3,    # cloudy/overcast
-        2000: 45,   # fog
-        2100: 48,   # light fog
-        4000: 51,   # drizzle
-        4001: 61,   # rain
-        4200: 61,   # light rain
-        4201: 65,   # heavy rain
-        6000: 51,   # freezing drizzle
-        6001: 61,   # freezing rain
-        6200: 51,   # light freezing rain
-        6201: 65,   # heavy freezing rain
-        7000: 71,   # ice pellets
-        7101: 77,   # heavy ice pellets
-        7102: 71,   # light ice pellets
-        5000: 71,   # snow
-        5001: 73,   # flurries
-        5100: 71,   # light snow
-        5101: 75,   # heavy snow
-        8000: 95,   # thunderstorm
-    }
-    return mapping.get(code, 3)
-
-# ── Island Watch — 5 Maldivian population centres ────────────────────────────
-ISLAND_LOCATIONS = [
-    {"name": "Malé",           "lat": 4.1755,   "lon": 73.5093},
-    {"name": "Addu",           "lat": 0.6167,   "lon": 73.1000},
-    {"name": "Kulhudhuffushi", "lat": 6.6226,   "lon": 73.0700},
-    {"name": "Fuvahmulah",     "lat": -0.2985,  "lon": 73.4236},
-    {"name": "Dhidhdhoo",      "lat": 6.8833,   "lon": 73.1167},
-]
-
-# ── Hijri special days — built-in for offline fallback ───────────────────────
-HIJRI_SPECIAL_DAYS = {
-    (1,  1):  ("Islamic New Year",     "Marks the Prophet ﷺ migration from Makkah to Madinah, the start of the Hijri calendar."),
-    (1, 10):  ("Ashura",               "The day Allah saved Prophet Musa and his people from Pharaoh. Fasting today is a Sunnah that expiates the past year's minor sins."),
-    (3, 12):  ("Mawlid al-Nabi",       "Commemorates the birth of Prophet Muhammad ﷺ, the mercy to all creation."),
-    (7, 27):  ("Isra & Mi'raj",        "The miraculous night journey of the Prophet ﷺ from Makkah to Jerusalem and his ascension to the heavens."),
-    (8, 15):  ("Shab-e-Barat",         "The night of forgiveness, when Allah descends and forgives those who seek His mercy."),
-    (9,  1):  ("First of Ramadan",     "The blessed month of fasting begins — a time of mercy, forgiveness and closeness to Allah."),
-    (9, 27):  ("Laylat al-Qadr",       "The Night of Power, better than a thousand months. The Quran was first revealed on this night."),
-    (10, 1):  ("Eid al-Fitr",          "The festival of breaking the fast, celebrating the completion of Ramadan."),
-    (12, 9):  ("Day of Arafah",        "The greatest day of Hajj. Fasting today expiates the sins of two years for non-pilgrims."),
-    (12,10):  ("Eid al-Adha",          "The festival of sacrifice, honouring Prophet Ibrahim's devotion to Allah."),
-    (12,18):  ("Eid al-Ghadir",        "A day of remembrance and reflection in the Islamic tradition."),
-}
-
-# Extra detail for API-detected holidays not in our dict
-SPECIAL_DAY_DETAILS = {
-    "Ashura":           "The day Allah saved Prophet Musa from Pharaoh. Fasting today is a Sunnah that expiates the past year's minor sins.",
-    "Day of Arafah":    "The greatest day of Hajj. Fasting today expiates the sins of two years for non-pilgrims.",
-    "Arafa":            "The greatest day of Hajj. Fasting today expiates the sins of two years for non-pilgrims.",
-    "Lailat-ul-Qadr":   "The Night of Power, better than a thousand months. The Quran was first revealed tonight.",
-    "Laylat al-Qadr":   "The Night of Power, better than a thousand months. The Quran was first revealed tonight.",
-    "Ramadan":          "The blessed month of fasting — mercy, forgiveness and closeness to Allah.",
-    "Eid-ul-Fitr":      "The festival of breaking the fast, celebrating the completion of Ramadan.",
-    "Eid-ul-Adha":      "The festival of sacrifice, honouring Prophet Ibrahim's devotion to Allah.",
-    "Mawlid al-Nabi ﷺ": "Commemorates the birth of Prophet Muhammad ﷺ, the mercy to all creation.",
-    "Isra and Mi'raj":  "The night journey of the Prophet ﷺ and his ascension to the heavens.",
-}
-
-# ── Daily Islamic reminders (rotated when no special day) ────────────────────
-# Short reminders from Quran and authentic Sunnah. One shows per card, rotating
-# by day so each card is different.
-ISLAMIC_REMINDERS = [
-    ("\"Indeed, Allah is with the patient.\"", "Quran 2:153"),
-    ("\"So remember Me; I will remember you.\"", "Quran 2:152"),
-    ("\"Verily, with hardship comes ease.\"", "Quran 94:6"),
-    ("\"And He is with you wherever you are.\"", "Quran 57:4"),
-    ("\"Allah does not burden a soul beyond what it can bear.\"", "Quran 2:286"),
-    ("\"And whoever relies upon Allah — He is sufficient for him.\"", "Quran 65:3"),
-    ("\"Do not despair of the mercy of Allah.\"", "Quran 39:53"),
-    ("\"The best among you are those who learn the Quran and teach it.\"", "Bukhari"),
-    ("\"None of you truly believes until he loves for his brother what he loves for himself.\"", "Bukhari & Muslim"),
-    ("\"The strong believer is better and more beloved to Allah than the weak believer.\"", "Muslim"),
-    ("\"Whoever believes in Allah and the Last Day should speak good or remain silent.\"", "Bukhari & Muslim"),
-    ("\"Allah is beautiful and He loves beauty.\"", "Muslim"),
-    ("\"A kind word is charity.\"", "Bukhari & Muslim"),
-    ("\"The most beloved deeds to Allah are those done consistently, even if small.\"", "Bukhari & Muslim"),
-    ("\"He who does not thank people has not thanked Allah.\"", "Abu Dawud, Tirmidhi"),
-    ("\"Smiling at your brother is charity.\"", "Tirmidhi"),
-    ("\"Make things easy, do not make things difficult.\"", "Bukhari & Muslim"),
-    ("\"Whoever treads a path seeking knowledge, Allah eases his way to Paradise.\"", "Muslim"),
-    ("\"The believer is not one who eats his fill while his neighbour is hungry.\"", "Al-Adab Al-Mufrad"),
-    ("\"Fear Allah wherever you are, and follow a bad deed with a good one.\"", "Tirmidhi"),
-    ("\"And speak to people good words.\"", "Quran 2:83"),
-    ("\"Indeed, the patient will be given their reward without measure.\"", "Quran 39:10"),
-    ("\"Call upon Me; I will respond to you.\"", "Quran 40:60"),
-    ("\"Whoever is grateful — his gratitude is for his own good.\"", "Quran 31:12"),
-    ("\"Cleanliness is half of faith.\"", "Muslim"),
-    ("\"Richness is not having many possessions, but richness is contentment of the soul.\"", "Bukhari & Muslim"),
-    ("\"Be in this world as if you were a stranger or a traveller.\"", "Bukhari"),
-    ("\"Allah does not look at your bodies or wealth, but at your hearts and deeds.\"", "Muslim"),
-    ("\"The dua of a Muslim for his brother in his absence is answered.\"", "Muslim"),
-    ("\"And lower your wing in tenderness to the believers.\"", "Quran 15:88"),
-]
-
-def get_daily_islamic_reminder(mvt_now):
-    """Pick a reminder that rotates by day — different each day, stable within a day."""
-    day_index = mvt_now.timetuple().tm_yday  # 1..366
-    text, source = ISLAMIC_REMINDERS[day_index % len(ISLAMIC_REMINDERS)]
-    return {"text": text, "source": source}
-
-def get_prayer_times():
-    """
-    Fetch today's prayer times + Hijri date for Malé, Maldives.
-    Uses AlAdhan API — free, no key. Uses exact Malé coordinates and the
-    Maldives-correct calculation so times match the official Islamic Ministry.
-    Returns dict or None on failure.
-    """
-    try:
-        from datetime import timezone, timedelta as _td
-        mvt_now = datetime.now(timezone.utc) + _td(hours=5)
-        date_str = mvt_now.strftime("%d-%m-%Y")
-
-        # Exact Malé coordinates + Maldives Islamic Ministry calculation.
-        # Maldives uses: Fajr 19.5°, Isha 78 min after Maghrib, Shafi'i Asr.
-        # tune offsets fine-tune to match the official Maldives prayer schedule exactly.
-        # tune order: Imsak,Fajr,Sunrise,Dhuhr,Asr,Sunset,Maghrib,Isha,Midnight
-        MALE_LAT, MALE_LON = 4.1755, 73.5093
-        url = (f"https://api.aladhan.com/v1/timings/{date_str}"
-               f"?latitude={MALE_LAT}&longitude={MALE_LON}"
-               f"&method=99&methodSettings=19.5,null,78%20min"
-               f"&school=0"
-               f"&timezonestring=Indian/Maldives"
-               f"&tune=0,0,0,1,-3,0,-1,0,0")
-        resp = requests.get(url, timeout=10)
-        if resp.status_code != 200:
-            log.warning(f"Prayer times API: HTTP {resp.status_code} — trying fallback")
-            # Fallback: simple city query with Umm al-Qura
-            url2 = (f"https://api.aladhan.com/v1/timingsByCity/{date_str}"
-                    f"?city=Male&country=Maldives&method=4")
-            resp = requests.get(url2, timeout=10)
-            if resp.status_code != 200:
-                return None
-
-        d = resp.json().get("data", {})
-        timings = d.get("timings", {})
-        hijri   = d.get("date", {}).get("hijri", {})
-
-        def clean_t(t): return t[:5] if t else "--:--"
-
-        prayers = {
-            "Fajr":    clean_t(timings.get("Fajr",    "")),
-            "Dhuhr":   clean_t(timings.get("Dhuhr",   "")),
-            "Asr":     clean_t(timings.get("Asr",     "")),
-            "Maghrib": clean_t(timings.get("Maghrib", "")),
-            "Isha":    clean_t(timings.get("Isha",    "")),
-        }
-
-        h_day   = int(hijri.get("day", 0))
-        h_month = hijri.get("month", {}).get("number", 0)
-        h_month_name = hijri.get("month", {}).get("en", "")
-        h_year  = hijri.get("year", "")
-
-        # Special day — check API holidays first, then built-in dict
-        api_holidays = hijri.get("holidays", [])
-        special_name = api_holidays[0] if api_holidays else None
-        special_desc = ""
-
-        if special_name:
-            special_desc = SPECIAL_DAY_DETAILS.get(special_name, "")
-            if not special_desc:
-                key = (h_month, h_day)
-                if key in HIJRI_SPECIAL_DAYS:
-                    _, special_desc = HIJRI_SPECIAL_DAYS[key]
-        else:
-            key = (h_month, h_day)
-            if key in HIJRI_SPECIAL_DAYS:
-                special_name, special_desc = HIJRI_SPECIAL_DAYS[key]
-
-        # If NOT a special day — pick a rotating Islamic reminder
-        reminder = None
-        if not special_name:
-            reminder = get_daily_islamic_reminder(mvt_now)
-
-        log.info(f"🕌 Prayer times — Fajr {prayers['Fajr']} Dhuhr {prayers['Dhuhr']} "
-                 f"Asr {prayers['Asr']} Maghrib {prayers['Maghrib']} Isha {prayers['Isha']}"
-                 + (f" | {special_name}" if special_name else ""))
-
-        return {
-            "prayers":      prayers,
-            "hijri_day":    h_day,
-            "hijri_month":  h_month_name,
-            "hijri_year":   h_year,
-            "special_name": special_name,
-            "special_desc": special_desc,
-            "reminder":     reminder,
-        }
-
-    except Exception as e:
-        log.error(f"Prayer times: {e}")
-        return None
-
-def generate_outlook(hourly_slots, mvt_now):
-    """
-    Convert next 12 hours of Tomorrow.io hourly slots into a one-line outlook.
-    e.g. "Heavy showers after 4 PM", "Sunny all day", "Thunderstorms tonight"
-    Uses Tomorrow.io native weatherCode (not WMO).
-    """
-    from datetime import datetime, timedelta as _td
-
-    SEVERITY = {
-        8000:5, 8001:5, 8002:5,           # thunderstorm
-        4201:4, 6201:4,                    # heavy rain
-        4001:3, 6001:3, 4200:3,            # rain
-        4000:2, 6000:2, 5000:2, 7000:2,   # drizzle/snow/ice
-        2000:1, 2100:1,                    # fog
-        1001:0, 1102:0,                    # cloudy
-        1101:0, 1100:0,                    # partly cloudy
-        1000:0,                            # clear
-    }
-
-    def sev(code): return SEVERITY.get(code, 0)
-
-    def label(code):
-        if code in [8000,8001,8002]: return "thunderstorms"
-        if code in [4201,6201]:      return "heavy showers"
-        if code in [4001,6001,4200]: return "rain showers"
-        if code in [4000,6000]:      return "light rain"
-        if code in [2000,2100]:      return "foggy conditions"
-        if code in [1001,1102]:      return "cloudy skies"
-        if code in [1100,1101]:      return "partly cloudy"
-        return "sunny"
-
-    # Parse all slots into (mvt_hour, raw_code, precip)
-    entries = []
-    for slot in hourly_slots[:12]:
-        try:
-            t_str = slot.get("time","")
-            dt_utc = datetime.fromisoformat(t_str.replace("Z","+00:00"))
-            dt_mvt = dt_utc + _td(hours=5)
-            v = slot.get("values",{})
-            raw_code = v.get("weatherCode", 1000)
-            precip   = v.get("precipitationProbability", 0)
-            entries.append((dt_mvt.hour, raw_code, precip))
-        except:
-            continue
-
-    if not entries:
-        return "Weather data unavailable"
-
-    now_h = mvt_now.hour
-
-    # Find the single worst event across all upcoming hours
-    worst = max(entries, key=lambda e: (sev(e[1]), e[2]))
-    worst_h, worst_code, worst_precip = worst
-
-    # If nothing severe at all — classify overall
-    if sev(worst_code) == 0:
-        all_codes = [e[1] for e in entries]
-        if all(c == 1000 for c in all_codes):
-            return "Sunny all day"
-        if all(c in [1000,1100] for c in all_codes):
-            return "Sunny with some clouds"
-        if all(c in [1000,1100,1101,1001,1102] for c in all_codes):
-            return "Mostly cloudy"
-        return "Partly cloudy"
-
-    # There IS a significant event — say when it happens
-    desc = label(worst_code)
-
-    if worst_h < 6:    time_hint = "overnight"
-    elif worst_h < 9:  time_hint = "early morning"
-    elif worst_h < 12: time_hint = "this morning"
-    elif worst_h == 12: time_hint = "at noon"
-    elif worst_h < 15: time_hint = "this afternoon"
-    elif worst_h < 18: time_hint = f"after {worst_h - 12} PM"
-    elif worst_h < 21: time_hint = "this evening"
-    else:              time_hint = "tonight"
-
-    # If already happening now, say "right now"
-    if abs(worst_h - now_h) <= 1:
-        return f"{desc.capitalize()} right now"
-
-    return f"{desc.capitalize()} {time_hint}"
-
-def get_weather_data():
-    """
-    Fetch real-time weather for Malé, Maldives.
-    Primary: Tomorrow.io. Fallback: Open-Meteo.
-    """
-    TOMORROW_API_KEY = os.environ.get("TOMORROW_API_KEY", "")
-
-    if TOMORROW_API_KEY:
-        try:
-            base   = "https://api.tomorrow.io/v4/weather"
-            params = f"?location=4.1755,73.5093&apikey={TOMORROW_API_KEY}&units=metric"
-            rt = requests.get(f"{base}/realtime{params}", timeout=15)
-            fc = requests.get(f"{base}/forecast{params}", timeout=15)
-
-            if rt.status_code == 200 and fc.status_code == 200:
-                rv = rt.json()["data"]["values"]
-                fd = fc.json()
-                wmo = _tomorrow_code_to_wmo(rv.get("weatherCode", 1000))
-                current = {
-                    "temperature_2m":       rv.get("temperature", 29),
-                    "apparent_temperature":  rv.get("temperatureApparent", 29),
-                    "relativehumidity_2m":   rv.get("humidity", 80),
-                    "windspeed_10m":         rv.get("windSpeed", 10),
-                    "windgust_10m":          rv.get("windGust", 0),
-                    "weathercode":           wmo,
-                    "uv_index":              rv.get("uvIndex", 0),
-                    "visibility":            rv.get("visibility", 10),
-                    "dewpoint_2m":           rv.get("dewPoint", 25),
-                    "pressure_msl":          rv.get("pressureSurfaceLevel", 1010),
-                    "precipitation_prob":    rv.get("precipitationProbability", 0),
-                    "_source":               "Tomorrow.io",
-                }
-                hourly_t, hourly_wmo, hourly_precip, hourly_times = [], [], [], []
-                for slot in fd.get("timelines", {}).get("hourly", [])[:24]:
-                    v = slot.get("values", {})
-                    hourly_times.append(slot.get("time", ""))
-                    hourly_t.append(v.get("temperature", 29))
-                    hourly_wmo.append(_tomorrow_code_to_wmo(v.get("weatherCode", 1000)))
-                    hourly_precip.append(v.get("precipitationProbability", 0))
-                hourly = {"time": hourly_times, "temperature_2m": hourly_t,
-                          "weathercode": hourly_wmo, "precipitation_probability": hourly_precip}
-                daily_max, daily_min, daily_wmo = [], [], []
-                sunrise_str, sunset_str = "06:00", "18:00"
-                for day in fd.get("timelines", {}).get("daily", [])[:1]:
-                    v = day.get("values", {})
-                    daily_max.append(v.get("temperatureMax", 32))
-                    daily_min.append(v.get("temperatureMin", 26))
-                    daily_wmo.append(_tomorrow_code_to_wmo(v.get("weatherCodeMax", 1000)))
-                    sr = v.get("sunriseTime", ""); ss = v.get("sunsetTime", "")
-                    if sr:
-                        from datetime import datetime as _dt, timedelta as _td2
-                        try:
-                            sr_utc = _dt.fromisoformat(sr.replace("Z","+00:00"))
-                            sunrise_str = (sr_utc + _td2(hours=5)).strftime("%H:%M")
-                        except: sunrise_str = sr[11:16]
-                    if ss:
-                        from datetime import datetime as _dt, timedelta as _td2
-                        try:
-                            ss_utc = _dt.fromisoformat(ss.replace("Z","+00:00"))
-                            sunset_str = (ss_utc + _td2(hours=5)).strftime("%H:%M")
-                        except: sunset_str = ss[11:16]
-                daily = {
-                    "temperature_2m_max": daily_max or [32],
-                    "temperature_2m_min": daily_min or [26],
-                    "weathercode":        daily_wmo or [wmo],
-                    "sunrise":            [f"2026-01-01T{sunrise_str}"],
-                    "sunset":             [f"2026-01-01T{sunset_str}"],
-                }
-                log.info(f"🌤️ Tomorrow.io: {current['temperature_2m']:.1f}°C UV={current['uv_index']} wind={current['windspeed_10m']}km/h")
-                return {"current": current, "hourly": hourly, "daily": daily, "_source": "Tomorrow.io"}
-            else:
-                log.warning(f"Tomorrow.io HTTP rt={rt.status_code} fc={fc.status_code} — falling back")
-        except Exception as e:
-            log.error(f"Tomorrow.io weather: {e} — falling back to Open-Meteo")
-
-    # Fallback: Open-Meteo
-    try:
-        url = ("https://api.open-meteo.com/v1/forecast"
-               "?latitude=4.1755&longitude=73.5093"
-               "&current=temperature_2m,weathercode,windspeed_10m,relativehumidity_2m,apparent_temperature"
-               "&hourly=temperature_2m,weathercode,precipitation_probability"
-               "&daily=temperature_2m_max,temperature_2m_min,sunrise,sunset,weathercode"
-               "&timezone=Indian%2FMaldives&forecast_days=1")
-        resp = requests.get(url, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            data["_source"] = "Open-Meteo"
-            c = data.get("current", {})
-            c.update({"uv_index":0,"visibility":10,"windgust_10m":0,
-                      "dewpoint_2m":25,"pressure_msl":1010,"precipitation_prob":0,"_source":"Open-Meteo"})
-            log.info(f"🌤️ Open-Meteo fallback: {c.get('temperature_2m',29):.1f}°C")
-            return data
-    except Exception as e:
-        log.error(f"Open-Meteo fallback: {e}")
-    return None
-
-def _island_openmeteo_fallback(island, mvt_now):
-    """Fetch a single island's forecast from Open-Meteo (free, no key)."""
-    try:
-        url = ("https://api.open-meteo.com/v1/forecast"
-               f"?latitude={island['lat']}&longitude={island['lon']}"
-               "&current=temperature_2m,weathercode"
-               "&hourly=temperature_2m,weathercode,precipitation_probability"
-               "&timezone=Indian%2FMaldives&forecast_days=1")
-        resp = requests.get(url, timeout=12)
-        if resp.status_code != 200:
-            return {"name": island["name"], "temp": 29, "code": 1000, "outlook": "Mostly cloudy"}
-        d = resp.json()
-        temp = round(d.get("current", {}).get("temperature_2m", 29))
-        code = d.get("current", {}).get("weathercode", 1)
-        # Build slots compatible with generate_outlook (uses native Tomorrow codes;
-        # Open-Meteo uses WMO codes which generate_outlook also tolerates via labels)
-        hourly = d.get("hourly", {})
-        times = hourly.get("time", [])
-        wcodes = hourly.get("weathercode", [])
-        precs = hourly.get("precipitation_probability", [])
-        slots = []
-        for i in range(min(12, len(times))):
-            # Open-Meteo times are local MVT already; convert to fake UTC for generate_outlook (-5)
-            slots.append({"time": times[i] + ":00Z",
-                          "values": {"weatherCode": _wmo_to_tomorrow(wcodes[i] if i < len(wcodes) else 1),
-                                     "precipitationProbability": precs[i] if i < len(precs) else 0}})
-        outlook = generate_outlook(slots, mvt_now) if slots else "Mostly cloudy"
-        return {"name": island["name"], "temp": temp, "code": code, "outlook": outlook}
-    except Exception as e:
-        log.debug(f"Island Open-Meteo {island['name']}: {e}")
-        return {"name": island["name"], "temp": 29, "code": 1000, "outlook": "Mostly cloudy"}
-
-def _wmo_to_tomorrow(wmo):
-    """Rough WMO → Tomorrow.io code for outlook labelling."""
-    if wmo in [95,96,99]: return 8000
-    if wmo in [65,82]:    return 4201
-    if wmo in [61,63,80,81]: return 4001
-    if wmo in [51,53,55]: return 4000
-    if wmo in [45,48]:    return 2000
-    if wmo in [3]:        return 1001
-    if wmo in [2]:        return 1101
-    if wmo in [1]:        return 1100
-    return 1000
-
-def get_island_forecasts():
-    """
-    Fetch 12-hour hourly forecast for all 5 islands.
-    Primary: Tomorrow.io. Fallback per-island: Open-Meteo (so never 'Data unavailable').
-    Returns list of {name, temp, code, outlook} dicts.
-    """
-    TOMORROW_API_KEY = os.environ.get("TOMORROW_API_KEY", "")
-    from datetime import datetime, timezone, timedelta as _td
-    mvt_now = datetime.now(timezone.utc) + _td(hours=5)
-    results = []
-
-    for island in ISLAND_LOCATIONS:
-        # If no Tomorrow.io key, go straight to Open-Meteo
-        if not TOMORROW_API_KEY:
-            results.append(_island_openmeteo_fallback(island, mvt_now))
-            continue
-        try:
-            params = (f"?location={island['lat']},{island['lon']}"
-                      f"&apikey={TOMORROW_API_KEY}&units=metric")
-            base = "https://api.tomorrow.io/v4/weather"
-
-            rt = requests.get(f"{base}/realtime{params}", timeout=12)
-            fc = requests.get(f"{base}/forecast{params}", timeout=12)
-
-            if rt.status_code != 200 or fc.status_code != 200:
-                log.warning(f"Island {island['name']}: Tomorrow.io {rt.status_code}/{fc.status_code} — Open-Meteo fallback")
-                results.append(_island_openmeteo_fallback(island, mvt_now))
-                continue
-
-            rv = rt.json()["data"]["values"]
-            fd = fc.json()
-            temp = round(rv.get("temperature", 29))
-            code = _tomorrow_code_to_wmo(rv.get("weatherCode", 1000))
-            hourly_slots = fd.get("timelines", {}).get("hourly", [])[:12]
-            outlook = generate_outlook(hourly_slots, mvt_now)
-
-            results.append({"name": island["name"], "temp": temp,
-                             "code": code, "outlook": outlook})
-            log.info(f"🏝️ {island['name']}: {temp}°C — {outlook}")
-
-        except Exception as e:
-            log.error(f"Island forecast {island['name']}: {e} — Open-Meteo fallback")
-            results.append(_island_openmeteo_fallback(island, mvt_now))
-
-    return results
-
-
-    """
-    Fetch real-time weather for Malé, Maldives.
-    Primary: Tomorrow.io (richer data — UV, gusts, visibility, dew point).
-    Fallback: Open-Meteo (free, no key, always available).
-    Returns a normalised dict the card renderer understands.
-    """
-    TOMORROW_API_KEY = os.environ.get("TOMORROW_API_KEY", "")
-
-    # ── Primary: Tomorrow.io ─────────────────────────────────────────────────
-    if TOMORROW_API_KEY:
-        try:
-            # Two calls: realtime (current) + forecast (hourly + daily)
-            base = "https://api.tomorrow.io/v4/weather"
-            params = f"?location=4.1755,73.5093&apikey={TOMORROW_API_KEY}&units=metric"
-
-            rt = requests.get(f"{base}/realtime{params}", timeout=15)
-            fc = requests.get(f"{base}/forecast{params}", timeout=15)
-
-            if rt.status_code == 200 and fc.status_code == 200:
-                rv = rt.json()["data"]["values"]
-                fd = fc.json()
-
-                # Current conditions
-                wmo = _tomorrow_code_to_wmo(rv.get("weatherCode", 1000))
-                current = {
-                    "temperature_2m":        rv.get("temperature", 29),
-                    "apparent_temperature":   rv.get("temperatureApparent", 29),
-                    "relativehumidity_2m":    rv.get("humidity", 80),
-                    "windspeed_10m":          rv.get("windSpeed", 10),
-                    "windgust_10m":           rv.get("windGust", 0),
-                    "weathercode":            wmo,
-                    "uv_index":               rv.get("uvIndex", 0),
-                    "visibility":             rv.get("visibility", 10),
-                    "dewpoint_2m":            rv.get("dewPoint", 25),
-                    "pressure_msl":           rv.get("pressureSurfaceLevel", 1010),
-                    "precipitation_prob":     rv.get("precipitationProbability", 0),
-                    "_source":                "Tomorrow.io",
-                }
-
-                # Hourly forecast (next 8 hours)
-                hourly_t, hourly_wmo, hourly_precip = [], [], []
-                hourly_times = []
-                for slot in fd.get("timelines", {}).get("hourly", [])[:12]:
-                    v = slot.get("values", {})
-                    hourly_times.append(slot.get("time", ""))
-                    hourly_t.append(v.get("temperature", 29))
-                    hourly_wmo.append(_tomorrow_code_to_wmo(v.get("weatherCode", 1000)))
-                    hourly_precip.append(v.get("precipitationProbability", 0))
-
-                hourly = {
-                    "time":                     hourly_times,
-                    "temperature_2m":           hourly_t,
-                    "weathercode":              hourly_wmo,
-                    "precipitation_probability":hourly_precip,
-                }
-
-                # Daily H/L + sunrise/sunset
-                daily_max, daily_min, daily_wmo = [], [], []
-                sunrise_str, sunset_str = "06:00", "18:00"
-                for i, day in enumerate(fd.get("timelines", {}).get("daily", [])[:1]):
-                    v = day.get("values", {})
-                    daily_max.append(v.get("temperatureMax", 32))
-                    daily_min.append(v.get("temperatureMin", 26))
-                    daily_wmo.append(_tomorrow_code_to_wmo(v.get("weatherCodeMax", 1000)))
-                    sr = v.get("sunriseTime", "")
-                    ss = v.get("sunsetTime", "")
-                    if sr:
-                        from datetime import datetime as _dt, timedelta as _td2
-                        try:
-                            sr_utc = _dt.fromisoformat(sr.replace("Z","+00:00"))
-                            sunrise_str = (sr_utc + _td2(hours=5)).strftime("%H:%M")
-                        except: sunrise_str = sr[11:16]
-                    if ss:
-                        from datetime import datetime as _dt, timedelta as _td2
-                        try:
-                            ss_utc = _dt.fromisoformat(ss.replace("Z","+00:00"))
-                            sunset_str = (ss_utc + _td2(hours=5)).strftime("%H:%M")
-                        except: sunset_str = ss[11:16]
-
-                daily = {
-                    "temperature_2m_max": daily_max or [32],
-                    "temperature_2m_min": daily_min or [26],
-                    "weathercode":        daily_wmo or [wmo],
-                    "sunrise":            [f"2026-01-01T{sunrise_str}"],
-                    "sunset":             [f"2026-01-01T{sunset_str}"],
-                }
-
-                log.info(f"🌤️ Tomorrow.io: {current['temperature_2m']:.1f}°C, "
-                         f"UV={current['uv_index']}, wind={current['windspeed_10m']}km/h")
-                return {"current": current, "hourly": hourly, "daily": daily,
-                        "_source": "Tomorrow.io"}
-
-            else:
-                log.warning(f"Tomorrow.io HTTP rt={rt.status_code} fc={fc.status_code} — falling back")
-        except Exception as e:
-            log.error(f"Tomorrow.io weather: {e} — falling back to Open-Meteo")
-
-    # ── Fallback: Open-Meteo (no key needed, always free) ────────────────────
-    try:
-        url = ("https://api.open-meteo.com/v1/forecast"
-               "?latitude=4.1755&longitude=73.5093"
-               "&current=temperature_2m,weathercode,windspeed_10m,relativehumidity_2m,apparent_temperature"
-               "&hourly=temperature_2m,weathercode,precipitation_probability"
-               "&daily=temperature_2m_max,temperature_2m_min,sunrise,sunset,weathercode"
-               "&timezone=Indian%2FMaldives&forecast_days=1")
-        resp = requests.get(url, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            data["_source"] = "Open-Meteo"
-            # Normalise Open-Meteo current to match Tomorrow.io shape
-            c = data.get("current", {})
-            c["uv_index"]        = 0
-            c["visibility"]      = 10
-            c["windgust_10m"]    = 0
-            c["dewpoint_2m"]     = 25
-            c["pressure_msl"]    = 1010
-            c["precipitation_prob"] = 0
-            c["_source"]         = "Open-Meteo"
-            log.info(f"🌤️ Open-Meteo fallback: {c.get('temperature_2m',29):.1f}°C")
-            return data
-    except Exception as e:
-        log.error(f"Open-Meteo fallback: {e}")
-    return None
-
-def weather_code_to_info(code):
-    """Convert WMO weather code to emoji + description"""
-    if code == 0:   return "☀️", "Clear Sky"
-    if code in [1,2]: return "🌤️", "Partly Cloudy"
-    if code == 3:   return "☁️", "Overcast"
-    if code in [45,48]: return "🌫️", "Foggy"
-    if code in [51,53,55]: return "🌦️", "Drizzle"
-    if code in [61,63,65]: return "🌧️", "Rain"
-    if code in [71,73,75]: return "🌨️", "Snow"
-    if code in [80,81,82]: return "🌧️", "Rain Showers"
-    if code in [95,96,99]: return "⛈️", "Thunderstorm"
-    return "🌡️", "Unknown"
-
-def draw_weather_icon(draw, code, x, y, size=40):
-    """Draw vector weather icon — scales cleanly at any size (line widths proportional)."""
-    import math
-    cx, cy = x, y
-    s = size
-    lw = max(2, s // 18)   # proportional line width
-
-    if code == 0:  # Sun
-        draw.ellipse([cx-s//3, cy-s//3, cx+s//3, cy+s//3], fill=(255,210,40,255))
-        for angle in range(0, 360, 30):
-            rad = math.radians(angle)
-            x1 = cx + int((s//3+s//12)*math.cos(rad))
-            y1 = cy + int((s//3+s//12)*math.sin(rad))
-            x2 = cx + int((s//2+s//10)*math.cos(rad))
-            y2 = cy + int((s//2+s//10)*math.sin(rad))
-            draw.line([x1,y1,x2,y2], fill=(255,210,40,230), width=lw)
-    elif code in [1,2]:  # Partly cloudy — sun behind cloud
-        draw.ellipse([cx-s//6, cy-s//2, cx+s//2, cy+s//8], fill=(255,210,40,235))
-        draw.ellipse([cx-s//2, cy-s//8, cx+s//6, cy+s//2], fill=(225,235,250,255))
-        draw.ellipse([cx-s//8, cy-s//5, cx+s//2, cy+s//3], fill=(225,235,250,255))
-        draw.ellipse([cx-s//2, cy, cx+s//4, cy+s//2], fill=(225,235,250,255))
-    elif code == 3:  # Cloud
-        draw.ellipse([cx-s//2, cy-s//8, cx+s//2, cy+s//2], fill=(210,220,245,255))
-        draw.ellipse([cx-s//3, cy-s//3, cx+s//6, cy+s//4], fill=(210,220,245,255))
-        draw.ellipse([cx-s//12, cy-s//4, cx+s//2, cy+s//3], fill=(210,220,245,255))
-    elif code in [51,53,55,61,63,65,80,81,82]:  # Rain
-        draw.ellipse([cx-s//2, cy-s//5, cx+s//2, cy+s//3], fill=(175,190,225,255))
-        draw.ellipse([cx-s//3, cy-s//3, cx+s//6, cy+s//5], fill=(175,190,225,255))
-        draw.ellipse([cx-s//12, cy-s//4, cx+s//2, cy+s//4], fill=(175,190,225,255))
-        for rx in [-s//3, 0, s//3]:
-            draw.line([cx+rx, cy+s//3, cx+rx-s//12, cy+s//2+s//8],
-                      fill=(90,160,255,235), width=lw)
-    elif code in [95,96,99]:  # Thunderstorm
-        draw.ellipse([cx-s//2, cy-s//5, cx+s//2, cy+s//3], fill=(90,90,115,255))
-        draw.ellipse([cx-s//3, cy-s//3, cx+s//6, cy+s//5], fill=(90,90,115,255))
-        draw.ellipse([cx-s//12, cy-s//4, cx+s//2, cy+s//4], fill=(90,90,115,255))
-        bolt = [cx+s//12, cy+s//4, cx-s//12, cy+s//4, cx, cy+s//2,
-                cx-s//6, cy+s//2, cx+s//5, cy+s*3//4]
-        draw.line(bolt, fill=(255,215,0,255), width=lw+1)
-    else:  # Default cloud
-        draw.ellipse([cx-s//2, cy-s//8, cx+s//2, cy+s//2], fill=(190,200,230,255))
-        draw.ellipse([cx-s//3, cy-s//3, cx+s//6, cy+s//4], fill=(190,200,230,255))
-
-def generate_weather_card(weather_data, alert_mode=False, alert_text="", island_data=None, prayer_data=None, alert_level=None):
-    """Samuga branded weather card v3 — 2500x3000, cinematic, sea conditions, prayer times, Hijri, MMS alerts."""
-    from PIL import Image, ImageDraw, ImageFont, ImageFilter
-    import io
-
-    W, H = 2500, (3050 if island_data else 2300)
-    img = Image.new("RGB", (W, H), (0, 0, 0))
-    draw = ImageDraw.Draw(img, "RGBA")
-
-    current    = weather_data.get("current", {})
-    hourly_d   = weather_data.get("hourly", {})
-    daily_d    = weather_data.get("daily", {})
-    source     = weather_data.get("_source", "")
-
-    temp     = round(current.get("temperature_2m", 29))
-    feels    = round(current.get("apparent_temperature", 29))
-    humidity = current.get("relativehumidity_2m", 80)
-    wind     = round(current.get("windspeed_10m", 10))
-    gusts    = round(current.get("windgust_10m", 0))
-    uv       = current.get("uv_index", 0)
-    vis      = round(current.get("visibility", 10))
-    dew      = round(current.get("dewpoint_2m", 25))
-    pressure = round(current.get("pressure_msl", 1010))
-    precip_p = current.get("precipitation_prob", 0)
-    code     = current.get("weathercode", 0)
-    _, condition = weather_code_to_info(code)
-
-    temp_max = round(daily_d.get("temperature_2m_max", [temp])[0])
-    temp_min = round(daily_d.get("temperature_2m_min", [temp])[0])
-    sunrise_raw = daily_d.get("sunrise", [""])[0]
-    sunset_raw  = daily_d.get("sunset",  [""])[0]
-    sunrise_str = sunrise_raw.split("T")[1][:5] if "T" in sunrise_raw else "06:00"
-    sunset_str  = sunset_raw.split("T")[1][:5]  if "T" in sunset_raw  else "18:19"
-
-    hours  = hourly_d.get("time", [])
-    temps  = hourly_d.get("temperature_2m", [])
-    codes  = hourly_d.get("weathercode", [])
-    precip = hourly_d.get("precipitation_probability", [])
-
-    from datetime import timezone
-    mvt = datetime.now(timezone.utc) + timedelta(hours=5)
-
-    # ── Sea condition assessment (Maldives-specific) ──────────────────────────
-    def sea_condition(wind_kmh, gust_kmh, precip_pct, wcode):
-        if wind_kmh >= 50 or gust_kmh >= 65 or wcode in [95,96,99]:
-            return "⛔", "Very Rough Sea", "Avoid all sea travel"
-        if wind_kmh >= 35 or gust_kmh >= 45:
-            return "🟠", "Rough Sea", "Caution — small craft warning"
-        if wind_kmh >= 20 or gust_kmh >= 30:
-            return "🟡", "Moderate Sea", "Speedboats with care"
-        return "🟢", "Calm Sea", "Good conditions for travel"
-
-    sea_icon, sea_label, sea_advice = sea_condition(wind, gusts, precip_p, code)
-
-    # ── Background — deep layered atmospheric ─────────────────────────────────
-    if alert_mode and alert_level:
-        # Each MMS level gets its own tinted background
-        if alert_level == "white":
-            TOP, BOT = (30, 45, 70), (12, 22, 42)      # light steel blue
-        elif alert_level == "yellow":
-            TOP, BOT = (60, 50, 8), (28, 22, 4)        # dark yellowish
-        elif alert_level == "orange":
-            TOP, BOT = (70, 38, 6), (32, 16, 3)        # dark orangish
-        elif alert_level == "red":
-            TOP, BOT = (55, 6, 6), (18, 2, 2)          # deep red (serious)
-        else:
-            TOP, BOT = (45, 5, 5), (15, 2, 2)
-    elif alert_mode:
-        TOP, BOT = (45, 5, 5), (15, 2, 2)
-    elif code in [95,96,99]:
-        TOP, BOT = (18, 10, 45), (6, 4, 22)
-    elif code in [61,63,65,80,81,82,51,53,55]:
-        TOP, BOT = (8, 18, 52), (4, 8, 28)
-    elif code == 0:
-        TOP, BOT = (5, 22, 80), (3, 10, 42)
-    else:
-        TOP, BOT = (8, 18, 55), (4, 8, 32)
-
-    # Three-stop gradient: top → mid → bottom
-    MID = tuple(int((TOP[i]+BOT[i])//2 + 8) for i in range(3))
-    for y in range(H):
-        t = y / H
-        if t < 0.45:
-            f = t / 0.45
-            r = int(TOP[0] + (MID[0]-TOP[0])*f)
-            g = int(TOP[1] + (MID[1]-TOP[1])*f)
-            b = int(TOP[2] + (MID[2]-TOP[2])*f)
-        else:
-            f = (t-0.45) / 0.55
-            r = int(MID[0] + (BOT[0]-MID[0])*f)
-            g = int(MID[1] + (BOT[1]-MID[1])*f)
-            b = int(MID[2] + (BOT[2]-MID[2])*f)
-        draw.line([(0,y),(W,y)], fill=(max(0,min(255,r)), max(0,min(255,g)), max(0,min(255,b)), 255))
-
-    # Atmospheric glow layers — large soft blobs of colour for depth
-    glow = Image.new("RGBA", (W, H), (0,0,0,0))
-    gd   = ImageDraw.Draw(glow)
-
-    # Primary glow — centre-top (SKY blue)
-    for r in range(700, 0, -1):
-        a = int(28 * (1 - r/700))
-        gd.ellipse([(W//2-r, 180-r), (W//2+r, 180+r)], fill=(41,171,226,a))
-
-    # Secondary glow — lower left (deeper blue)
-    for r in range(500, 0, -1):
-        a = int(18 * (1 - r/500))
-        gd.ellipse([(200-r, H-400-r), (200+r, H-400+r)], fill=(20,60,160,a))
-
-    # Accent glow — lower right (hint of teal)
-    for r in range(400, 0, -1):
-        a = int(14 * (1 - r/400))
-        gd.ellipse([(W-300-r, H-500-r), (W-300+r, H-500+r)], fill=(20,120,140,a))
-
-    glow = glow.filter(ImageFilter.GaussianBlur(60))
-    img_rgba = img.convert("RGBA")
-    img_rgba = Image.alpha_composite(img_rgba, glow)
-
-    # Noise/grain overlay for depth (subtle)
-    import random
-    grain = Image.new("RGBA", (W, H), (0,0,0,0))
-    gpx  = grain.load()
-    for yy in range(0, H, 3):
-        for xx in range(0, W, 3):
-            v = random.randint(0, 12)
-            gpx[xx, yy] = (v, v, v+4, 6)
-    img_rgba = Image.alpha_composite(img_rgba, grain)
-
-    img  = img_rgba.convert("RGB")
-    draw = ImageDraw.Draw(img, "RGBA")
-
-    # Alert tint overlay — coloured by level
-    if alert_mode:
-        tint_map = {
-            "white":  (60, 90, 130, 30),
-            "yellow": (120, 100, 10, 35),
-            "orange": (140, 70, 5, 35),
-            "red":    (90, 0, 0, 45),
-        }
-        tc = tint_map.get(alert_level, (80, 0, 0, 40))
-        overlay = Image.new("RGBA", (W,H), tc)
-        img = Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
-        draw = ImageDraw.Draw(img, "RGBA")
-
-    # ── Fonts ─────────────────────────────────────────────────────────────────
-    def F(sz, bold=False):
-        try:
-            path = f"/usr/share/fonts/truetype/dejavu/DejaVuSans{chr(45)+'Bold' if bold else ''}.ttf"
-            return ImageFont.truetype(path, sz)
-        except:
-            return ImageFont.load_default()
-
-    f_giant  = F(420, True)   # temperature
-    f_huge   = F(110, True)   # condition
-    f_large  = F(80,  True)   # location, section headers
-    f_med    = F(64)           # H/L, details
-    f_small  = F(52,  True)   # island names, sea label
-    f_body   = F(46)           # outlook text
-    f_tiny   = F(38)           # hourly labels
-    f_xs     = F(32)           # sub-labels
-    f_xxs    = F(26)           # footer, source
-
-    # ── MMS Alert banner FIRST (so logo sits below it, not under it) ──────────
-    banner_h = 0
-    if alert_mode and alert_level:
-        level_cfg = MMS_ALERT_LEVELS.get(alert_level, MMS_ALERT_LEVELS["white"])
-        acolor = level_cfg["color"]
-        banner_h = 130
-        draw.rectangle([(0, 0), (W, banner_h)], fill=(acolor[0], acolor[1], acolor[2], 235))
-        btext = f"{level_cfg['emoji']}  {level_cfg['label']}  —  {level_cfg['headline'].upper()}"
-        btw = draw.textlength(btext, font=f_small)
-        txt_color = (20,20,20,255) if alert_level in ["white","yellow"] else (255,255,255,255)
-        draw.text(((W-btw)//2, 38), btext, font=f_small, fill=txt_color)
-    elif alert_mode:
-        banner_h = 110
-        draw.rectangle([(0, 0), (W, banner_h)], fill=(200, 40, 40, 235))
-        btext = "⚠  WEATHER ALERT  ⚠"
-        btw = draw.textlength(btext, font=f_small)
-        draw.text(((W-btw)//2, 30), btext, font=f_small, fill=(255,255,255,255))
-
-    # ── SAMUGA LOGO — top left (below banner if in alert mode) ────────────────
-    logo_y = (banner_h + 25) if alert_mode else 55
-    try:
-        logo = Image.open("logo.png").convert("RGBA")
-        lh = 120; lw2 = int(logo.width * lh / logo.height)
-        logo = logo.resize((lw2, lh), Image.LANCZOS)
-        ir = img.convert("RGBA"); ir.paste(logo, (70, logo_y), logo)
-        img = ir.convert("RGB"); draw = ImageDraw.Draw(img, "RGBA")
-    except Exception as e:
-        log.debug(f"weather logo: {e}")
-        draw.text((70, logo_y), "SAMUGA MEDIA", font=f_xs, fill=(255,255,255,200))
-
-    # Channel tag — top right (below banner if in alert mode)
-    tag = "t.me/samugacommunity"
-    ttw = draw.textlength(tag, font=f_xs)
-    tag_y = (banner_h + 45) if alert_mode else 78
-    draw.text((W-ttw-70, tag_y), tag, font=f_xs, fill=(255,255,255,130))
-
-    # ── LOCATION ──────────────────────────────────────────────────────────────
-    loc = "Malé, Maldives"
-    loc_y = (banner_h + 180) if alert_mode else 240
-    lcw = draw.textlength(loc, font=f_large)
-    draw.text(((W-lcw)//2, loc_y), loc, font=f_large, fill=(255,255,255,230))
-
-    # ── WEATHER ICON — dead centre between location and temperature ────────────
-    icon_y = loc_y + 175
-    draw_weather_icon(draw, code, W//2, icon_y, size=175)
-
-    # ── TEMPERATURE ───────────────────────────────────────────────────────────
-    temp_str = f"{temp}°"
-    ttw2 = draw.textlength(temp_str, font=f_giant)
-    temp_y = icon_y + 175
-    draw.text(((W-ttw2)//2, temp_y), temp_str, font=f_giant, fill=(255,255,255,255))
-
-    # ── PRAYER TIMES (left of temp) + HIJRI (right of temp) ───────────────────
-    if prayer_data:
-        prayers  = prayer_data.get("prayers", {})
-        h_day    = prayer_data.get("hijri_day", "")
-        h_month  = prayer_data.get("hijri_month", "")
-        h_year   = prayer_data.get("hijri_year", "")
-        sp_name  = prayer_data.get("special_name", "")
-        sp_desc  = prayer_data.get("special_desc", "")
-        reminder = prayer_data.get("reminder", None)
-
-        flank_y = temp_y + 30   # align with top of big temperature
-
-        # ── LEFT: Prayer times ────────────────────────────────────────────────
-        px = 90
-        py = flank_y
-        draw.text((px, py), "PRAYER TIMES", font=f_xs, fill=(255,220,100,210))
-        py += 60
-        prayer_order = ["Fajr","Dhuhr","Asr","Maghrib","Isha"]
-        for name in prayer_order:
-            draw.text((px, py), name, font=f_small, fill=(255,255,255,220))
-            t_val = prayers.get(name, "--:--")
-            tw_p = int(draw.textlength(t_val, font=f_small))
-            draw.text((px + 430 - tw_p, py), t_val, font=f_small, fill=(160,215,255,235))
-            py += 78
-
-        # ── RIGHT: Hijri calendar ─────────────────────────────────────────────
-        rx = W - 90 - 540   # right block left edge (room for long month names)
-        ry = flank_y
-        draw.text((rx, ry), "HIJRI CALENDAR", font=f_xs, fill=(255,220,100,210))
-        ry += 60
-        # Big day number
-        h_day_str = str(h_day)
-        draw.text((rx, ry), h_day_str, font=F(150, True), fill=(255,255,255,245))
-        ry += 165
-        # Month + year below the number
-        draw.text((rx, ry), h_month, font=f_med, fill=(255,255,255,215))
-        ry += 66
-        draw.text((rx, ry), f"{h_year} AH", font=f_body, fill=(200,225,255,165))
-        ry += 70
-
-        # Special day box (gold) OR Islamic reminder box (subtle teal)
-        if sp_name:
-            box_left  = rx
-            box_right = W - 80
-            box_w_px  = box_right - box_left
-            desc_lines = []
-            if sp_desc:
-                words = sp_desc.split()
-                cur = ""
-                for w in words:
-                    test = (cur + " " + w).strip()
-                    if draw.textlength(test, font=F(28)) <= box_w_px - 40:
-                        cur = test
-                    else:
-                        desc_lines.append(cur); cur = w
-                if cur: desc_lines.append(cur)
-            box_h = 56 + len(desc_lines)*38 + 30
-            draw.rounded_rectangle([(box_left, ry),(box_right, ry+box_h)],
-                                   radius=18, fill=(58,44,4,180))
-            draw.text((box_left+24, ry+18), sp_name, font=F(38,True), fill=(255,220,80,255))
-            dyy = ry + 70
-            for dl in desc_lines:
-                draw.text((box_left+24, dyy), dl, font=F(28), fill=(255,205,90,210))
-                dyy += 38
-        elif reminder:
-            # Islamic reminder box — subtle teal/blue accent
-            box_left  = rx
-            box_right = W - 80
-            box_w_px  = box_right - box_left
-            r_text = reminder.get("text", "")
-            r_src  = reminder.get("source", "")
-            # Wrap the reminder text
-            words = r_text.split()
-            lines = []
-            cur = ""
-            for w in words:
-                test = (cur + " " + w).strip()
-                if draw.textlength(test, font=F(30)) <= box_w_px - 40:
-                    cur = test
-                else:
-                    lines.append(cur); cur = w
-            if cur: lines.append(cur)
-            box_h = 50 + len(lines)*40 + 50
-            draw.rounded_rectangle([(box_left, ry),(box_right, ry+box_h)],
-                                   radius=18, fill=(10,40,55,170))
-            # Small header
-            draw.text((box_left+24, ry+16), "✦ DAILY REMINDER", font=F(24,True), fill=(120,200,220,220))
-            dyy = ry + 56
-            for ln in lines:
-                draw.text((box_left+24, dyy), ln, font=F(30), fill=(220,240,250,225))
-                dyy += 40
-            # Source
-            draw.text((box_left+24, dyy+4), f"— {r_src}", font=F(26), fill=(150,200,220,190))
-
-    # ── CONDITION ─────────────────────────────────────────────────────────────
-    cond_y = temp_y + 440
-    ccw = draw.textlength(condition, font=f_huge)
-    draw.text(((W-ccw)//2, cond_y), condition, font=f_huge, fill=(255,255,255,200))
-
-    # ── H / L ─────────────────────────────────────────────────────────────────
-    hl_y = cond_y + 130
-    hl_str = f"H:{temp_max}°   L:{temp_min}°"
-    hlw = draw.textlength(hl_str, font=f_med)
-    draw.text(((W-hlw)//2, hl_y), hl_str, font=f_med, fill=(255,255,255,180))
-
-    # Alert text — wrapped, below H/L (full detail is also in the caption)
-    if alert_mode and alert_text:
-        acol = (255,140,140,255)
-        if alert_level in MMS_ALERT_LEVELS:
-            c = MMS_ALERT_LEVELS[alert_level]["color"]
-            acol = (min(255,c[0]+40), min(255,c[1]+40), min(255,c[2]+40), 255)
-        # Wrap alert text
-        words = alert_text.split()
-        lines = []; cur = ""
-        for w in words:
-            test = (cur + " " + w).strip()
-            if draw.textlength(test, font=f_body) <= W - 200:
-                cur = test
-            else:
-                lines.append(cur); cur = w
-        if cur: lines.append(cur)
-        ay = hl_y + 80
-        for ln in lines[:3]:
-            lw_a = draw.textlength(ln, font=f_body)
-            draw.text(((W-lw_a)//2, ay), ln, font=f_body, fill=acol)
-            ay += 56
-        hl_y = ay - 80  # push details down below the alert text
-
-    # ── DETAILS — 3 rows ──────────────────────────────────────────────────────
-    dy = hl_y + 90
-    def centred(text, font, color, y):
-        w = draw.textlength(text, font=font)
-        draw.text(((W-w)//2, y), text, font=font, fill=color)
-
-    row1 = f"Feels {feels}°   Humidity {humidity}%   Wind {wind} km/h"
-    if gusts and gusts > wind: row1 += f" (gusts {gusts})"
-    centred(row1, f_med, (255,255,255,175), dy); dy += 70
-
-    row2_parts = []
-    if uv:       row2_parts.append(f"UV {uv}")
-    if vis:      row2_parts.append(f"Visibility {vis} km")
-    if dew:      row2_parts.append(f"Dew {dew}°")
-    if pressure: row2_parts.append(f"Pressure {pressure} hPa")
-    if row2_parts:
-        centred("   ".join(row2_parts), f_body, (255,255,255,145), dy); dy += 60
-
-    sun_str = f"Sunrise {sunrise_str}   Sunset {sunset_str}"
-    if precip_p: sun_str += f"   Rain {precip_p}%"
-    centred(sun_str, f_body, (255,220,100,200), dy); dy += 50
-
-    # ── THIN DIVIDER ──────────────────────────────────────────────────────────
-    div1 = dy + 20
-    draw.line([(80,div1),(W-80,div1)], fill=(255,255,255,35), width=2)
-
-    # ── SEA & WIND CONDITION SECTION (Maldives-specific) ─────────────────────
-    sea_y = div1 + 50
-    # Section label
-    sea_hdr = "SEA & WIND CONDITIONS"
-    shw = draw.textlength(sea_hdr, font=f_small)
-    draw.text(((W-shw)//2, sea_y), sea_hdr, font=f_small, fill=(255,220,100,220))
-    sea_y += 80
-
-    # Three columns: wind | sea state | advice
-    col_w = W // 3
-    # Wind column
-    draw.text((col_w*0 + 80, sea_y), "WIND", font=f_xs, fill=(255,255,255,120))
-    wind_val = f"{wind} km/h"
-    draw.text((col_w*0 + 80, sea_y+40), wind_val, font=f_small, fill=(255,255,255,230))
-    if gusts > wind:
-        draw.text((col_w*0 + 80, sea_y+100), f"Gusts {gusts} km/h", font=f_body, fill=(255,200,100,180))
-
-    # Sea state column — centred
-    sl_w = draw.textlength(sea_label, font=f_small)
-    draw.text(((W-sl_w)//2, sea_y+40), sea_label, font=f_small, fill=(255,255,255,230))
-    adv_w = draw.textlength(sea_advice, font=f_body)
-    draw.text(((W-adv_w)//2, sea_y+100), sea_advice, font=f_body, fill=(200,230,255,170))
-
-    # UV + Visibility column — right
-    draw.text((col_w*2 + 80, sea_y), "UV INDEX", font=f_xs, fill=(255,255,255,120))
-    uv_col = "Low" if uv<=2 else "Moderate" if uv<=5 else "High" if uv<=7 else "Very High"
-    draw.text((col_w*2 + 80, sea_y+40), f"{uv} — {uv_col}", font=f_small, fill=(255,255,255,230))
-    draw.text((col_w*2 + 80, sea_y+100), f"Vis {vis} km", font=f_body, fill=(200,230,255,170))
-
-    sea_y += 160
-    div2 = sea_y + 10
-    draw.line([(80,div2),(W-80,div2)], fill=(255,255,255,35), width=2)
-    div3 = div2
-
-    # ── HOURLY STRIP — next 8 hours ───────────────────────────────────────────
-    hourly_y = div3 + 40
-    now_hour = mvt.hour
-    slot_w = (W - 160) // 8
-    displayed = 0
-
-    for h_str, ht, hc, hp in zip(hours, temps, codes, precip):
-        try:
-            h_hour = int(h_str.split("T")[1][:2])
-        except:
-            continue
-        if h_hour < now_hour: continue
-        if displayed >= 8: break
-
-        hx = 80 + displayed * slot_w + slot_w // 2
-
-        # Hour label
-        h_label = "Now" if displayed == 0 else f"{h_hour:02d}:00"
-        hlw2 = draw.textlength(h_label, font=f_tiny)
-        draw.text((hx-hlw2//2, hourly_y), h_label, font=f_tiny, fill=(255,255,255,160))
-
-        # Icon
-        draw_weather_icon(draw, hc, hx, hourly_y+75, size=78)
-
-        # Temp
-        ht_str = f"{round(ht)}°"
-        htw = draw.textlength(ht_str, font=f_small)
-        draw.text((hx-htw//2, hourly_y+140), ht_str, font=f_small, fill=(255,255,255,255))
-
-        # Rain %
-        if hp and hp > 0:
-            hp_str = f"{hp}%"
-            hpw = draw.textlength(hp_str, font=f_tiny)
-            draw.text((hx-hpw//2, hourly_y+200), hp_str, font=f_tiny, fill=(120,200,255,200))
-
-        displayed += 1
-
-    div3 = hourly_y + 260
-    draw.line([(80,div3),(W-80,div3)], fill=(255,255,255,35), width=2)
-
-    # ── ISLAND WATCH STRIP ────────────────────────────────────────────────────
-    if island_data:
-        iw_y = div3 + 50
-
-        iw_hdr = "WEATHER WATCH — MALDIVES"
-        ihw = draw.textlength(iw_hdr, font=f_small)
-        draw.text(((W-ihw)//2, iw_y), iw_hdr, font=f_small, fill=(255,220,100,225))
-        iw_y += 90
-
-        for isl in island_data:
-            iname = isl["name"]
-            iout  = isl["outlook"]
-            itemp = isl.get("temp", 29)
-
-            # Name left, temp right
-            draw.text((90, iw_y), iname, font=f_small, fill=(255,255,255,230))
-            ts2 = f"{itemp}°C"
-            tw3 = int(draw.textlength(ts2, font=f_small))
-            draw.text((W-90-tw3, iw_y), ts2, font=f_small, fill=(160,215,255,210))
-            # Outlook below
-            draw.text((90, iw_y+58), iout, font=f_body, fill=(200,225,255,165))
-
-            # Subtle row separator
-            draw.line([(90, iw_y+108),(W-90, iw_y+108)], fill=(255,255,255,18), width=1)
-            iw_y += 118
-
-        div4 = iw_y + 20
-        draw.line([(80,div4),(W-80,div4)], fill=(255,255,255,30), width=2)
-        bottom_start = div4
-    else:
-        bottom_start = div3
-
-    # ── BOTTOM BAR ────────────────────────────────────────────────────────────
-    bar_y = H - 160
-    # Semi-transparent dark strip
-    bar_overlay = Image.new("RGBA", (W, 160), (0,0,0,80))
-    img.paste(Image.new("RGB",(W,160),(0,0,0)), (0,bar_y),
-              Image.new("L",(W,160), 80))
-    draw = ImageDraw.Draw(img, "RGBA")
-
-    time_str = mvt.strftime("%A, %d %B %Y  •  %H:%M MVT")
-    tfw = draw.textlength(time_str, font=f_xs)
-    draw.text(((W-tfw)//2, bar_y+18), time_str, font=f_xs, fill=(255,255,255,120))
-
-    brand = "Samuga Media  |  @samugacommunity"
-    bw3 = draw.textlength(brand, font=f_small)
-    draw.text(((W-bw3)//2, bar_y+62), brand, font=f_small, fill=(255,255,255,210))
-
-    if source:
-        src_txt = f"Data: {source}"
-        stw2 = draw.textlength(src_txt, font=f_xxs)
-        draw.text((W-stw2-80, bar_y+128), src_txt, font=f_xxs, fill=(255,255,255,80))
-
-    buf = io.BytesIO()
-    img.convert("RGB").save(buf, format="PNG")
-    buf.seek(0)
-    return buf
-
-
-# ── Weather Alert System ──────────────────────────────────────────────────────
-# Checks every weather fetch for dangerous conditions.
-# Max 2 alerts per day (MVT). Never spams.
-weather_alerts_today = {"date": None, "count": 0}
-
-# ── Maldives Meteorological Service alert levels ─────────────────────────────
-# White (informational) → Yellow (advisory) → Orange (warning) → Red (emergency)
-# Wind/gust thresholds based on official MMS criteria (mph converted to km/h).
-MMS_ALERT_LEVELS = {
-    "white": {
-        "label": "WHITE ALERT", "tier": 1,
-        "color": (230, 230, 235), "emoji": "⚪",
-        "headline": "Weather Advisory",
-        "wind_kmh": 30, "gust_kmh": 55,    # ~19 mph wind / ~34 mph gust
-    },
-    "yellow": {
-        "label": "YELLOW ALERT", "tier": 2,
-        "color": (245, 200, 40), "emoji": "🟡",
-        "headline": "Weather Warning",
-        "wind_kmh": 40, "gust_kmh": 64,    # ~25 mph wind / 40 mph gust
-    },
-    "orange": {
-        "label": "ORANGE ALERT", "tier": 3,
-        "color": (245, 140, 20), "emoji": "🟠",
-        "headline": "Severe Weather Warning",
-        "wind_kmh": 55, "gust_kmh": 80,    # ~34 mph wind / 50 mph gust
-    },
-    "red": {
-        "label": "RED ALERT", "tier": 4,
-        "color": (220, 40, 40), "emoji": "🔴",
-        "headline": "EMERGENCY — Severe Weather",
-        "wind_kmh": 75, "gust_kmh": 100,   # ~47 mph wind / 62 mph gust
-    },
-}
-
-def can_send_weather_alert():
-    global weather_alerts_today
-    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
-    if weather_alerts_today["date"] != today:
-        weather_alerts_today = {"date": today, "count": 0}
-    return weather_alerts_today["count"] < 2
-
-def increment_alert_count():
-    global weather_alerts_today
-    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
-    if weather_alerts_today["date"] != today:
-        weather_alerts_today = {"date": today, "count": 0}
-    weather_alerts_today["count"] += 1
-    log.info(f"⚠️ Weather alerts today: {weather_alerts_today['count']}/2")
-
-def detect_weather_alert(weather_data):
-    """
-    Assess conditions against Maldives Met Service alert levels.
-    Returns (should_alert, level_key, alert_text) or (False, None, None).
-    Only fires White/Yellow/Orange/Red — nothing for calm weather.
-    """
-    current = weather_data.get("current", {})
-    code    = current.get("weathercode", 0)
-    wind    = current.get("windspeed_10m", 0)
-    gusts   = current.get("windgust_10m", 0)
-    precip  = current.get("precipitation_prob", 0)
-
-    is_storm = code in [95, 96, 99]
-    is_heavy_rain = code in [65, 82] and precip >= 80
-
-    # Determine the highest level the conditions meet (check Red first)
-    level = None
-    for key in ["red", "orange", "yellow", "white"]:
-        cfg = MMS_ALERT_LEVELS[key]
-        if wind >= cfg["wind_kmh"] or gusts >= cfg["gust_kmh"]:
-            level = key
-            break
-
-    # Thunderstorms bump the level up at least to Yellow
-    if is_storm:
-        if level is None or MMS_ALERT_LEVELS[level]["tier"] < 2:
-            level = "yellow"
-
-    # Heavy rain alone triggers at least White
-    if is_heavy_rain and level is None:
-        level = "white"
-
-    if level is None:
-        return (False, None, None)
-
-    # Build the alert description
-    cfg = MMS_ALERT_LEVELS[level]
-    parts = []
-    if is_storm:
-        parts.append("thunderstorms")
-    if is_heavy_rain or (code in [61,63,65,80,81,82]):
-        parts.append("heavy rain")
-    if wind >= 30 or gusts >= 50:
-        parts.append("strong winds")
-    # Sea state
-    if wind >= 55 or gusts >= 80:
-        sea = "very rough seas"
-    elif wind >= 35 or gusts >= 55:
-        sea = "rough seas"
-    else:
-        sea = "moderate seas"
-    parts.append(sea)
-
-    desc = ", ".join(parts).capitalize()
-    w_str = f"Wind {int(wind)} km/h"
-    if gusts > wind:
-        w_str += f", gusts {int(gusts)} km/h"
-
-    alert_text = f"{desc} expected over Malé. {w_str}."
-
-    # Advice by level
-    advice = {
-        "white":  "Stay informed and take normal precautions.",
-        "yellow": "Caution advised. Avoid unnecessary sea travel.",
-        "orange": "Avoid sea travel. Secure loose objects. Stay indoors if possible.",
-        "red":    "DANGER. Do not travel by sea. Stay indoors and follow official guidance.",
-    }
-    alert_text += " " + advice[level]
-
-    return (True, level, alert_text)
-
-def send_weather_alert(weather_data, level_key, alert_text):
-    """
-    Send a Maldives Met-style alert card.
-    Red alerts post immediately and bypass the daily limit.
-    Others respect the 2/day cap.
-    """
-    cfg = MMS_ALERT_LEVELS.get(level_key, MMS_ALERT_LEVELS["white"])
-    is_red = level_key == "red"
-
-    # Red bypasses the daily limit (emergency), others respect it
-    if not is_red and not can_send_weather_alert():
-        log.info(f"⚠️ Weather alert limit (2/day) reached — skipping {level_key}")
-        return
-
-    try:
-        card = generate_weather_card(weather_data, alert_mode=True,
-                                     alert_text=alert_text, alert_level=level_key)
-        current = weather_data.get("current", {})
-        code = current.get("weathercode", 0)
-        emoji, condition = weather_code_to_info(code)
-
-        caption = (
-            f"{cfg['emoji']} <b>{cfg['label']} — Malé, Maldives</b>\n"
-            f"<b>{cfg['headline']}</b>\n\n"
-            f"{alert_text}\n\n"
-            f"🌡️ Current: {round(current.get('temperature_2m',29))}°C — {condition}\n\n"
-            f"📡 <b>Samuga Media</b> | @samugacommunity\n"
-            f"<i>Source: Conditions via weather data — follow @MetMaldives for official warnings</i>"
-        )
-
-        # Post to community (Telegram) immediately
-        card.seek(0)
-        send_photo(TELEGRAM_CHANNEL_ID, card, caption)
-
-        # ALL alert levels post immediately to FB + IG + X via queue
-        try:
-            card.seek(0)
-            queue_for_social(io.BytesIO(card.getvalue()), caption)
-            log.info(f"📲 {cfg['label']} queued for FB + IG + X")
-        except Exception as e:
-            log.error(f"Alert social post: {e}")
-
-        # Core team notification
-        team_note = (
-            f"{cfg['emoji']} <b>{cfg['label']} posted to ALL platforms</b>\n"
-            f"{alert_text}\n"
-            f"Alerts today: {weather_alerts_today['count']+(0 if is_red else 1)}/2"
-            + ("  (RED — bypassed daily limit)" if is_red else "")
-        )
-        send_text(CORE_TEAM_CHAT_ID, team_note)
-
-        if not is_red:
-            increment_alert_count()
-        log.info(f"{cfg['emoji']} Weather alert sent to all platforms: {level_key.upper()}")
-    except Exception as e:
-        log.error(f"Weather alert send: {e}")
-
-def send_weather_update(time_of_day="morning"):
-    """Send weather card to Telegram + island watch + check for alerts"""
-    log.info(f"🌤️ Weather update ({time_of_day})...")
-    try:
-        data = get_weather_data()
-        if not data:
-            log.error("Weather: no data"); return
-
-        # Fetch island forecasts
-        log.info("🏝️ Fetching island forecasts...")
-        islands = get_island_forecasts()
-        if islands:
-            log.info(f"🏝️ Got {len(islands)} island forecasts")
-        else:
-            log.warning("🏝️ No island forecast data — card will show Malé only")
-
-        # Fetch prayer times + Hijri date
-        log.info("🕌 Fetching prayer times...")
-        prayer_info = get_prayer_times()
-        if prayer_info:
-            log.info("🕌 Prayer times fetched")
-        else:
-            log.warning("🕌 Prayer times unavailable")
-
-        card = generate_weather_card(data, island_data=islands if islands else None,
-                                     prayer_data=prayer_info)
-        current  = data.get("current", {})
-        daily_d  = data.get("daily", {})
-        temp     = round(current.get("temperature_2m", 29))
-        feels    = round(current.get("apparent_temperature", 29))
-        humidity = current.get("relativehumidity_2m", 80)
-        code     = current.get("weathercode", 0)
-        uv       = current.get("uv_index", 0)
-        wind     = round(current.get("windspeed_10m", 10))
-        precip_p = current.get("precipitation_prob", 0)
-        source   = data.get("_source", "")
-        temp_max = round(daily_d.get("temperature_2m_max", [temp])[0])
-        temp_min = round(daily_d.get("temperature_2m_min", [temp])[0])
-        sunrise_raw = daily_d.get("sunrise", [""])[0]
-        sunset_raw  = daily_d.get("sunset",  [""])[0]
-        sunrise_str = sunrise_raw.split("T")[1][:5] if "T" in sunrise_raw else "06:00"
-        sunset_str  = sunset_raw.split("T")[1][:5]  if "T" in sunset_raw  else "18:19"
-        emoji, condition = weather_code_to_info(code)
-        if time_of_day == "morning":
-            greeting = "\U0001f305 Good Morning Maldives!"
-        elif time_of_day == "afternoon":
-            greeting = "\u2600\ufe0f Good Afternoon Maldives!"
-        else:
-            greeting = "\U0001f319 Good Evening Maldives!"
-        src_tag = f"\n<i>Data: {source}</i>" if source else ""
-
-        # Sea condition for caption
-        def _sea_label(w, g, p, c):
-            if w>=50 or g>=65 or c in [95,96,99]: return "⛔ Very Rough Sea — avoid all sea travel"
-            if w>=35 or g>=45: return "🟠 Rough Sea — small craft warning"
-            if w>=20 or g>=30: return "🟡 Moderate Sea — speedboats with care"
-            return "🟢 Calm Sea — good conditions"
-        sea_line = _sea_label(wind, round(current.get("windgust_10m",0)), precip_p, code)
-
-        island_lines = ""
-        if islands:
-            island_lines = "\n\n🏝 <b>Weather Watch</b>\n"
-            for isl in islands:
-                island_lines += f"📍 <b>{isl['name']}</b> — {isl['outlook']}\n"
-
-        src_tag = f"\n<i>📡 Data: {source}</i>" if source else ""
-
-        caption = (
-            f"{greeting}\n\n"
-            f"{emoji} <b>{condition} — Malé, Maldives</b>\n"
-            f"🌡 <b>{temp}°C</b>  (Feels {feels}°C)  •  H:{temp_max}° L:{temp_min}°\n"
-            f"💧 Humidity {humidity}%  •  ☔ Rain {precip_p}%  •  ☀️ UV {uv}\n"
-            f"💨 Wind {wind} km/h" + (f" (gusts {round(current.get('windgust_10m',0))} km/h)" if current.get('windgust_10m',0) > wind else "") + "\n"
-            f"🌅 Sunrise {sunrise_str}  •  🌇 Sunset {sunset_str}\n\n"
-            f"{sea_line}"
-            f"{island_lines}\n"
-            f"📡 <b>Samuga Media</b> | @samugacommunity"
-            f"{src_tag}"
-        )
-        # Post to Telegram community
-        send_photo(TELEGRAM_CHANNEL_ID, card, caption)
-        log.info(f"\u2705 Weather card sent to Telegram ({time_of_day}) via {source}")
-
-        # Post to social media (FB + IG + X) in background
-        try:
-            card.seek(0)
-            queue_for_social(io.BytesIO(card.getvalue()), caption)
-            log.info(f"📲 Weather card queued for FB + IG + X ({time_of_day})")
-        except Exception as e:
-            log.error(f"Weather social post: {e}")
-
-        # Alert check after every regular card
-        should_alert, alert_type, alert_text = detect_weather_alert(data)
-        if should_alert:
-            log.info(f"\u26a0\ufe0f Alert detected: {alert_type}")
-            send_weather_alert(data, alert_type, alert_text)
-        else:
-            log.info("\u2705 No alert conditions detected")
-
-    except Exception as e:
-        log.error(f"Weather update: {e}")
-
-# ── Night Summary (12AM MVT) ──────────────────────────────────────────────────
 def send_night_summary():
     log.info("🌙 Night summary...")
     try:
@@ -6850,34 +2291,6 @@ def compute_topic_weights(days=28):
         weights[theme] = {"weight": weight, "median": round(med, 2),
                           "avg": round(avg, 2), "n": len(ss)}
 
-    # ── Rejection signal: penalise themes Uly consistently rejects ──────────
-    # Reads the learning table for rejected articles and nudges those themes down.
-    try:
-        rej_rows = db_execute("""
-            SELECT a.title, a.summary FROM learning l
-            JOIN articles a ON a.id = l.article_id
-            WHERE l.action = 'rejected'
-              AND l.logged_at > NOW() - INTERVAL %s
-        """, (f"{days} days",), fetch="all")
-        if rej_rows:
-            rej_theme_counts = {}
-            for title, summary in rej_rows:
-                for theme in _detect_themes(f"{title or ''} {summary or ''}"):
-                    rej_theme_counts[theme] = rej_theme_counts.get(theme, 0) + 1
-            total_rej = sum(rej_theme_counts.values()) or 1
-            for theme, rcount in rej_theme_counts.items():
-                if theme not in weights:
-                    continue
-                # Rejection penalty: proportional to rejection rate, max -5 pts nudge
-                rej_penalty = min(5, round(rcount / total_rej * 20))
-                if rej_penalty > 0:
-                    old_w = weights[theme]["weight"]
-                    weights[theme]["weight"] = max(-LEARN_CAP, old_w - rej_penalty)
-                    weights[theme]["rej"] = rcount
-            log.info(f"📉 Rejection signal applied: {len(rej_theme_counts)} themes penalised")
-    except Exception as e:
-        log.warning(f"Rejection signal skipped: {e}")
-
     kv_set("topic_weights", weights)
     kv_set("topic_weights_baseline", {"median": round(baseline, 2)})
     log.info(f"📊 Computed topic weights for {len(weights)} themes (baseline median {round(baseline)})")
@@ -6932,33 +2345,34 @@ def _top_gainers_losers(weights, n=4):
     return (g, l)
 
 def check_learning_readiness():
-    """Weekly: auto-activate learning once thresholds met; recompute weights if already on."""
+    """Weekly: if gate met and not yet asked, send the ONE-TIME readiness prompt."""
     if not DB_ENABLED:
         return
-    if learning_is_active():
-        # Already on — recompute weights every week so model stays fresh
-        compute_topic_weights()
-        log.info("🧠 Learning active — weights recomputed for this week")
-        return
     posted, weeks, valid = learning_stats()
+    already = kv_get("learning_prompt_sent", {"sent": False})
+    if learning_is_active() or (isinstance(already, dict) and already.get("sent")):
+        return
     if posted < LEARN_MIN_POSTS or weeks < LEARN_MIN_WEEKS or valid < LEARN_MIN_VALID_VIEWS:
-        log.info(f"🧪 Learning not ready yet: posts={posted}/{LEARN_MIN_POSTS} "
+        log.info(f"🧪 Learning not ready: posts={posted}/{LEARN_MIN_POSTS} "
                  f"weeks={weeks}/{LEARN_MIN_WEEKS} valid_views={valid}/{LEARN_MIN_VALID_VIEWS}")
         return
-    # Gate passed — auto-activate without waiting for manual /learning on
-    kv_set("learning_active", {"on": True, "by": "auto", "at": utcnow().isoformat()})
     weights = compute_topic_weights()
     gainers, losers = _top_gainers_losers(weights)
     msg = (
-        "🧠 <b>Learning mode auto-activated</b>\n\n"
-        f"Gate passed: <b>{posted}</b> posts · <b>{weeks}</b> weeks · <b>{valid}</b> with views.\n"
-        f"Audience engagement now nudges story scoring (±{LEARN_CAP} pts cap — never overrides serious news).\n\n"
-        "<b>Top performers:</b>\n" + (gainers or "  (gathering data)") + "\n\n"
-        "<b>Underperformers:</b>\n" + (losers or "  (gathering data)") + "\n\n"
-        "Turn off anytime: <code>/learning off</code>"
+        "🧠 <b>Learning mode ready</b>\n\n"
+        f"I've banked <b>{posted}</b> posts over <b>{weeks}</b> weeks, "
+        f"<b>{valid}</b> with real view counts.\n\n"
+        "<b>Top performers:</b>\n" + (gainers or "  (not enough data)") + "\n\n"
+        "<b>Underperformers:</b>\n" + (losers or "  (not enough data)") + "\n\n"
+        "If you approve, I'll let audience data <i>nudge</i> my posting decisions — "
+        f"capped at ±{LEARN_CAP} pts. It informs, it never overrides a serious story.\n\n"
+        "✅ <code>/learning on</code> to activate\n"
+        "📊 <code>/learning status</code> to see the numbers\n"
+        "<i>Ignore to stay observe-only. I won't ask again.</i>"
     )
     send_text(CORE_TEAM_CHAT_ID, msg, thread_id=ALERT_THREAD_ID)
-    log.info(f"🧠 Learning AUTO-ACTIVATED: {posted} posts, {weeks}w, {valid} with views")
+    kv_set("learning_prompt_sent", {"sent": True, "at": utcnow().isoformat()})
+    log.info("🧠 Readiness prompt sent to Content Lab (one-time).")
 
 # ── Weekly Analytics Report to Core Team ─────────────────────────────────────
 def send_weekly_analytics():
@@ -6989,13 +2403,12 @@ def send_weekly_analytics():
             + f"<b>Bot:</b> Samuga AI v{SAMUGA_VERSION}" + chr(10)
             + "Samuga Media | @samugacommunity"
         )
-        # ── Weekly learning cycle: refresh data → recompute weights → auto-activate if ready ──
+        # ── Phase 2: weekly engagement crunch + readiness ──
         learn_block = ""
         try:
-            backfill_tg_views()       # pull latest Telegram view counts
-            fetch_meta_insights()     # pull FB + IG engagement
-            check_learning_readiness()  # recompute weights + auto-activate if gate met
-            weights = kv_get("topic_weights", {})
+            backfill_tg_views()                      # refresh view counts (matured)
+            fetch_meta_insights()                    # refresh FB + IG engagement
+            weights = compute_topic_weights()        # recompute (stored, not yet acting)
             posted, weeks, valid = learning_stats()
             gainers, losers = _top_gainers_losers(weights)
             mode = "ACTIVE ✅" if learning_is_active() else "observing 👀"
@@ -7010,6 +2423,7 @@ def send_weekly_analytics():
         report = report + learn_block
 
         send_text(CORE_TEAM_CHAT_ID, report)
+        check_learning_readiness()                  # one-time prompt if gate met
         log.info("✅ Analytics report sent to core team")
     except Exception as e:
         log.error(f"Analytics report: {e}")
@@ -7265,7 +2679,7 @@ def get_sender_info(user_name, first_name):
 
 # ── Newsroom snapshot — cached 10 min, injected into brain when relevant ─────
 _snapshot_cache = {"data": None, "ts": None}
-_SNAPSHOT_TTL = 600  # 2 minutes
+_SNAPSHOT_TTL = 600  # 10 minutes
 
 def get_newsroom_snapshot():
     """
@@ -7544,6 +2958,26 @@ SAMUGA'S VOICE: Real stories, no filter, people first. The compass for the peopl
             return None
 
 # ── Chat Handler ──────────────────────────────────────────────────────────────
+# Per-user daily DM/search limit (resets at MVT midnight).
+DM_DAILY_LIMIT = int(os.environ.get("DM_DAILY_LIMIT", "20"))
+_dm_usage = {}  # user_id -> {"date": "YYYY-MM-DD", "count": int}
+
+
+def dm_check_and_increment(user_id):
+    """Check and increment a user's daily DM/search usage.
+    Returns (allowed, count, limit). When not allowed, the count is left at the
+    limit and not incremented further."""
+    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+    rec = _dm_usage.get(user_id)
+    if not rec or rec.get("date") != today:
+        rec = {"date": today, "count": 0}
+        _dm_usage[user_id] = rec
+    if rec["count"] >= DM_DAILY_LIMIT:
+        return False, rec["count"], DM_DAILY_LIMIT
+    rec["count"] += 1
+    return True, rec["count"], DM_DAILY_LIMIT
+
+
 def handle_updates():
     # Use persisted offset so we never miss messages across restarts
     offset = _poll_offset[0]
@@ -7727,7 +3161,7 @@ def handle_updates():
                                                     f"📡 <b>ސަމުގާ މީޑިއާ</b> | @samugacommunity"
                                                 )
                                                 card.seek(0)
-                                                # Queue handles Telegram + FB + IG + X with 2-min gap
+                                                # Queue handles Telegram + FB + IG + X with 10-min gap
                                                 # tg_ok=False initially — queue will post Telegram too
                                                 remember_post(_item["title"], _item["cat"], ts_now)
                                                 db_mark_status(_item.get("article_id",""), "posted", posted=True)
@@ -7763,7 +3197,7 @@ def handle_updates():
                                         threading.Thread(target=_process_dv, daemon=True).start()
                                         ok = True  # optimistic — thread handles actual result
                                     else:
-                                        # English — queue for Telegram + social (2-min gap)
+                                        # English — queue for Telegram + social (10-min gap)
                                         # EXCEPT breaking which fires immediately
                                         is_breaking_card = item.get("is_breaking", False)
                                         if is_breaking_card:
@@ -7780,7 +3214,7 @@ def handle_updates():
                                             )
                                             ok = tg_ok
                                         else:
-                                            # Regular — joins queue with 2-min gap
+                                            # Regular — joins queue with 10-min gap
                                             buf = io.BytesIO(item["card_bytes"])
                                             queue_for_social(
                                                 buf, item["caption"],
@@ -7977,9 +3411,9 @@ def handle_updates():
                                             lines.append("   Check GEMINI_API_KEY in Railway vars")
                                     else:
                                         lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ❌ GEMINI_API_KEY not set in Railway")
-                                    # 2. Source ladder health
+                                    # 2. Dhivehi feed check (RSS — expected to fail, kept for reference)
                                     dv_feeds = [f for f in LOCAL_FEEDS if f.get("lang")=="dv"]
-                                    lines.append(f"\n📡 <b>Local RSS health ({len(dv_feeds)} core Dhivehi feeds):</b>")
+                                    lines.append(f"\n📡 <b>Dhivehi RSS feeds ({len(dv_feeds)}) — now replaced by Telegram:</b>")
                                     for f in dv_feeds:
                                         try:
                                             parsed = feedparser.parse(f["url"])
@@ -7987,59 +3421,17 @@ def handle_updates():
                                             domain = f["url"].split("/")[2]
                                             status = f"✅ {n} items" if n > 0 else "❌ 0 items (blocked/down)"
                                             lines.append(f"  {status} — {domain}")
-                                        except Exception:
+                                        except Exception as fe:
                                             lines.append(f"  ❌ {f['url'].split('/')[2]}: error")
-
-                                    lines.append(f"\n🧗 <b>RSS recovery ladder:</b>")
-                                    try:
-                                        rss_recovery = fetch_local_rss_recovery(limit_per_source=2)
-                                        src_counts = {}
-                                        for a in rss_recovery:
-                                            src_counts[a.get("source", "Unknown")] = src_counts.get(a.get("source", "Unknown"), 0) + 1
-                                        if src_counts:
-                                            for src_name, cnt in sorted(src_counts.items()):
-                                                lines.append(f"  ✅ {src_name}: {cnt} backup item(s)")
-                                        else:
-                                            lines.append("  ⚠️ No RSS recovery items now — latest pages/Telegram still active")
-                                    except Exception as re_err:
-                                        lines.append(f"  ❌ RSS recovery error: {str(re_err)[:50]}")
-
-                                    lines.append(f"\n🌐 <b>Latest-page scraping:</b>")
-                                    try:
-                                        latest = fetch_latest_web_pages(limit_per_source=2)
-                                        counts = {}
-                                        for a in latest:
-                                            counts[a.get("source", "Unknown")] = counts.get(a.get("source", "Unknown"), 0) + 1
-                                        if counts:
-                                            for src_name, cnt in sorted(counts.items()):
-                                                lines.append(f"  ✅ {src_name}: {cnt} headline(s)")
-                                        else:
-                                            lines.append("  ⚠️ No latest-page headlines returned")
-                                    except Exception as we:
-                                        lines.append(f"  ❌ latest-page error: {str(we)[:50]}")
-
-                                    # 3. Telegram/local channels
-                                    lines.append(f"\n📲 <b>Telegram/local channels:</b>")
-                                    seen_handles = set()
+                                    # 3. Telegram Dhivehi channels
+                                    lines.append(f"\n📲 <b>Dhivehi Telegram channels:</b>")
                                     for ch in DV_TELEGRAM_CHANNELS:
-                                        if ch.get("handle") in seen_handles:
-                                            continue
-                                        seen_handles.add(ch.get("handle"))
                                         try:
                                             arts = fetch_dv_telegram(ch["handle"], ch["source"])
                                             dv_count = sum(1 for a in arts if a["lang"]=="dv")
-                                            ok = "✅" if len(arts) else "⚠️"
-                                            lines.append(f"  {ok} @{ch['handle']} / {ch['source']}: {len(arts)} items ({dv_count} Dhivehi)")
+                                            lines.append(f"  ✅ {ch['source']}: {len(arts)} items ({dv_count} Dhivehi)")
                                         except Exception as ce:
-                                            lines.append(f"  ❌ @{ch.get('handle','?')} / {ch['source']}: {str(ce)[:30]}")
-
-                                    lines.append(f"\n🌍 <b>World updates:</b>")
-                                    try:
-                                        world = fetch_world_updates(limit=3)
-                                        lines.append(f"  ✅ {len(world)} major world item(s) available")
-                                    except Exception as world_err:
-                                        lines.append(f"  ❌ World fetch error: {str(world_err)[:50]}")
-
+                                            lines.append(f"  ❌ {ch['source']}: {str(ce)[:30]}")
                                     # 4. Queue state
                                     dv_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="dv")
                                     en_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="en")
@@ -8842,6 +4234,84 @@ def _api_category(cat, title="", summary=""):
     except Exception:
         return (cat or "LOCAL").upper()
 
+
+def ensure_article_engine_body(article_id, title, summary, category,
+                               lang="en", is_breaking=False):
+    """Return a full website article body for an article, generating and
+    persisting one via Claude if the stored body is missing/too short."""
+    try:
+        body = generate_website_article_body(
+            title=title, summary=summary, category=category,
+            source=SAMUGA_PUBLIC_SOURCE, is_breaking=is_breaking
+        )
+    except Exception as e:
+        log.error(f"ensure_article_engine_body generate error: {e}")
+        body = ""
+    body = (body or "").strip()
+    if not body:
+        body = summary or title or ""
+    # Persist so we don't regenerate on every request.
+    try:
+        if article_id and body:
+            db_execute(
+                "UPDATE articles SET article_body=%s WHERE id=%s",
+                (body, article_id),
+            )
+    except Exception as e:
+        log.warning(f"ensure_article_engine_body persist skipped: {e}")
+    return body
+
+
+def _clean_article_engine_output(body, title=""):
+    """Clean a generated English article body for website/API rendering:
+    strip HTML/source links/stray title echo and normalize whitespace per
+    paragraph (preserving paragraph breaks)."""
+    body = str(body or "")
+    body = _html.unescape(body)
+    body = strip_source_links(body)
+    body = _api_re.sub(r"<[^>]+>", " ", body)
+    body = _api_re.sub(r"https?://\S+", "", body)
+    paras = []
+    for para in _api_re.split(r"\n\s*\n", body):
+        para = _api_re.sub(r"\s+", " ", para).strip()
+        if not para:
+            continue
+        # Drop a leading line that just repeats the title.
+        if title and para.lower() == title.strip().lower():
+            continue
+        paras.append(para)
+    return "\n\n".join(paras)[:6000]
+
+
+def related_articles_for_api(article_id, category, limit=4):
+    """Return a small list of related published articles in the same category
+    (excluding the current article) for the website 'related' rail."""
+    try:
+        rows = db_execute("""
+            SELECT id, title, category, posted_at, found_at, article_slug
+            FROM articles
+            WHERE category=%s
+              AND id<>%s
+              AND (status IN ('posted','published','social_posted') OR (status='queued' AND lang='en'))
+            ORDER BY COALESCE(posted_at, found_at) DESC NULLS LAST
+            LIMIT %s
+        """, (category, article_id, limit), fetch="all") or []
+    except Exception as e:
+        log.error(f"related_articles_for_api error: {e}")
+        return []
+    related = []
+    for r in rows:
+        rid, title, cat, posted_at, found_at, slug = r
+        dt = posted_at or found_at
+        related.append({
+            "id": rid,
+            "title": _api_clean_text(strip_source_links(title), 160),
+            "category": _api_category(cat),
+            "slug": slug or "",
+            "time": mvt_display_time(dt),
+        })
+    return related
+
 def _absolute_api_url(path):
     """Build full Railway URL for GitHub Pages."""
     return request.url_root.rstrip("/") + path
@@ -8878,7 +4348,7 @@ def api_health():
         if row:
             latest = {
                 "title": _api_clean_text(row[0], 160),
-                "time": mvt_display_time(row[1] or row[2]),
+                "time": (row[1] or row[2]).strftime("%d %b %Y • %H:%M") if (row[1] or row[2]) else "Recent",
                 "status": row[3]
             }
     except Exception as e:
@@ -8940,8 +4410,7 @@ def api_stories():
             safe_summary = _api_clean_text(strip_source_links(article_excerpt or summary), 420)
             if not safe_title:
                 continue
-
-            if not public_text_is_safe(safe_title, safe_summary):
+            if not public_text_is_safe(f"{safe_title}\n{safe_summary}"):
                 continue
 
             # Hide old broken Latin Thaana rows from the website feed.
@@ -9002,8 +4471,8 @@ def api_article():
 
         safe_title = _api_clean_text(strip_source_links(title), 500)
         safe_summary = _api_clean_text(strip_source_links(summary), 1800)
-        if not public_text_is_safe(safe_title, safe_summary, article_excerpt, article_body):
-            return jsonify({"error": "article safety cleanup pending"}), 404
+        if not public_text_is_safe(f"{safe_title}\n{safe_summary}"):
+            return jsonify({"error": "article failed public safety check"}), 404
         if looks_latin_thaana(f"{safe_title} {safe_summary}") and not _api_has_thaana(f"{safe_title} {safe_summary}"):
             return jsonify({"error": "article language cleanup pending"}), 404
         safe_category = _api_category(category, safe_title, safe_summary)
@@ -9044,7 +4513,7 @@ def api_article():
 # not from old model memory. It also cleans markdown so replies feel human.
 _PUBLIC_CHAT_RATE = {}  # ip -> [timestamps]
 _PUBLIC_CHAT_LIMIT = 12
-_PUBLIC_CHAT_WINDOW = 60 * 10  # 12 messages per 2 minutes per IP
+_PUBLIC_CHAT_WINDOW = 60 * 10  # 12 messages per 10 minutes per IP
 _PUBLIC_CHAT_MAX_CHARS = 600
 _PUBLIC_CHAT_BLOCKED_COMMANDS = [
     "/approve", "/approved", "/reject", "/confirm", "/cancel", "/ai ",
@@ -9127,7 +4596,9 @@ def _public_chat_latest_rows(lang=None, limit=8, hours=30):
         for title, summary, category, source, link, posted_at, found_at, row_lang, status in rows:
             safe_title = _api_clean_text(strip_source_links(title), 260)
             safe_summary = _api_clean_text(strip_source_links(summary), 520)
-            if not safe_title:
+            if not safe_title or not public_text_is_safe(f"{safe_title}\n{safe_summary}"):
+                continue
+            if not public_text_is_safe(f"{safe_title}\n{safe_summary}"):
                 continue
             detected = _api_lang(safe_title, safe_summary, row_lang)
             if lang in ("en", "dv") and detected != lang:
@@ -9560,6 +5031,185 @@ def start_api_server():
     log.info(f"🌐 Website API starting on port {port}")
     api_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
+
+
+# ── State Persistence (JSON fallback — survives Railway restarts) ─────────────
+import os as _os, json as _json, threading as _threading
+DATA_DIR   = "/data"
+_os.makedirs(DATA_DIR, exist_ok=True)
+SEEN_FILE  = _os.path.join(DATA_DIR, "seen_articles.json")
+STATE_FILE = _os.path.join(DATA_DIR, "bot_state.json")
+_state_lock = _threading.Lock()
+_poll_offset = [0]
+
+def load_seen():
+    try:
+        if _os.path.exists(SEEN_FILE):
+            with open(SEEN_FILE) as f: return set(_json.load(f))
+    except Exception as e: log.error(f"load_seen: {e}")
+    return set()
+
+def save_seen(seen):
+    try:
+        with open(SEEN_FILE,"w") as f: _json.dump(list(seen)[-1000:], f)
+    except Exception as e: log.error(f"save_seen: {e}")
+
+def _load_state():
+    try:
+        if _os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f: return _json.load(f)
+    except Exception as e: log.error(f"load_state: {e}")
+    return {}
+
+def _save_state(state):
+    try:
+        with _state_lock:
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as f: _json.dump(state, f)
+            _os.replace(tmp, STATE_FILE)
+    except Exception as e: log.error(f"save_state: {e}")
+
+def _serialize_social_counts():
+    sc = dict(social_post_counts)
+    if sc.get("date") and not isinstance(sc["date"], str):
+        sc["date"] = sc["date"].isoformat()
+    return sc
+
+def _serialize_approval_queue():
+    import base64
+    out = {}
+    for k, v in approval_queue.items():
+        item = dict(v)
+        if item.get("card_bytes"):
+            try:
+                item["card_bytes"] = base64.b64encode(item["card_bytes"]).decode()
+                item["_card_b64"] = True
+            except Exception:
+                item["card_bytes"] = None
+                item["_card_b64"] = False
+        item["created_at"] = item["created_at"].isoformat() if item.get("created_at") else None
+        out[k] = item
+    return out
+
+def persist_state():
+    """Snapshot all volatile state to disk."""
+    try:
+        sq_serialized = []
+        with _social_queue_lock:
+            for item in _social_queue:
+                sq_serialized.append({
+                    "img_bytes_b64": __import__("base64").b64encode(item["img_bytes"]).decode(),
+                    "caption": item["caption"],
+                    "queued_at": item["queued_at"].isoformat(),
+                    "article_id": item.get("article_id"),
+                    "title": item.get("title",""),
+                    "summary": item.get("summary",""),
+                    "cat": item.get("cat","LOCAL"),
+                    "source": item.get("source","Samuga Media"),
+                    "link": item.get("link",""),
+                    "lang": item.get("lang","en"),
+                    "is_breaking": item.get("is_breaking", False),
+                    "key_label": item.get("key_label","Post"),
+                    "tg_ok": item.get("tg_ok", False),
+                    "post_telegram": item.get("post_telegram", True),
+                    "notify_chat_id": item.get("notify_chat_id"),
+                    "notify_thread_id": item.get("notify_thread_id"),
+                })
+        state = {
+            "recent_story_titles": [(t, ts.isoformat()) for (t, ts) in recent_story_titles],
+            "recent_posts": recent_posts[-50:],
+            "analytics": analytics,
+            "daily_sports_count": daily_sports_count,
+            "daily_world_count": daily_world_count,
+            "daily_tourism_count": daily_tourism_count,
+            "social_post_counts": _serialize_social_counts(),
+            "polls_today": polls_today,
+            "last_regular_post_time": last_regular_post_time.isoformat() if last_regular_post_time else None,
+            "last_social_post_time": _last_social_post_time.isoformat() if _last_social_post_time else None,
+            "approval_counter": _approval_counter[0],
+            "approval_queue": _serialize_approval_queue(),
+            "poll_offset": _poll_offset[0],
+            "social_queue": sq_serialized,
+        }
+        _save_state(state)
+    except Exception as e:
+        log.error(f"persist_state: {e}")
+
+def restore_state():
+    """Load persisted state back into memory on startup."""
+    global recent_story_titles, recent_posts, analytics
+    global daily_sports_count, daily_world_count, daily_tourism_count
+    global social_post_counts, polls_today, last_regular_post_time
+    state = _load_state()
+    if not state:
+        log.info("📦 No saved state — starting fresh")
+        return
+    import base64
+    try:
+        recent_story_titles.clear()
+        for (t, ts) in state.get("recent_story_titles", []):
+            try: recent_story_titles.append((t, datetime.fromisoformat(ts)))
+            except Exception: pass
+        recent_posts.clear()
+        recent_posts.extend(state.get("recent_posts", []))
+        analytics.update(state.get("analytics", {}))
+        daily_sports_count.update(state.get("daily_sports_count", {}))
+        daily_world_count.update(state.get("daily_world_count", {}))
+        daily_tourism_count.update(state.get("daily_tourism_count", {}))
+        social_post_counts.update(state.get("social_post_counts", {}))
+        polls_today.update(state.get("polls_today", {}))
+        lrt = state.get("last_regular_post_time")
+        if lrt:
+            try: last_regular_post_time = datetime.fromisoformat(lrt)
+            except Exception: pass
+        _approval_counter[0] = state.get("approval_counter", 0)
+        _poll_offset[0] = state.get("poll_offset", 0)
+        global _last_social_post_time
+        lspt = state.get("last_social_post_time")
+        if lspt:
+            try: _last_social_post_time = datetime.fromisoformat(lspt)
+            except Exception: pass
+        sq = state.get("social_queue", [])
+        if sq:
+            import base64 as _b64
+            with _social_queue_lock:
+                for item in sq:
+                    try:
+                        _social_queue.append({
+                            "img_bytes": _b64.b64decode(item["img_bytes_b64"]),
+                            "caption": item["caption"],
+                            "queued_at": datetime.fromisoformat(item["queued_at"]),
+                            "article_id": item.get("article_id"),
+                            "title": item.get("title",""),
+                            "summary": item.get("summary",""),
+                            "cat": item.get("cat","LOCAL"),
+                            "source": item.get("source","Samuga Media"),
+                            "link": item.get("link",""),
+                            "lang": item.get("lang","en"),
+                            "is_breaking": item.get("is_breaking", False),
+                            "key_label": item.get("key_label","Post"),
+                            "tg_ok": item.get("tg_ok", False),
+                            "post_telegram": item.get("post_telegram", True),
+                            "notify_chat_id": item.get("notify_chat_id"),
+                            "notify_thread_id": item.get("notify_thread_id"),
+                        })
+                    except Exception: pass
+            log.info(f"📲 Social queue restored: {len(_social_queue)} post(s) waiting")
+        for k, item in state.get("approval_queue", {}).items():
+            try:
+                if item.get("_card_b64") and item.get("card_bytes"):
+                    item["card_bytes"] = base64.b64decode(item["card_bytes"])
+                item.pop("_card_b64", None)
+                item["created_at"] = datetime.fromisoformat(item["created_at"]) if item.get("created_at") else utcnow()
+                approval_queue[k] = item
+            except Exception as e:
+                log.error(f"restore approval {k}: {e}")
+        log.info(f"📦 State restored: {len(recent_story_titles)} dedup titles, "
+                 f"{len(approval_queue)} pending cards, {len(recent_posts)} recent posts")
+    except Exception as e:
+        log.error(f"restore_state: {e}")
+
+
 # ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import signal, atexit
@@ -9597,12 +5247,41 @@ if __name__ == "__main__":
     log.info("🧠 Core team brain: live newsroom awareness + persistent memory")
     log.info("💬 Smart chat: history, web search, Dhivehi support, story queries")
 
-    # Start social queue worker — drains one post every 2 minutes
+    # Start social queue worker — drains one post every 10 minutes
     threading.Thread(target=_social_queue_worker, daemon=True).start()
-    log.info("📲 Social queue worker started (2-min gap between posts)")
+    log.info("📲 Social queue worker started (10-min gap between posts)")
 
     init_database()  # connect to Postgres (falls back to JSON if unavailable)
     restore_state()  # bring back dedup memory, daily counters, pending cards, analytics
+
+
+    # Wire db module with shared functions
+    import db as _db
+    _db.utcnow       = utcnow
+    _db.ai           = ai
+    _db._gemini_post = _gemini_post
+    _db.send_text    = send_text
+    _db.GEMINI_API_KEY   = GEMINI_API_KEY
+    _db.CORE_TEAM_CHAT_ID = CORE_TEAM_CHAT_ID
+    _db.ALERT_THREAD_ID   = ALERT_THREAD_ID
+
+    # Wire scoring module with utcnow
+    import scoring as _sc
+    _sc.utcnow = utcnow
+
+    # Wire fetchers module with shared AI client
+    import fetchers as _ft
+    _ft.ai             = ai
+    _ft._gemini_post   = _gemini_post
+    _ft.GEMINI_API_KEY = GEMINI_API_KEY
+
+    # Wire weather module with shared functions (avoids circular imports)
+    import weather as _wx
+    _wx.send_photo      = send_photo
+    _wx.send_text       = send_text
+    _wx.queue_for_social = queue_for_social
+    _wx.utcnow          = utcnow
+    _wx.mvt_now         = mvt_now
     seen_on_start=load_seen()
     log.info(f"📚 Loaded {len(seen_on_start)} seen articles")
 
@@ -9613,7 +5292,7 @@ if __name__ == "__main__":
     scheduler.add_job(scheduled_check, "interval", minutes=15)
     # Breaking news fast check every 5 min (LOCAL/DISASTER only)
     scheduler.add_job(breaking_news_check, "interval", minutes=5)
-    # Approval lifecycle — English confidence auto-post, Dhivehi expires at 2h. Check every 5 min.
+    # Approval lifecycle — English auto-posts at 15min, Dhivehi expires at 2h. Check every 5 min.
     scheduler.add_job(expire_old_approvals, "interval", minutes=5)
     scheduler.add_job(release_content_lab_drip, "interval", minutes=10)
     # Morning brief 7AM MVT = 2AM UTC
