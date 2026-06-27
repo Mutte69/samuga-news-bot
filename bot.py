@@ -59,7 +59,7 @@ from db import (
     init_database, db_execute, db_record_article, db_mark_status,
     db_publish_article_for_website, db_log_learning,
     db_set_article_message, db_set_article_matchkey,
-    db_hide_article, db_unhide_article,
+    db_hide_article, db_unhide_article, db_hide_all_dhivehi,
     kv_get, kv_set, mem_add, mem_list, mem_clear_all, mem_delete_last,
     detect_trends, is_trending_topic, find_or_create_story,
     get_story_timeline, search_stories, get_active_stories,
@@ -686,6 +686,23 @@ def send_text(chat_id, text, reply_to=None, thread_id=None):
     if thread_id: payload["message_thread_id"]=thread_id
     try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",json=payload,timeout=15)
     except Exception as e: log.error(f"Send text: {e}")
+
+def delete_telegram_message(chat_id, message_id):
+    """Delete a Telegram message when the bot has rights in the chat."""
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage",
+            json={"chat_id": chat_id, "message_id": message_id},
+            timeout=15
+        )
+        data = r.json() if r.ok else {}
+        ok = bool(r.ok and data.get("ok"))
+        if not ok:
+            log.warning(f"deleteMessage failed: {str(data)[:200]}")
+        return ok
+    except Exception as e:
+        log.error(f"delete_telegram_message: {e}")
+        return False
 
 # ── Gemini Dhivehi Caption ────────────────────────────────────────────────────
 # Model fallback chain — newest first, fall back if quota/deprecated
@@ -2790,6 +2807,61 @@ def manual_publish_website_article(title, subheading="", category="LOCAL", sourc
         log.error(f"manual_publish_website_article: {e}")
         return None
 
+
+def manual_post_replied_article_to_website(reply_text, category_hint="LOCAL"):
+    """
+    Publish a human-written article from a replied Telegram message directly to the website.
+    First non-empty line = title. Remaining lines = body.
+    """
+    try:
+        raw = strip_source_links(str(reply_text or "")).strip()
+        if not raw:
+            return None, "Reply to the drafted article text first."
+        parts = [p.strip() for p in raw.split("\n") if p.strip()]
+        if not parts:
+            return None, "Reply text is empty."
+        title = parts[0][:220]
+        body = "\n\n".join(parts[1:]).strip() if len(parts) > 1 else title
+        lang = "dv" if is_dhivehi(title + " " + body) else "en"
+        safe_ok, safe_reason = contentlab_candidate_is_safe(title, body, "Samuga Media", lang)
+        if not safe_ok:
+            return None, f"Blocked by safety wall: {safe_reason}"
+        category = canonical_category(category_hint or "LOCAL", title, body)
+        base_id = "manualweb_" + hashlib.md5((title + "|" + body + "|" + str(utcnow())).encode()).hexdigest()[:12]
+        db_publish_article_for_website(
+            article_id=base_id,
+            title=title,
+            summary=body[:2500],
+            category=category,
+            source=SAMUGA_PUBLIC_SOURCE,
+            link=SAMUGA_CAPTION_LINK,
+            lang=lang,
+            score=195,
+            reliability=99,
+            is_breaking=(category in ("BREAKING","DISASTER"))
+        )
+        saved_id = base_id if lang != "dv" else f"{base_id}_dv"
+        try:
+            excerpt = make_article_excerpt(title, body, lang=lang)
+            db_execute(
+                "UPDATE articles SET article_body=%s, article_excerpt=%s, status='posted' WHERE id=%s",
+                (body, excerpt, saved_id)
+            )
+        except Exception as e:
+            log.warning(f"manual_post_replied_article_to_website body persist: {e}")
+        slug = make_article_slug(title, saved_id)
+        return {
+            "article_id": saved_id,
+            "slug": slug,
+            "title": title,
+            "body": body,
+            "category": category,
+            "lang": lang,
+        }, None
+    except Exception as e:
+        log.error(f"manual_post_replied_article_to_website: {e}")
+        return None, str(e)
+
 def needs_web_search(msg):
     # Skip search only for simple greetings / meta questions
     # Skip search for short messages or greetings
@@ -3327,6 +3399,9 @@ def handle_updates():
                 text=msg.get("text","") or msg.get("caption","")
                 photo=msg.get("photo")  # list of photo sizes if message has photo
                 video=msg.get("video") or msg.get("video_note")
+                reply_msg = msg.get("reply_to_message", {}) or {}
+                reply_text = reply_msg.get("text","") or reply_msg.get("caption","") or ""
+                reply_msg_id = reply_msg.get("message_id")
                 if not text and not photo and not video: continue
                 if not text: text=""
                 # Skip videos for card creation — only photos supported
@@ -3655,6 +3730,69 @@ def handle_updates():
                                 send_text(chat_id, f"👀 <b>Restored on website</b>\n\n{joined}", reply_to=msg_id, thread_id=thread_id)
                             else:
                                 send_text(chat_id, f"⚠️ No hidden website article found for <code>{ident}</code>", reply_to=msg_id, thread_id=thread_id)
+
+                        # /delete — reply to a bot message in Content Lab to delete it and remove queue item if present
+                        elif text.strip().lower() in ["/delete", "/del", "/remove"]:
+                            if not reply_msg_id:
+                                send_text(chat_id,
+                                    "Reply to the bot message you want deleted, then send <code>/delete</code>.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                removed_key = None
+                                try:
+                                    lower_reply = reply_text.lower()
+                                    m = re.search(r"\b((?:dv|en)\d+)\b", lower_reply)
+                                    if m and m.group(1) in approval_queue:
+                                        removed_key = m.group(1)
+                                        approval_queue.pop(removed_key, None)
+                                        persist_state()
+                                except Exception:
+                                    pass
+                                ok = delete_telegram_message(chat_id, reply_msg_id)
+                                if ok:
+                                    msg_text = "🗑️ <b>Deleted from Content Lab.</b>"
+                                    if removed_key:
+                                        msg_text += f" Queue item <code>{removed_key}</code> removed too."
+                                    send_text(chat_id, msg_text, reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id,
+                                        "⚠️ I couldn't delete that Telegram message. Check bot admin rights in the group.",
+                                        reply_to=msg_id, thread_id=thread_id)
+
+                        # /post to web — reply to a human-written article in Content Lab and publish it to website
+                        elif text.strip().lower() in ["/post to web", "/post web", "/posttoweb"]:
+                            if not reply_text.strip():
+                                send_text(chat_id,
+                                    "Reply to the written article first, then send <code>/post to web</code>.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                send_text(chat_id, "🌐 Publishing replied article to website... ⏳", reply_to=msg_id, thread_id=thread_id)
+                                result, err = manual_post_replied_article_to_website(reply_text, category_hint="LOCAL")
+                                if result:
+                                    send_text(
+                                        chat_id,
+                                        "🌐 <b>Posted to website</b>\n\n"
+                                        f"<b>{result['title']}</b>\n"
+                                        f"Category: {result['category']}\n"
+                                        f"Lang: {result['lang']}\n"
+                                        f"ID: <code>{result['article_id']}</code>\n"
+                                        f"Slug: <code>{result['slug']}</code>",
+                                        reply_to=msg_id, thread_id=thread_id
+                                    )
+                                else:
+                                    send_text(chat_id, f"❌ Website post failed: {err}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /hide_dv — hide all currently posted Dhivehi website articles
+                        elif text.strip().lower() in ["/hide_dv", "/hide dv", "/hide all dv"]:
+                            rows = db_hide_all_dhivehi()
+                            if rows:
+                                send_text(chat_id,
+                                    f"🙈 <b>Hidden Dhivehi website articles:</b> {len(rows)}",
+                                    reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                send_text(chat_id,
+                                    "ℹ️ No posted Dhivehi website articles found to hide.",
+                                    reply_to=msg_id, thread_id=thread_id)
 
                         # /buffercheck — test imgbb + Buffer connection live
                         elif text.strip().lower() in ["/buffercheck", "/socialcheck", "/checkbuffer"]:

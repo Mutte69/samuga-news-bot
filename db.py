@@ -533,6 +533,16 @@ def db_unhide_article(identifier):
     )
     return rows or []
 
+def db_hide_all_dhivehi():
+    """Hide all currently posted Dhivehi website articles."""
+    if not DB_ENABLED:
+        return []
+    rows = db_execute(
+        "UPDATE articles SET status='hidden' WHERE status='posted' AND lang='dv' RETURNING id, title",
+        fetch="all"
+    )
+    return rows or []
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Website article engine
 # ═══════════════════════════════════════════════════════════════════════════════
