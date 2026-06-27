@@ -19,7 +19,7 @@ Dependencies from bot.py (imported at bottom of bot.py's import block):
   TELEGRAM_CHANNEL_ID, CORE_TEAM_CHAT_ID, ALERT_THREAD_ID, TOMORROW_API_KEY
 """
 
-import os, io, logging, requests
+import os, io, logging, requests, threading, copy
 from datetime import datetime, timedelta
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
@@ -39,6 +39,51 @@ send_text       = None
 queue_for_social = None
 utcnow          = None
 mvt_now         = None
+
+# ── Weather cache / anti-rate-limit layer ─────────────────────────────────────
+# Goal:
+# - avoid hammering Tomorrow.io when /weather, /alert, scheduler, and previews
+#   ask for the same data within a short time window
+# - return stale cached data instead of failing silently when a provider is rate-limited
+WEATHER_CACHE_TTL_SECONDS = int(os.environ.get("WEATHER_CACHE_TTL_SECONDS", "300"))   # 5 min
+ISLAND_CACHE_TTL_SECONDS  = int(os.environ.get("ISLAND_CACHE_TTL_SECONDS",  "600"))   # 10 min
+PRAYER_CACHE_TTL_SECONDS  = int(os.environ.get("PRAYER_CACHE_TTL_SECONDS",  "21600")) # 6 hr
+
+_weather_cache_lock = threading.RLock()
+_weather_cache = {
+    "main": {"ts": None, "data": None},
+    "islands": {"ts": None, "data": None},
+    "prayer": {"ts": None, "data": None, "day_key": None},
+}
+
+def _cache_age_seconds(ts):
+    if not ts:
+        return 10**9
+    return (datetime.utcnow() - ts).total_seconds()
+
+def _cache_get(name, ttl=None, day_key=None):
+    with _weather_cache_lock:
+        slot = _weather_cache.get(name, {})
+        if day_key is not None and slot.get("day_key") != day_key:
+            return None
+        ts = slot.get("ts")
+        if ttl is not None and _cache_age_seconds(ts) > ttl:
+            return None
+        data = slot.get("data")
+        return copy.deepcopy(data) if data is not None else None
+
+def _cache_set(name, data, day_key=None):
+    with _weather_cache_lock:
+        _weather_cache[name] = {
+            "ts": datetime.utcnow(),
+            "data": copy.deepcopy(data),
+            "day_key": day_key,
+        }
+
+def _cache_get_stale(name):
+    with _weather_cache_lock:
+        data = _weather_cache.get(name, {}).get("data")
+        return copy.deepcopy(data) if data is not None else None
 
 def posting_paused():
     return os.environ.get("POSTING_PAUSED", "false").lower() == "true"
@@ -172,7 +217,7 @@ def get_daily_islamic_reminder(mvt_now):
     text, source = ISLAMIC_REMINDERS[day_index % len(ISLAMIC_REMINDERS)]
     return {"text": text, "source": source}
 
-def get_prayer_times():
+def get_prayer_times(force_refresh=False):
     """
     Fetch today's prayer times + Hijri date for Malé, Maldives.
     Uses AlAdhan API with exact Malé coordinates and Maldives-style calculation.
@@ -182,6 +227,12 @@ def get_prayer_times():
         from datetime import timezone as _tz
         mvt_now = datetime.now(_tz.utc) + timedelta(hours=5)
         date_str = mvt_now.strftime("%d-%m-%Y")
+
+        if not force_refresh:
+            cached = _cache_get("prayer", ttl=PRAYER_CACHE_TTL_SECONDS, day_key=date_str)
+            if cached:
+                log.info("🕌 Prayer times: cache hit")
+                return cached
 
         # Exact Malé coordinates + Maldives Islamic Ministry style calculation.
         # Maldives uses Shafi'i Asr, Fajr 19.5°, Isha 78 min after Maghrib.
@@ -247,7 +298,7 @@ def get_prayer_times():
             + (f" | {special_name}" if special_name else "")
         )
 
-        return {
+        result = {
             "prayers": prayers,
             "hijri_day": h_day,
             "hijri_month": h_month_name,
@@ -256,7 +307,13 @@ def get_prayer_times():
             "special_desc": special_desc,
             "reminder": reminder,
         }
+        _cache_set("prayer", result, day_key=date_str)
+        return result
     except Exception as e:
+        stale = _cache_get_stale("prayer")
+        if stale:
+            log.warning(f"Prayer times failed, using stale cache: {e}")
+            return stale
         log.error(f"Prayer times: {e}")
         return None
 
@@ -265,13 +322,19 @@ def get_prayer_times():
 # Weather data — Tomorrow.io primary, Open-Meteo fallback
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def get_weather_data():
+def get_weather_data(force_refresh=False):
     """
     Fetch current weather for Malé.
     Primary: Tomorrow.io (richer data — UV, wind gusts, visibility).
     Fallback: Open-Meteo (free, no key needed).
     Returns normalised dict or None.
     """
+    if not force_refresh:
+        cached = _cache_get("main", ttl=WEATHER_CACHE_TTL_SECONDS)
+        if cached:
+            log.info("🌤️ Weather cache hit")
+            return cached
+
     if TOMORROW_API_KEY:
         try:
             lat, lon = 4.1755, 73.5093
@@ -514,13 +577,19 @@ def _island_openmeteo_fallback(island, mvt_now_dt):
         "outlook": "Weather data unavailable",
     }
 
-def get_island_forecasts():
+def get_island_forecasts(force_refresh=False):
     """
     Fetch current conditions for all 5 islands.
     Primary: Tomorrow.io realtime + forecast.
     Fallback: Open-Meteo with hourly outlook.
     Returns list of dicts with keys: name, temp, wmo, wind, source, outlook
     """
+    if not force_refresh:
+        cached = _cache_get("islands", ttl=ISLAND_CACHE_TTL_SECONDS)
+        if cached:
+            log.info("🏝️ Island forecasts: cache hit")
+            return cached
+
     results = []
     from datetime import timezone as _tz
     mvt_now_dt = datetime.now(_tz.utc) + timedelta(hours=5)
@@ -572,7 +641,14 @@ def get_island_forecasts():
         if isl["name"] in by_name:
             ordered.append(by_name[isl["name"]])
     log.info(f"🏝️ Island forecasts: {len(ordered)}/{len(ISLAND_LOCATIONS)} fetched")
-    return ordered if ordered else None
+    if ordered:
+        _cache_set("islands", ordered)
+        return ordered
+    stale = _cache_get_stale("islands")
+    if stale:
+        log.warning("🏝️ Island forecasts empty — serving stale cached island data")
+        return stale
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

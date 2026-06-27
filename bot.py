@@ -4383,7 +4383,7 @@ def handle_updates():
 
                         # /weather — force send a weather card preview to core team
                         elif text.strip().lower() in ["/weather", "/wx"]:
-                            send_text(chat_id, "🌤️ Fetching weather + island data... ⏳",
+                            send_text(chat_id, "🌤️ Fetching weather + island data... ⏳ (cache-aware)",
                                       reply_to=msg_id, thread_id=thread_id)
                             def _send_weather_preview(_chat_id=chat_id, _thread_id=thread_id, _name=first_name):
                                 try:
