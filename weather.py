@@ -166,30 +166,99 @@ def weather_code_to_info(code):
 # Prayer times
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def get_daily_islamic_reminder(mvt_now):
+    """Pick a reminder that rotates by day — different each day, stable within a day."""
+    day_index = mvt_now.timetuple().tm_yday
+    text, source = ISLAMIC_REMINDERS[day_index % len(ISLAMIC_REMINDERS)]
+    return {"text": text, "source": source}
+
 def get_prayer_times():
-    """Fetch prayer times for Malé via Aladhan API. Returns dict or None."""
+    """
+    Fetch today's prayer times + Hijri date for Malé, Maldives.
+    Uses AlAdhan API with exact Malé coordinates and Maldives-style calculation.
+    Returns dict or None on failure.
+    """
     try:
         from datetime import timezone as _tz
-        now_mvt = datetime.now(_tz.utc) + timedelta(hours=5)
-        url = (f"https://api.aladhan.com/v1/timingsByCity"
-               f"?city=Male&country=MV&method=4"
-               f"&date={now_mvt.strftime('%d-%m-%Y')}")
+        mvt_now = datetime.now(_tz.utc) + timedelta(hours=5)
+        date_str = mvt_now.strftime("%d-%m-%Y")
+
+        # Exact Malé coordinates + Maldives Islamic Ministry style calculation.
+        # Maldives uses Shafi'i Asr, Fajr 19.5°, Isha 78 min after Maghrib.
+        # tune order: Imsak,Fajr,Sunrise,Dhuhr,Asr,Sunset,Maghrib,Isha,Midnight
+        MALE_LAT, MALE_LON = 4.1755, 73.5093
+        url = (f"https://api.aladhan.com/v1/timings/{date_str}"
+               f"?latitude={MALE_LAT}&longitude={MALE_LON}"
+               f"&method=99&methodSettings=19.5,null,78%20min"
+               f"&school=0"
+               f"&timezonestring=Indian/Maldives"
+               f"&tune=0,0,0,1,-3,0,-1,0,0")
         resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            timings = data.get("data", {}).get("timings", {})
-            hijri  = data.get("data", {}).get("date", {}).get("hijri", {})
-            return {
-                "fajr":    timings.get("Fajr", ""),
-                "dhuhr":   timings.get("Dhuhr", ""),
-                "asr":     timings.get("Asr", ""),
-                "maghrib": timings.get("Maghrib", ""),
-                "isha":    timings.get("Isha", ""),
-                "hijri":   hijri,
-            }
+        if resp.status_code != 200:
+            log.warning(f"Prayer times API: HTTP {resp.status_code} — trying fallback")
+            url2 = (f"https://api.aladhan.com/v1/timingsByCity/{date_str}"
+                    f"?city=Male&country=Maldives&method=4")
+            resp = requests.get(url2, timeout=10)
+            if resp.status_code != 200:
+                return None
+
+        d = resp.json().get("data", {})
+        timings = d.get("timings", {})
+        hijri   = d.get("date", {}).get("hijri", {})
+
+        def clean_t(t):
+            return t[:5] if t else "--:--"
+
+        prayers = {
+            "Fajr":    clean_t(timings.get("Fajr", "")),
+            "Dhuhr":   clean_t(timings.get("Dhuhr", "")),
+            "Asr":     clean_t(timings.get("Asr", "")),
+            "Maghrib": clean_t(timings.get("Maghrib", "")),
+            "Isha":    clean_t(timings.get("Isha", "")),
+        }
+
+        h_day = int(hijri.get("day", 0) or 0)
+        h_month_num = hijri.get("month", {}).get("number", 0)
+        h_month_name = hijri.get("month", {}).get("en", "")
+        h_year = hijri.get("year", "")
+
+        api_holidays = hijri.get("holidays", [])
+        special_name = api_holidays[0] if api_holidays else None
+        special_desc = ""
+
+        if special_name:
+            special_desc = SPECIAL_DAY_DETAILS.get(special_name, "")
+            if not special_desc:
+                key = (h_month_num, h_day)
+                if key in HIJRI_SPECIAL_DAYS:
+                    _, special_desc = HIJRI_SPECIAL_DAYS[key]
+        else:
+            key = (h_month_num, h_day)
+            if key in HIJRI_SPECIAL_DAYS:
+                special_name, special_desc = HIJRI_SPECIAL_DAYS[key]
+
+        reminder = None
+        if not special_name:
+            reminder = get_daily_islamic_reminder(mvt_now)
+
+        log.info(
+            f"🕌 Prayer times — Fajr {prayers['Fajr']} Dhuhr {prayers['Dhuhr']} "
+            f"Asr {prayers['Asr']} Maghrib {prayers['Maghrib']} Isha {prayers['Isha']}"
+            + (f" | {special_name}" if special_name else "")
+        )
+
+        return {
+            "prayers": prayers,
+            "hijri_day": h_day,
+            "hijri_month": h_month_name,
+            "hijri_year": h_year,
+            "special_name": special_name,
+            "special_desc": special_desc,
+            "reminder": reminder,
+        }
     except Exception as e:
         log.error(f"Prayer times: {e}")
-    return None
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
