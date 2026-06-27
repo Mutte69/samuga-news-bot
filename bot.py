@@ -179,10 +179,14 @@ SPORTS_FEEDS = [
     {"url": "https://news.google.com/rss/search?q=world+cup+2026+results&hl=en&gl=US&ceid=US:en",       "cat": "SPORTS", "lang": "en"},
 ]
 
-# WORLD (10%) — Only major international that affects Maldives or region
+# WORLD (10%) — Major international updates, plus Maldives/region impact.
+# Google News RSS is the most reliable fallback because many news sites change/block RSS.
 WORLD_FEEDS = [
-    {"url": "https://news.google.com/rss/search?q=war+conflict+crisis+2026&hl=en&gl=US&ceid=US:en",     "cat": "WORLD", "lang": "en"},
-    {"url": "https://news.google.com/rss/search?q=earthquake+tsunami+disaster&hl=en&gl=US&ceid=US:en",  "cat": "DISASTER", "lang": "en"},
+    {"url": "https://news.google.com/rss/search?q=major+world+news+war+crisis+ceasefire+earthquake+election&hl=en&gl=US&ceid=US:en", "cat": "WORLD", "lang": "en"},
+    {"url": "https://news.google.com/rss/search?q=Iran+US+Israel+Gaza+Russia+Ukraine+latest&hl=en&gl=US&ceid=US:en", "cat": "WORLD", "lang": "en"},
+    {"url": "https://news.google.com/rss/search?q=South+Asia+India+Sri+Lanka+Bangladesh+Maldives&hl=en-MV&gl=MV&ceid=MV:en", "cat": "WORLD", "lang": "en"},
+    {"url": "https://news.google.com/rss/search?q=global+economy+oil+prices+dollar+shipping+Indian+Ocean&hl=en&gl=US&ceid=US:en", "cat": "WORLD", "lang": "en"},
+    {"url": "https://news.google.com/rss/search?q=earthquake+tsunami+disaster+flood+cyclone+latest&hl=en&gl=US&ceid=US:en", "cat": "DISASTER", "lang": "en"},
 ]
 
 # LIFESTYLE (10%)
@@ -253,10 +257,10 @@ _ai_proactive_mode = True   # on by default — team can toggle
 # ── Universal Approval Queue (in-memory) ─────────────────────────────────────
 # Every card (English + Dhivehi) waits here for Content Lab approval before posting.
 # Cards expire after 2 hours if not approved.
-ENGLISH_AUTOPOST_SECONDS = 2700   # Regular: auto-post after 45 min if nobody reviews
-BREAKING_AUTOPOST_SECONDS = 1800  # Breaking held for confidence: auto-posts in 30 min
-TELEGRAM_GAP_SECONDS    = 7200   # 2 hours between regular Telegram posts
-DAILY_TG_POST_MAX       = 12     # Max regular posts per day to Telegram
+ENGLISH_AUTOPOST_SECONDS = 900    # Fallback: English auto-post after 15 min if no per-item delay is set
+BREAKING_AUTOPOST_SECONDS = 0     # Low-confidence breaking does NOT auto-post; it waits for Alert approval
+TELEGRAM_GAP_SECONDS    = 120    # 2 minutes between regular Telegram posts
+DAILY_TG_POST_MAX       = 30     # Strict selection target: normal 10-15/day, big days up to ~30
 DHIVEHI_EXPIRY_SECONDS   = 7200   # Dhivehi: expire (delete) after 2h if not approved
 
 approval_queue = {}  # key -> {card_bytes, caption, title, link, cat, lang, dv_text, created_at, ...}
@@ -340,105 +344,93 @@ def store_pending_approval(card_bytes, caption, title, link, cat="LOCAL", lang="
     persist_state()
     return key
 
+def _auto_publish_approval_item(key, item, reason="auto"):
+    """Publish an approved/auto-approved English card through the 2-minute social queue."""
+    try:
+        if not item or item.get("lang") == "dv":
+            return False
+        if item.get("_auto_published"):
+            return False
+        item["_auto_published"] = True
+        buf = io.BytesIO(item["card_bytes"])
+        queue_for_social(
+            buf, item["caption"],
+            key_label=f"{key.upper()} ({reason})",
+            tg_ok=False, post_telegram=True,
+            article_id=item.get("article_id"), title=item.get("title",""),
+            summary=item.get("summary",""), cat=item.get("cat","LOCAL"),
+            source=item.get("source","Samuga Media"), link=item.get("link",""),
+            lang=item.get("lang","en"), is_breaking=item.get("is_breaking", False)
+        )
+        send_text(
+            CORE_TEAM_CHAT_ID,
+            f"⏰ <b>{key.upper()}</b> auto-sent to 2-min social queue ({reason})\n"
+            f"📰 {item.get('title','')[:90]}",
+            thread_id=CONTENT_LAB_THREAD_ID
+        )
+        return True
+    except Exception as e:
+        log.error(f"Auto publish {key}: {e}")
+        return False
+
 def expire_old_approvals():
     """
-    Runs every few minutes:
-    - Breaking held (low confidence): auto-posts after 30 min if no team action
-    - Regular English: auto-posts after 45 min via queue
-    - Dhivehi breaking: auto-posts after 2h
-    - Regular Dhivehi: deleted after 2h
+    Approval lifecycle:
+    - Low-confidence breaking in Alert Chat does NOT auto-post; team must approve/reject.
+    - English high confidence can auto-post immediately after preview.
+    - English medium confidence auto-posts after 5 min.
+    - English lower confidence auto-posts after 15–30 min.
+    - Dhivehi never auto-posts for now; it expires after 2 hours.
     """
     now = utcnow()
+    changed = False
 
-    # Breaking held for confidence — auto-post after 30 min
-    breaking_held = [k for k, v in approval_queue.items()
-                     if v.get("lang") == "en"
-                     and v.get("is_breaking", False)
-                     and v.get("_held_for_confidence", False)
-                     and (now - v["created_at"]).total_seconds() > BREAKING_AUTOPOST_SECONDS]
-    for k in breaking_held:
-        item = approval_queue.pop(k)
-        log.info(f"⏰ Breaking {k} auto-posting (30min, no review): {item.get('title','')[:50]}")
-        try:
-            buf = io.BytesIO(item["card_bytes"])
-            queue_for_social(buf, item["caption"],
-                key_label=f"{k.upper()} (breaking auto)",
-                tg_ok=False, post_telegram=True, is_breaking=True,
-                article_id=item.get("article_id"), title=item.get("title",""),
-                summary=item.get("summary",""), cat=item.get("cat","BREAKING"),
-                source=item.get("source","Samuga Media"), link=item.get("link",""),
-                lang=item.get("lang","en"))
-            send_text(CORE_TEAM_CHAT_ID,
-                f"⏰ <b>{k.upper()} Breaking auto-posted</b> (30min, no review)\n"
-                f"📰 {item.get('title','')[:80]}",
-                thread_id=ALERT_THREAD_ID)
-        except Exception as e:
-            log.error(f"Breaking auto-post {k}: {e}")
+    # English confidence-based auto-post
+    en_due = []
+    for k, v in list(approval_queue.items()):
+        if v.get("lang") != "en":
+            continue
+        if v.get("_alert_only"):
+            continue
+        if not v.get("card_bytes"):
+            continue
+        delay = v.get("_autopost_after_seconds")
+        if delay is None:
+            delay = english_autopost_delay_seconds(v)
+        if delay is None:
+            continue
+        age = (now - v.get("created_at", now)).total_seconds()
+        if age >= int(delay):
+            en_due.append((k, v, int(delay)))
 
-    # Regular English auto-post after 45 min
-    en_due = [k for k, v in approval_queue.items()
-              if v.get("lang") == "en"
-              and not v.get("is_breaking", False)
-              and (now - v["created_at"]).total_seconds() > ENGLISH_AUTOPOST_SECONDS]
-    for k in en_due:
-        item = approval_queue.pop(k)
-        title = item.get("title","")[:50]
-        log.info(f"⏰ English {k} auto-queuing (45min, no review): {title}")
-        try:
-            buf = io.BytesIO(item["card_bytes"])
-            queue_for_social(buf, item["caption"],
-                key_label=f"{k.upper()} (auto)",
-                tg_ok=False, post_telegram=True,
-                article_id=item.get("article_id"), title=item.get("title",""),
-                summary=item.get("summary",""), cat=item.get("cat","LOCAL"),
-                source=item.get("source","Samuga Media"), link=item.get("link",""),
-                lang=item.get("lang","en"), is_breaking=item.get("is_breaking", False))
-            send_text(CORE_TEAM_CHAT_ID,
-                f"⏰ <b>{k.upper()}</b> auto-posted (45min, no review)\n📰 {item.get('title','')[:80]}",
-                thread_id=ALERT_THREAD_ID)
-        except Exception as e:
-            log.error(f"Auto-post queue {k}: {e}")
+    for k, item, delay in en_due:
+        if k not in approval_queue:
+            continue
+        approval_queue.pop(k, None)
+        reason = "instant high-confidence" if delay <= 0 else f"{max(1, delay//60)}min no review"
+        log.info(f"⏰ English {k} auto-queueing ({reason}): {item.get('title','')[:55]}")
+        if _auto_publish_approval_item(k, item, reason=reason):
+            changed = True
 
-    # Dhivehi expiry — breaking ones auto-post after 2h, regular ones delete
+    # Dhivehi expiry — no auto-post for now
     dv_due = [k for k, v in approval_queue.items()
-              if v["lang"] == "dv" and (now - v["created_at"]).total_seconds() > DHIVEHI_EXPIRY_SECONDS]
+              if v.get("lang") == "dv"
+              and (now - v.get("created_at", now)).total_seconds() > DHIVEHI_EXPIRY_SECONDS]
     for k in dv_due:
-        item = approval_queue.pop(k)
-        title = item.get("title","")[:40]
-        # Breaking Dhivehi with auto-post flag → post automatically
-        if item.get("_auto_post_breaking") and item.get("dv_text"):
-            log.info(f"⏰ Breaking Dhivehi {k} auto-posting after 2h: {title}")
-            try:
-                kw = item.get("keyword","local")
-                bg = item.get("_bg_image") or fetch_background_image(kw, cat=item.get("cat"), title=item.get("title",""))
-                ts_now = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
-                card = generate_card(item["dv_text"], SAMUGA_PUBLIC_SOURCE, ts_now, item.get("cat","BREAKING"), bg)
-                full_caption = (
-                    f"🇲🇻 <b>{item['title']}</b>\n\n"
-                    f"{item['dv_text']}\n\n"
-                    f"📡 <b>ސަމުގާ މީޑިއާ</b> | @samugacommunity"
-                )
-                card.seek(0)
-                tg_ok = send_to_telegram(card, full_caption)
-                if tg_ok:
-                    card.seek(0)
-                    queue_for_social(io.BytesIO(card.getvalue()), full_caption,
-                                     key_label=k.upper(), tg_ok=True,
-                                     article_id=item.get("article_id"), title=item.get("title",""),
-                                     summary=item.get("summary",""), cat=item.get("cat","BREAKING"),
-                                     source=item.get("source","Samuga Media"), link=item.get("link",""),
-                                     lang="dv", is_breaking=True)
-                    send_text(CORE_TEAM_CHAT_ID,
-                        f"⏰ <b>{k.upper()} Breaking Dhivehi auto-posted</b> (2h, no review)\n"
-                        f"📰 {item['title'][:70]}",
-                        thread_id=ALERT_THREAD_ID)
-                    log.info(f"⏰ Breaking Dhivehi {k} auto-posted to community")
-            except Exception as e:
-                log.error(f"Breaking DV auto-post {k}: {e}")
-        else:
-            log.info(f"⏰ Dhivehi {k} expired (2h, not breaking, deleted): {title}")
+        item = approval_queue.pop(k, None)
+        if not item:
+            continue
+        log.info(f"⏰ Dhivehi {k} expired (2h, no auto-post): {item.get('title','')[:55]}")
+        send_text(
+            CORE_TEAM_CHAT_ID,
+            f"⏰ <b>{k.upper()}</b> Dhivehi card expired after 2h\n"
+            f"📰 {item.get('title','')[:90]}\n"
+            f"<i>Dhivehi auto-post is disabled for now.</i>",
+            thread_id=CONTENT_LAB_THREAD_ID
+        )
+        changed = True
 
-    if en_due or dv_due:
+    if changed:
         persist_state()
 
 # Backwards-compat alias (old code references dhivehi_pending)
@@ -505,6 +497,68 @@ BREAKING_BLACKLIST = [
     "civil war","squad","team","player","match","game","season","transfer",
     "economy","business","market","price","investment","opening","launch","event"
 ]
+
+# ── World-news gate: allow only major global stories, not random foreign filler.
+# Samuga should carry world updates when they are big enough for Maldivians to ask about
+# or when they affect the region/economy/travel/safety.
+WORLD_MAJOR_KEYWORDS = [
+    "war", "ceasefire", "airstrike", "missile", "attack", "invasion", "conflict",
+    "earthquake", "tsunami", "cyclone", "flood", "volcano", "disaster",
+    "election", "president", "prime minister", "government collapsed", "coup",
+    "oil price", "dollar", "global economy", "shipping", "red sea", "indian ocean",
+    "iran", "israel", "gaza", "palestine", "ukraine", "russia", "india", "sri lanka",
+    "china", "us", "united states", "uk", "un", "world bank", "imf",
+    "travel ban", "airport closed", "flight cancelled", "visa", "pandemic", "outbreak"
+]
+
+def is_major_world_news_text(text):
+    """True when a global story is important enough for Samuga public updates."""
+    t = (text or "").lower()
+    if any(k in t for k in ["world cup", "premier league", "champions league", "celebrity", "movie", "concert"]):
+        return False
+    return any(k in t for k in WORLD_MAJOR_KEYWORDS)
+
+# ── Source Ladder configs ───────────────────────────────────────────────────
+# Local RSS often returns 403/empty in Maldives, so every source has fallbacks:
+# RSS candidates → latest webpage scrape → public Telegram → Google News backup.
+RSS_CANDIDATE_PATHS = ["/feed", "/rss", "/rss.xml", "/feed.xml", "/index.xml", "/en/feed", "/rss/news"]
+
+LOCAL_RSS_RECOVERY_SOURCES = [
+    {"domain": "https://mihaaru.com",        "source": "Mihaaru", "cat": "LOCAL", "lang": "dv"},
+    {"domain": "https://avas.mv",            "source": "Avas",    "cat": "LOCAL", "lang": "dv"},
+    {"domain": "https://sun.mv",             "source": "Sun",     "cat": "LOCAL", "lang": "dv"},
+    {"domain": "https://sunonline.mv",       "source": "Sun",     "cat": "LOCAL", "lang": "dv"},
+    {"domain": "https://english.sun.mv",     "source": "Sun",     "cat": "LOCAL", "lang": "en"},
+    {"domain": "https://psmnews.mv",         "source": "PSM News","cat": "LOCAL", "lang": "en"},
+    {"domain": "https://edition.mv",         "source": "Edition", "cat": "LOCAL", "lang": "en"},
+    {"domain": "https://raajje.mv",          "source": "Raajje",  "cat": "LOCAL", "lang": "dv"},
+    {"domain": "https://voice.mv",           "source": "VoiceMV", "cat": "LOCAL", "lang": "dv"},
+]
+
+LOCAL_GOOGLE_BACKUP_FEEDS = [
+    {"url": "https://news.google.com/rss/search?q=site:mihaaru.com+Maldives&hl=dv-MV&gl=MV&ceid=MV:dv", "cat": "LOCAL", "lang": "dv", "source": "Mihaaru via Google"},
+    {"url": "https://news.google.com/rss/search?q=site:avas.mv+Maldives&hl=dv-MV&gl=MV&ceid=MV:dv", "cat": "LOCAL", "lang": "dv", "source": "Avas via Google"},
+    {"url": "https://news.google.com/rss/search?q=site:sun.mv+Maldives+OR+site:english.sun.mv+Maldives&hl=en-MV&gl=MV&ceid=MV:en", "cat": "LOCAL", "lang": "en", "source": "Sun via Google"},
+    {"url": "https://news.google.com/rss/search?q=site:psmnews.mv+Maldives&hl=en-MV&gl=MV&ceid=MV:en", "cat": "LOCAL", "lang": "en", "source": "PSM via Google"},
+    {"url": "https://news.google.com/rss/search?q=site:raajje.mv+Maldives&hl=en-MV&gl=MV&ceid=MV:en", "cat": "LOCAL", "lang": "en", "source": "Raajje via Google"},
+]
+
+def parse_extra_telegram_sources():
+    """Optional env: SAMUGA_EXTRA_TG_CHANNELS='handle:Source:lang:reliability,handle2:Source2:dv:85'"""
+    out = []
+    raw = os.environ.get("SAMUGA_EXTRA_TG_CHANNELS", "").strip()
+    if not raw:
+        return out
+    for part in raw.split(","):
+        bits = [b.strip() for b in part.split(":")]
+        if len(bits) >= 2 and bits[0] and bits[1]:
+            out.append({
+                "handle": bits[0].lstrip("@"),
+                "source": bits[1],
+                "lang_hint": bits[2] if len(bits) >= 3 and bits[2] else "auto",
+                "reliability": int(bits[3]) if len(bits) >= 4 and bits[3].isdigit() else 80,
+            })
+    return out
 
 # ── PostgreSQL Database Layer (v6) ────────────────────────────────────────────
 # Railway auto-injects DATABASE_URL when Postgres is in the project.
@@ -606,6 +660,36 @@ def init_database():
                         content     TEXT NOT NULL,
                         added_by    TEXT,          -- who added it
                         created_at  TIMESTAMPTZ DEFAULT NOW()
+                    );
+                """)
+                # Public Samuga AI chat analytics — one public brain across Website, Telegram, and future WhatsApp.
+                # This stores what people ask, so Samuga can learn public interest trends.
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public_chat_messages (
+                        id            SERIAL PRIMARY KEY,
+                        platform      TEXT,
+                        session_id    TEXT,
+                        user_key      TEXT,
+                        user_message  TEXT,
+                        bot_reply     TEXT,
+                        lang          TEXT,
+                        intent        TEXT,
+                        topics        TEXT[],
+                        used_search   BOOLEAN DEFAULT FALSE,
+                        created_at    TIMESTAMPTZ DEFAULT NOW()
+                    );
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_public_chat_created ON public_chat_messages(created_at);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_public_chat_platform ON public_chat_messages(platform);")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_public_chat_intent ON public_chat_messages(intent);")
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS public_interest_daily (
+                        day           DATE,
+                        topic         TEXT,
+                        platform      TEXT,
+                        count         INTEGER DEFAULT 0,
+                        updated_at    TIMESTAMPTZ DEFAULT NOW(),
+                        PRIMARY KEY (day, topic, platform)
                     );
                 """)
                 # Phase 4: STORY INTELLIGENCE — ongoing story threads ("Story #248")
@@ -760,6 +844,16 @@ def db_publish_article_for_website(article_id, title="", summary="", category="L
 
     public_title = strip_source_links(title or "")[:500]
     public_summary = samuga_public_summary(public_title, summary or "")[:2600]
+
+    # Quality gate: never publish Latin Thaana as broken English/Dhivehi.
+    # Gemini converts it to proper English or Thaana. If conversion fails, hold it back.
+    public_title, public_summary, lang, lang_ok = normalize_article_language_for_public(
+        public_title, public_summary, lang=lang
+    )
+    if not lang_ok:
+        log.warning(f"🌐 Website publish held — language cleanup failed: {public_title[:70]}")
+        return
+
     public_link = SAMUGA_PUBLIC_LINK
     public_source = SAMUGA_PUBLIC_SOURCE
     safe_cat = canonical_category(category or "LOCAL", public_title, public_summary)
@@ -1754,6 +1848,15 @@ SOURCE_RELIABILITY = {
     "oneonline":   80,
     "maldivesvoice": 78,
     "visitmaldives": 75,
+    "voice":       80,
+    "raajje":      82,
+    "police":      94,
+    "mndf":        94,
+    "thepress":    78,
+    "world news":  70,
+    "reuters":     82,
+    "ap":          82,
+    "bbc":         80,
     "google news": 55,  # aggregator — least trusted, often duplicates
 }
 DEFAULT_RELIABILITY = 60
@@ -1804,15 +1907,140 @@ def add_to_conversation(uid, role, content):
 def get_mvt_hour(): return (utcnow().hour + 5) % 24
 def is_day_mode(): return 6 <= get_mvt_hour() < 22
 
-def is_fresh(entry, hours=24):
+def _parse_any_datetime(value):
+    """Best-effort datetime parser for RSS, Telegram ISO strings, and article dicts."""
     try:
-        pub = entry.get("published","")
-        if pub:
-            dt = parsedate_to_datetime(pub)
-            if dt.tzinfo: dt = dt.replace(tzinfo=None)
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            s = str(value).strip()
+            if not s:
+                return None
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            try:
+                dt = datetime.fromisoformat(s)
+            except Exception:
+                dt = parsedate_to_datetime(s)
+        if getattr(dt, "tzinfo", None):
+            dt = dt.astimezone(_tz.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+def entry_published_dt(entry):
+    """Extract published timestamp from feedparser entry."""
+    for key in ("published", "updated", "created"):
+        dt = _parse_any_datetime(entry.get(key, ""))
+        if dt:
+            return dt
+    return None
+
+def is_fresh(entry, hours=12):
+    """RSS freshness gate. 12h+ is never treated as new; unknown dates pass to source-specific gates."""
+    try:
+        dt = entry_published_dt(entry)
+        if dt:
             return utcnow() - dt < timedelta(hours=hours)
-    except Exception as e: log.debug(f"is_fresh parse: {e}")
+    except Exception as e:
+        log.debug(f"is_fresh parse: {e}")
     return True
+
+def article_published_at(article):
+    """Return article published datetime when known. Unknown homepage items are treated as just discovered."""
+    return _parse_any_datetime((article or {}).get("published")) or _parse_any_datetime((article or {}).get("found_at")) or utcnow()
+
+def article_age_minutes(article):
+    try:
+        return max(0, (utcnow() - article_published_at(article)).total_seconds() / 60)
+    except Exception:
+        return 0
+
+def freshness_bonus(article):
+    """
+    Freshness scoring:
+    0–10m huge boost, 10–30m strong, 30–90m okay,
+    90m–4h only important, 4h+ usually skip, 12h+ never new.
+    """
+    age = article_age_minutes(article)
+    if age <= 10: return 60
+    if age <= 30: return 42
+    if age <= 90: return 22
+    if age <= 240: return 0
+    if age <= 720: return -45
+    return -999
+
+def freshness_label(article):
+    age = article_age_minutes(article)
+    if age < 2: return "just now"
+    if age < 60: return f"{int(age)}m old"
+    return f"{age/60:.1f}h old"
+
+def should_skip_for_freshness(article, score=None, breaking=False):
+    """Strict recency gate so Samuga stops posting old stories as latest."""
+    score = score if score is not None else score_article(article)
+    age = article_age_minutes(article)
+    text = ((article or {}).get("title","") + " " + (article or {}).get("summary","")).lower()
+    developing = any(k in text for k in ["update", "developing", "confirmed", "court", "minister", "president", "parliament", "police", "mndf", "breaking"])
+    if age > 720:
+        return True, f"too old ({age/60:.1f}h)"
+    if age > 240 and not (breaking or score >= 185 or developing):
+        return True, f"older than 4h and not important enough ({age/60:.1f}h, score {score})"
+    if age > 90 and not (breaking or score >= 145 or developing):
+        return True, f"older than 90m and not strong enough ({age:.0f}m, score {score})"
+    return False, ""
+
+def should_skip_low_value(article):
+    """Skip weak/duplicate/low-value stories before Content Lab or website."""
+    if not article:
+        return True, "empty article"
+    title = article.get("title","")
+    summary = article.get("summary","")
+    cat = article.get("cat","LOCAL")
+    text = (title + " " + summary).lower()
+    if len(title.strip()) < 12:
+        return True, "title too short"
+    if _looks_like_ad(text):
+        return True, "ad/promo"
+    # Keep public website/social Maldives-focused; public chat can answer global questions separately.
+    mv_terms = ["maldives","maldivian","raajje","dhivehi","male","malé","hulhumale","atoll","island","mvr","rufiyaa","majlis","mndf","police","president","minister"]
+    if cat in ("WORLD", "DISASTER") and not any(t in text for t in mv_terms):
+        if not is_major_world_news_text(text):
+            return True, "global story without Maldives angle or major-world signal"
+    score = score_article(article)
+    breaking = is_breaking(title, summary, cat)
+    skip_old, reason = should_skip_for_freshness(article, score=score, breaking=breaking)
+    if skip_old:
+        return True, reason
+    min_score = 60 if breaking else 105
+    if score < min_score:
+        return True, f"low score {score} < {min_score}"
+    return False, ""
+
+def english_autopost_delay_seconds(item_or_article):
+    """
+    Confidence-based English auto-post:
+    - Very high confidence/priority: immediately after Content Lab preview
+    - Medium confidence: 5 minutes
+    - Lower confidence: 15–30 minutes
+    Dhivehi never auto-posts here.
+    """
+    lang = (item_or_article or {}).get("lang", "en")
+    if lang == "dv":
+        return None
+    priority = int((item_or_article or {}).get("_priority") or (item_or_article or {}).get("score") or 0)
+    confidence = int((item_or_article or {}).get("_confidence") or 0)
+    if (item_or_article or {}).get("is_breaking") and confidence >= 55:
+        return 0
+    if confidence >= 85 and priority >= 155:
+        return 0
+    if confidence >= 70:
+        return 300
+    if confidence >= 55:
+        return 900
+    return 1800
 
 def is_breaking(title, summary="", cat=""):
     text = (title + " " + summary).lower()
@@ -1865,8 +2093,8 @@ def increment_cat_count(counter_dict):
 def can_post_regular():
     """
     Returns True only if:
-    1. At least 2 hours have passed since last regular post, AND
-    2. Daily regular post cap (12) hasn't been hit.
+    1. At least 2 minutes have passed since last regular post, AND
+    2. Daily regular post cap has not been hit.
     Breaking news ignores this entirely.
     """
     global last_regular_post_time
@@ -1892,10 +2120,10 @@ def allowed_for_social(article):
     if cat in ["SPORTS", "FOOTBALL", "WEATHER", "TOURISM"]:
         return False
     if cat == "WORLD":
-        # Only Maldives-relevant world news
+        # Maldives/region/economy relevant OR major global story. Daily world cap still limits volume.
         text = (article["title"] + " " + article.get("summary","")).lower()
-        mv_terms = ["maldives","indian ocean","south asia","india","china","un ","dollar","oil price","global economy"]
-        return any(t in text for t in mv_terms)
+        mv_terms = ["maldives","indian ocean","south asia","india","sri lanka","china","un ","dollar","oil price","global economy"]
+        return any(t in text for t in mv_terms) or is_major_world_news_text(text)
     # LOCAL and DISASTER always allowed
     return True
 
@@ -1913,12 +2141,12 @@ def is_day_social():
     return 6 <= h < 22
 
 def can_post_social():
-    """Check if social daily limit not reached: 20 posts 6AM-10PM, 5 posts night"""
+    """Check if social daily limit not reached: 30 posts 6AM-10PM, 5 posts night"""
     global social_post_counts
     today = mvt_now().date()
     if social_post_counts["date"] != today:
         social_post_counts = {"date": today, "count": 0}
-    limit = 20 if is_day_social() else 3
+    limit = 30 if is_day_social() else 5
     return social_post_counts["count"] < limit
 
 def increment_social_count():
@@ -1928,7 +2156,7 @@ def increment_social_count():
         social_post_counts = {"date": today, "count": 0}
     social_post_counts["count"] += 1
     persist_state()
-    log.info(f"📊 Social posts today: {social_post_counts['count']} ({'day' if is_day_social() else 'night'} limit: {20 if is_day_social() else 3})")
+    log.info(f"📊 Social posts today: {social_post_counts['count']} ({'day' if is_day_social() else 'night'} limit: {30 if is_day_social() else 5})")
 
 # ── Gemini Translate ──────────────────────────────────────────────────────────
 def gemini_translate(text):
@@ -1957,24 +2185,64 @@ def _looks_like_ad(text):
     has_price = bool(_re.search(r"\b\d+\s*(mvr|rf|rufiyaa|usd|\$)\b", t))
     return hits >= 2 or (hits >= 1 and (has_phone or has_price))
 
+
+def _html_unescape(text):
+    try:
+        import html
+        return html.unescape(text or "")
+    except Exception:
+        return str(text or "")
+
+def _extract_telegram_messages(html_text, limit=12):
+    """
+    Extract public Telegram channel messages with their real timestamp.
+    This prevents old t.me/s posts from being treated as fresh on every deploy.
+    """
+    import re as _re
+    blocks = _re.findall(r'<div class="tgme_widget_message[^>]*?>(.*?)(?=<div class="tgme_widget_message|</section>|\Z)', html_text, _re.DOTALL)
+    out = []
+    for block in blocks:
+        txt_m = _re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', block, _re.DOTALL)
+        if not txt_m:
+            continue
+        raw = txt_m.group(1)
+        clean = _re.sub(r"<br\s*/?>", "\n", raw)
+        clean = _re.sub(r"<[^>]+>", "", clean).strip()
+        clean = _html_unescape(clean)
+        dt = None
+        time_m = _re.search(r'<time[^>]+datetime="([^"]+)"', block)
+        if time_m:
+            dt = _parse_any_datetime(time_m.group(1))
+        out.append((clean, dt or utcnow()))
+        if len(out) >= limit:
+            break
+    # Fallback for Telegram HTML changes
+    if not out:
+        texts = _re.findall(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', html_text, _re.DOTALL)
+        dates = [_parse_any_datetime(x) for x in _re.findall(r'<time[^>]+datetime="([^"]+)"', html_text)]
+        for i, raw in enumerate(texts[:limit]):
+            clean = _re.sub(r"<br\s*/?>", "\n", raw)
+            clean = _re.sub(r"<[^>]+>", "", clean).strip()
+            clean = _html_unescape(clean)
+            out.append((clean, dates[i] if i < len(dates) and dates[i] else utcnow()))
+    return out[:limit]
+
 def fetch_mvcrisis():
     """Scrape MvCrisis public Telegram channel — filters ads, only keeps real news."""
     try:
         resp = requests.get("https://t.me/s/mvcrisis", timeout=10,
                            headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code != 200: return []
-        import re as _re, hashlib
-        texts = _re.findall(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', resp.text, _re.DOTALL)
+        if resp.status_code != 200:
+            return []
         articles = []
         skipped_ads = 0
-        for raw in texts[:15]:
-            text = _re.sub(r"<[^>]+>", "", raw).strip()
-            text = text.replace("&amp;","&").replace("&#39;","'").replace("&quot;",'"')
-            if len(text) < 25: continue
+        for text, published in _extract_telegram_messages(resp.text, limit=15):
+            if len(text) < 25:
+                continue
             if _looks_like_ad(text):
                 skipped_ads += 1
                 continue
-            art_id = "mvc_" + hashlib.md5(text[:60].encode()).hexdigest()[:8]
+            art_id = "mvc_" + hashlib.md5((text[:80] + str(published)).encode()).hexdigest()[:10]
             lang = "dv" if any("ހ" <= ch <= "޿" for ch in text) else "en"
             articles.append({
                 "id": art_id,
@@ -1984,7 +2252,7 @@ def fetch_mvcrisis():
                 "source": "MvCrisis",
                 "cat": "LOCAL",
                 "lang": lang,
-                "published": utcnow()
+                "published": published
             })
         log.info(f"📡 MvCrisis: {len(articles)} news kept, {skipped_ads} ads skipped")
         return articles
@@ -1997,18 +2265,45 @@ def fetch_mvcrisis():
 # and scrapeable — same technique as MvCrisis. Each returns native Dhivehi text.
 
 DV_TELEGRAM_CHANNELS = [
-    {"handle": "mihaarulive",  "source": "Mihaaru",   "reliability": 95},
-    {"handle": "avasonline",   "source": "Avas",      "reliability": 88},
-    {"handle": "raajjemvlive", "source": "Raajje",    "reliability": 85},
-    {"handle": "voicemaldives","source": "VoiceMV",   "reliability": 80},
-    {"handle": "mvplusmedia",  "source": "MV+",       "reliability": 82},
+    # Keep multiple known/likely handles where needed. /diag will show which ones work.
+    {"handle": "mihaarulive",      "source": "Mihaaru",   "reliability": 95},
+    {"handle": "mihaaru",          "source": "Mihaaru",   "reliability": 95},
+    {"handle": "avasonline",       "source": "Avas",      "reliability": 88},
+    {"handle": "avasmv",           "source": "Avas",      "reliability": 88},
+    {"handle": "sunmvmv",          "source": "Sun",       "reliability": 92},
+    {"handle": "sunonlinemv",      "source": "Sun",       "reliability": 92},
+    {"handle": "raajjemvlive",     "source": "Raajje",    "reliability": 85},
+    {"handle": "raajjemv",         "source": "Raajje",    "reliability": 85},
+    {"handle": "voicemaldives",    "source": "VoiceMV",   "reliability": 80},
+    {"handle": "voice_mv",         "source": "VoiceMV",   "reliability": 80},
+    {"handle": "mvplusmedia",      "source": "MV+",       "reliability": 82},
+    {"handle": "mvcrisis",         "source": "MvCrisis",  "reliability": 70},
+] + parse_extra_telegram_sources()
+
+
+# Direct latest-page sources. RSS is blocked/weak on many Maldives sites, so this
+# browser-like fallback watches public latest/home pages for fresh headlines.
+WEB_LATEST_SOURCES = [
+    {"url": "https://mihaaru.com/",          "source": "Mihaaru",    "cat": "LOCAL", "lang": "dv"},
+    {"url": "https://avas.mv/",              "source": "Avas",       "cat": "LOCAL", "lang": "dv"},
+    {"url": "https://sun.mv/",               "source": "Sun",        "cat": "LOCAL", "lang": "dv"},
+    {"url": "https://english.sun.mv/",       "source": "Sun",        "cat": "LOCAL", "lang": "en"},
+    {"url": "https://psmnews.mv/en",         "source": "PSM News",   "cat": "LOCAL", "lang": "en"},
+    {"url": "https://raajje.mv/",            "source": "Raajje",     "cat": "LOCAL", "lang": "dv"},
+    {"url": "https://voice.mv/",             "source": "VoiceMV",    "cat": "LOCAL", "lang": "dv"},
+    {"url": "https://edition.mv/",           "source": "Edition",    "cat": "LOCAL", "lang": "en"},
+    {"url": "https://maldivesvoice.com/",    "source": "Maldives Voice", "cat": "LOCAL", "lang": "en"},
+    {"url": "https://thepress.mv/",          "source": "ThePress",   "cat": "LOCAL", "lang": "dv"},
+    {"url": "https://www.mndf.gov.mv/",      "source": "MNDF",       "cat": "LOCAL", "lang": "en"},
+    {"url": "https://www.police.gov.mv/",    "source": "Police",     "cat": "LOCAL", "lang": "en"},
+    {"url": "https://presidency.gov.mv/",    "source": "Presidency", "cat": "LOCAL", "lang": "en"},
 ]
+
 
 def fetch_dv_telegram(handle, source, reliability=80):
     """
-    Scrape a public Telegram channel for Dhivehi news.
-    Returns articles with lang='dv' where Thaana script is detected,
-    or lang='en' for mixed-language posts.
+    Scrape a public Telegram channel for Dhivehi/news posts with real Telegram timestamps.
+    Returns lang='dv' when Thaana is present, lang='en' for English/mixed posts.
     """
     try:
         url = f"https://t.me/s/{handle}"
@@ -2016,22 +2311,17 @@ def fetch_dv_telegram(handle, source, reliability=80):
         if resp.status_code != 200:
             log.debug(f"[FETCH] {source} Telegram: HTTP {resp.status_code}")
             return []
-        import re as _re
-        texts = _re.findall(
-            r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
-            resp.text, _re.DOTALL)
         articles = []
-        for raw in texts[:12]:
-            text = _re.sub(r"<[^>]+>", "", raw).strip()
-            text = (text.replace("&amp;","&").replace("&#39;","'")
-                    .replace("&quot;",'"').replace("&lt;","<").replace("&gt;",">"))
-            if len(text) < 20: continue
-            if _looks_like_ad(text): continue
-            # Detect language from Thaana script presence
+        for text, published in _extract_telegram_messages(resp.text, limit=12):
+            if len(text) < 20:
+                continue
+            if _looks_like_ad(text):
+                continue
+            if (utcnow() - published).total_seconds() > 12 * 3600:
+                continue
             dv_chars = sum(1 for ch in text if "ހ" <= ch <= "޿")
-            # Lower threshold — even 1-2 Thaana chars in a mixed post = Dhivehi
             lang = "dv" if dv_chars >= 1 else "en"
-            art_id = f"tg_{handle}_" + hashlib.md5(text[:60].encode()).hexdigest()[:8]
+            art_id = f"tg_{handle}_" + hashlib.md5((text[:80] + str(published)).encode()).hexdigest()[:10]
             articles.append({
                 "id":          art_id,
                 "title":       text[:150],
@@ -2041,7 +2331,7 @@ def fetch_dv_telegram(handle, source, reliability=80):
                 "cat":         "LOCAL",
                 "lang":        lang,
                 "reliability": reliability,
-                "published":   utcnow()
+                "published":   published
             })
         log.info(f"[FETCH] {source} Telegram: {len(articles)} items")
         return articles
@@ -2086,6 +2376,187 @@ def _feed_source_name(url):
     if "thepress_mv" in u:     return "ThePress"
     return ""
 
+def _build_article_from_feed_entry(entry, fc, fallback_source=""):
+    """Convert a feedparser entry into a Samuga article dict with safe defaults."""
+    title = entry.get("title", "") or ""
+    summary = entry.get("summary", title) or title
+    lang = fc.get("lang", "en")
+    if lang == "dv" and not is_dhivehi(title + " " + summary):
+        # If a Dhivehi feed returns Latin/English, keep it as English unless Gemini can clean it later.
+        lang = "en"
+    entry_src = entry.get("source", {}).get("title", "") if isinstance(entry.get("source"), dict) else ""
+    src_name = fc.get("source") or entry_src or fallback_source or _feed_source_name(fc.get("url", "")) or fc.get("cat", "LOCAL")
+    return {
+        "id": hashlib.md5((entry.get("link", "") or title).encode()).hexdigest(),
+        "title": strip_source_links(title)[:180],
+        "summary": strip_source_links(summary)[:1500],
+        "link": entry.get("link", ""),
+        "cat": fc.get("cat", "LOCAL"),
+        "lang": lang,
+        "source": src_name,
+        "published": entry_published_dt(entry) or utcnow(),
+    }
+
+def fetch_rss_feed_items(fc, limit=8, max_age_hours=12):
+    """Safe RSS fetch wrapper used by normal feeds + local RSS recovery + world feeds."""
+    out = []
+    url = fc.get("url", "")
+    if not url:
+        return out
+    try:
+        feed = feedparser.parse(url)
+        entries = getattr(feed, "entries", []) or []
+        if not entries:
+            return out
+        for entry in entries[:limit]:
+            if not is_fresh(entry, hours=max_age_hours):
+                continue
+            a = _build_article_from_feed_entry(entry, fc)
+            if not a.get("title"):
+                continue
+            out.append(a)
+    except Exception as e:
+        log.debug(f"[RSS] feed failed {url}: {e}")
+    return out
+
+def fetch_local_rss_recovery(limit_per_source=4):
+    """
+    Try common RSS paths for local sources, then Google News per-source backups.
+    This does not replace latest-page/Telegram; it is one extra ladder step.
+    """
+    articles, seen_keys = [], set()
+    # Direct candidate paths first
+    for src in LOCAL_RSS_RECOVERY_SOURCES:
+        found_for_source = 0
+        base = src["domain"].rstrip("/")
+        for path in RSS_CANDIDATE_PATHS:
+            fc = {"url": base + path, "cat": src.get("cat", "LOCAL"), "lang": src.get("lang", "en"), "source": src.get("source", "LOCAL")}
+            items = fetch_rss_feed_items(fc, limit=limit_per_source, max_age_hours=12)
+            if not items:
+                continue
+            for a in items:
+                key = _caption_match_key(a.get("title", ""))
+                if not key or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                articles.append(a)
+                found_for_source += 1
+                if found_for_source >= limit_per_source:
+                    break
+            if found_for_source:
+                log.info(f"[RSS] {src['source']} recovery working via {path}: {found_for_source} item(s)")
+                break
+    # Google News per-source backup
+    for fc in LOCAL_GOOGLE_BACKUP_FEEDS:
+        items = fetch_rss_feed_items(fc, limit=limit_per_source, max_age_hours=12)
+        kept = 0
+        for a in items:
+            key = _caption_match_key(a.get("title", ""))
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            articles.append(a)
+            kept += 1
+        if kept:
+            log.info(f"[RSS] Google local backup {fc.get('source','')}: {kept} item(s)")
+    return articles
+
+def fetch_world_updates(limit=8):
+    """Fetch major world updates separately so Samuga has global awareness without filler."""
+    articles, seen_keys = [], set()
+    for fc in WORLD_FEEDS:
+        for a in fetch_rss_feed_items(fc, limit=limit, max_age_hours=12):
+            text = a.get("title", "") + " " + a.get("summary", "")
+            if not is_major_world_news_text(text):
+                continue
+            key = _caption_match_key(a.get("title", ""))
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+            a["cat"] = "DISASTER" if a.get("cat") == "DISASTER" else "WORLD"
+            a["source"] = a.get("source") or "World News"
+            articles.append(a)
+    if articles:
+        log.info(f"[FETCH] World updates: {len(articles)} major item(s)")
+    return articles
+
+def fetch_latest_web_pages(limit_per_source=6):
+    """
+    RSS fallback: scrape public latest/home pages like a browser.
+    This is intentionally lightweight and only extracts headline links; the bot
+    still rewrites in Samuga style and never exposes source links publicly.
+    """
+    articles = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,dv;q=0.8",
+        "Cache-Control": "no-cache",
+    }
+    try:
+        from urllib.parse import urljoin, urlparse
+    except Exception:
+        return articles
+
+    for src in WEB_LATEST_SOURCES:
+        try:
+            resp = requests.get(src["url"], timeout=12, headers=headers)
+            if resp.status_code != 200 or not resp.text:
+                log.debug(f"[FETCH] {src['source']} latest page HTTP {resp.status_code}")
+                continue
+            try:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(resp.text, "html.parser")
+                anchors = soup.find_all("a", href=True)
+                candidates = []
+                for a in anchors:
+                    title = " ".join(a.get_text(" ", strip=True).split())
+                    if len(title) < 18 or len(title) > 180:
+                        continue
+                    href = urljoin(src["url"], a.get("href", ""))
+                    host = urlparse(src["url"]).netloc.replace("www.", "")
+                    if host not in urlparse(href).netloc:
+                        continue
+                    candidates.append((title, href))
+            except Exception:
+                import re as _re
+                candidates = []
+                for href, title in _re.findall(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', resp.text, _re.I|_re.S):
+                    title = _re.sub(r"<[^>]+>", " ", title)
+                    title = " ".join(_html_unescape(title).split())
+                    if 18 <= len(title) <= 180:
+                        candidates.append((title, urljoin(src["url"], href)))
+
+            seen_local = set()
+            kept = 0
+            for title, href in candidates:
+                key = re.sub(r"\W+", " ", title.lower()).strip()[:70]
+                if key in seen_local:
+                    continue
+                seen_local.add(key)
+                if _looks_like_ad(title):
+                    continue
+                lang = "dv" if is_dhivehi(title) else src.get("lang","en")
+                art_id = "web_" + hashlib.md5((href or title).encode()).hexdigest()[:12]
+                articles.append({
+                    "id": art_id,
+                    "title": title[:150],
+                    "summary": title,
+                    "link": href,
+                    "source": src["source"],
+                    "cat": src.get("cat","LOCAL"),
+                    "lang": lang,
+                    "published": utcnow(),  # latest pages rarely expose clean dates; seen DB prevents repeats
+                })
+                kept += 1
+                if kept >= limit_per_source:
+                    break
+            if kept:
+                log.info(f"[FETCH] {src['source']} latest page: {kept} headline(s)")
+        except Exception as e:
+            log.debug(f"[FETCH] latest page {src.get('source')}: {e}")
+    return articles
+
 def fetch_news():
     articles, seen_titles = [], set()
     # MvCrisis first — #1 Maldives breaking news source
@@ -2095,34 +2566,42 @@ def fetch_news():
             articles.append(a)
     # Dhivehi Telegram channels — native Dhivehi content from Mihaaru, Avas, VNews etc
     for a in fetch_all_dv_channels():
-        if a["title"] not in seen_titles:
-            seen_titles.add(a["title"])
+        key = re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
+        if key not in seen_titles:
+            seen_titles.add(key)
             articles.append(a)
+
+    # Website latest pages — fallback for Maldives sites that block RSS.
+    for a in fetch_latest_web_pages():
+        key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
+        if key not in seen_titles:
+            seen_titles.add(key)
+            articles.append(a)
+
+    # Local RSS recovery ladder: common RSS paths + Google News per-source backups.
+    for a in fetch_local_rss_recovery():
+        key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
+        if key not in seen_titles:
+            seen_titles.add(key)
+            articles.append(a)
+
+    # Normal configured RSS feeds.
     for fc in RSS_FEEDS:
-        try:
-            feed = feedparser.parse(fc["url"])
-            for entry in feed.entries[:10]:
-                title   = entry.get("title","")
-                summary = entry.get("summary", title)
-                if fc["lang"] == "dv":
-                    title   = gemini_translate(title)
-                    summary = gemini_translate(summary[:300])
-                key = title.lower()[:50]
-                if key in seen_titles or not is_fresh(entry): continue
-                seen_titles.add(key)
-                # Derive a clean source name: prefer RSS entry source, else feed domain
-                entry_src = entry.get("source",{}).get("title", "") if isinstance(entry.get("source"), dict) else ""
-                feed_src = _feed_source_name(fc["url"])
-                src_name = entry_src or feed_src or fc["cat"]
-                articles.append({
-                    "id": hashlib.md5(entry.get("link",title).encode()).hexdigest(),
-                    "title": title, "summary": summary,
-                    "link": entry.get("link",""), "cat": fc["cat"],
-                    "lang": fc["lang"],
-                    "source": src_name,
-                })
-        except Exception as e: log.error(f"Feed error: {e}")
-    log.info(f"Found {len(articles)} fresh articles")
+        for a in fetch_rss_feed_items(fc, limit=10, max_age_hours=12):
+            key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
+            if key in seen_titles:
+                continue
+            seen_titles.add(key)
+            articles.append(a)
+
+    # Major world updates — limited by strict scoring later, but fetched here for awareness.
+    for a in fetch_world_updates(limit=6):
+        key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
+        if key not in seen_titles:
+            seen_titles.add(key)
+            articles.append(a)
+
+    log.info(f"Found {len(articles)} fresh articles from source ladder")
     return articles
 
 def get_local_headlines():
@@ -2667,20 +3146,133 @@ def _gemini_post(prompt, timeout=15):
     return None
 
 def make_dhivehi_caption(english_text, title):
-    """Convert English news caption to Dhivehi using Gemini (with model fallback)."""
+    """Convert English/Latin news text to clean Dhivehi Thaana using Gemini."""
     if not GEMINI_API_KEY:
         return None
-    prompt = f"""You are a Maldivian news writer. Write a short news caption in Dhivehi (Thaana script) for this news.
+    prompt = f"""You are a Maldivian news editor for Samuga Media.
 
-English title: {title}
-English summary: {english_text}
+Write a short public news caption in proper Dhivehi Thaana script.
 
-Write 2-3 sentences in natural Dhivehi as it would appear in a Maldivian news channel.
-Return ONLY the Dhivehi text in Thaana script, nothing else."""
+Rules:
+- Output ONLY Dhivehi Thaana.
+- 2 to 3 natural sentences.
+- Clean Maldivian news style.
+- Do not add facts that are not in the input.
+- Do not include external source links.
+- Do not leave Latin Thaana/romanized Dhivehi.
+- Brand names can stay in English only if necessary.
+
+Title:
+{title}
+
+Summary:
+{english_text}
+"""
     result = _gemini_post(prompt)
-    if result:
+    if result and is_dhivehi(result):
         log.info("✅ Gemini Dhivehi caption done")
-    return result
+        return strip_source_links(result).strip()
+    if result:
+        log.warning("Gemini Dhivehi caption returned non-Thaana text — rejected")
+    return None
+
+
+# ── Dhivehi Quality Layer: Latin Thaana → Proper Thaana / English ─────────────
+_LATIN_THAANA_WORDS = [
+    "raajje","mihaaru","avas","dhuvas","dhivehi","vaguthu","gothun","medhu",
+    "hurihaa","dhathuru","furusathu","baakee","haftaa","majlis","sarukaaru",
+    "rayyithun","tharaggee","qanoon","fuluhun","khabaru","miadhu","airport",
+    "guriathulun","govaalaifi","kuri","mahchah","mifaharu","dhaaira","kanthah"
+]
+
+def looks_latin_thaana(text):
+    """Detect romanized Dhivehi/Latin Thaana so it does not leak into website as English."""
+    s = str(text or "").lower()
+    if not s or is_dhivehi(s):
+        return False
+    hits = sum(1 for w in _LATIN_THAANA_WORDS if w in s)
+    # Romanized Dhivehi often has aa/ee/oo/dh/th/haa patterns.
+    pattern_hits = len(re.findall(r"\b[a-z]*(?:dh|th|aa|ee|oo|vv|lh|sh)[a-z]*\b", s))
+    return hits >= 2 or (hits >= 1 and pattern_hits >= 3)
+
+def gemini_latin_thaana_to_thaana(text):
+    """Rewrite Latin Thaana / romanized Dhivehi into clean Thaana news style."""
+    if not GEMINI_API_KEY:
+        return None
+    prompt = f"""Rewrite the following romanized Dhivehi / Latin Thaana into proper Dhivehi Thaana script.
+
+Rules:
+- Output ONLY Dhivehi Thaana.
+- Clean newsroom style.
+- Do not add new facts.
+- Do not use Latin letters unless it is a brand name that cannot be translated.
+- Keep it concise.
+
+Text:
+{text}
+"""
+    out = _gemini_post(prompt, timeout=20)
+    if out and is_dhivehi(out):
+        return strip_source_links(out).strip()
+    return None
+
+def gemini_latin_thaana_to_english(text):
+    """Translate romanized Dhivehi / Latin Thaana to clean English for English website articles."""
+    if not GEMINI_API_KEY:
+        return None
+    prompt = f"""Translate this romanized Dhivehi / Latin Thaana news text into clean English.
+
+Rules:
+- Output ONLY English.
+- Do not add new facts.
+- Keep names and places accurate.
+- Clean news style.
+
+Text:
+{text}
+"""
+    out = _gemini_post(prompt, timeout=20)
+    if out and not is_dhivehi(out):
+        return strip_source_links(out).strip()
+    return None
+
+def normalize_article_language_for_public(title="", summary="", lang="en", prefer="auto"):
+    """
+    Public quality gate:
+    - Dhivehi public text must be real Thaana.
+    - Latin Thaana is converted by Gemini before public website/social use.
+    - If conversion fails, caller can hold/skip instead of publishing ugly text.
+    Returns (title, summary, lang, ok).
+    """
+    title = strip_source_links(title or "")
+    summary = strip_source_links(summary or "")
+    combined = f"{title} {summary}".strip()
+    current_lang = (lang or "en").lower()
+    has_thaana = is_dhivehi(combined)
+    latin_dv = looks_latin_thaana(combined)
+
+    if current_lang in ("dv", "dhivehi") or has_thaana:
+        if has_thaana:
+            return title, summary, "dv", True
+        if latin_dv:
+            converted = gemini_latin_thaana_to_thaana(combined)
+            if converted:
+                return converted[:500], converted[:2600], "dv", True
+            return title, summary, "dv", False
+        return title, summary, "en", True
+
+    if latin_dv:
+        # For English website side, convert Latin Thaana to English. If Gemini cannot,
+        # do not publish it publicly as broken English.
+        converted = gemini_latin_thaana_to_english(combined)
+        if converted:
+            # Use first sentence as title-ish if original title was romanized.
+            sent = re.split(r"(?<=[.!?])\s+", converted.strip(), maxsplit=1)
+            new_title = sent[0][:500] if sent else converted[:500]
+            return new_title, converted[:2600], "en", True
+        return title, summary, "en", False
+
+    return title, summary, "en", True
 
 # ── Auto Poll ─────────────────────────────────────────────────────────────────
 POLL_KEYWORDS = [
@@ -2848,14 +3440,14 @@ mutation CreatePost($input: CreatePostInput!) {
 _social_queue = []
 _social_queue_lock = threading.Lock()
 _last_social_post_time = None
-SOCIAL_GAP_SECONDS = 600  # 10 minutes
+SOCIAL_GAP_SECONDS = 120  # 2 minutes — protects Buffer/Meta from burst posting
 
 # Personality messages for queue notifications
 QUEUE_PERSONALITY = [
     "yea yea it's in the queue. 😮‍💨",
     "queued. The algorithm likes it spaced out. Unlike Uly's approvals. 😅",
     "in the queue. Good things take time. 🕐",
-    "queued. You're too bossy today, I need my 10 minutes. 😤",
+    "queued. You're too bossy today, I need my 2 minutes. 😤",
     "in the queue. Quality over quantity. 💅",
     "queued. I'm tired, not lazy. There's a difference. 😴",
     "queued. Back-to-back posting is so 2022. ⏳",
@@ -2877,7 +3469,7 @@ def _calc_eta_seconds():
 
 def _social_queue_worker():
     """
-    Background thread — drains one post every 10 minutes.
+    Background thread — drains one post every 2 minutes.
     Each item posts to Telegram community + FB + IG + X in sequence.
     BREAKING news bypasses this queue entirely and posts immediately.
     """
@@ -2974,7 +3566,7 @@ def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=Non
                      article_id=None, title="", summary="", cat="LOCAL",
                      source="Samuga Media", link="", lang="en", is_breaking=False):
     """
-    Add a card to the 10-minute publish queue.
+    Add a card to the 2-minute publish queue.
     post_telegram=True  → queue will post to Telegram community too (standard flow)
     post_telegram=False → Telegram was already posted separately (breaking news)
 
@@ -3103,7 +3695,7 @@ def post_to_social(img_buf, caption):
         log.warning("Social: no BUFFER_TOKEN, skipping")
         return
     if not can_post_social():
-        limit = 20 if is_day_social() else 3
+        limit = 30 if is_day_social() else 5
         log.info(f"📵 Social limit reached ({30 if is_day_social() else 5} posts {'day' if is_day_social() else 'night'}) — skipping")
         return
     try:
@@ -3304,12 +3896,21 @@ def _send_approval_card(key, item, force=False):
     footer += f"❌ <code>/reject {key}</code>\n\n"
     # Tell the team the auto-post / expiry behaviour
     if item["lang"] == "en":
-        footer += "<i>⏰ Auto-posts in 15 min if not reviewed</i>"
-    else:
-        if item.get("_auto_post_breaking"):
-            footer += "<i>⏰ Breaking Dhivehi — auto-posts in 2h if no action taken</i>"
+        delay = item.get("_autopost_after_seconds")
+        if delay is None:
+            delay = english_autopost_delay_seconds(item)
+        if delay is None:
+            footer += "<i>⏰ Manual review required.</i>"
+        elif int(delay) <= 0:
+            footer += "<i>⏰ High confidence — posts to the 2-min social queue immediately after this preview.</i>"
+        elif int(delay) <= 300:
+            footer += "<i>⏰ Medium confidence — auto-posts in 5 min if not rejected.</i>"
+        elif int(delay) <= 900:
+            footer += "<i>⏰ Lower confidence — auto-posts in 15 min if not rejected.</i>"
         else:
-            footer += "<i>⏰ Expires in 2h if not approved (regular Dhivehi never auto-posts)</i>"
+            footer += "<i>⏰ Low confidence — auto-posts in 30 min if not rejected.</i>"
+    else:
+        footer += "<i>⏰ Expires in 2h if not approved. Dhivehi auto-post is disabled for now.</i>"
     msg = header + footer
 
     # If we have a finished card image, send it as a photo with the caption
@@ -3331,8 +3932,36 @@ def post_article(article, seen, social_only=False, allow_social=True):
     Marks article as seen immediately so it isn't re-queued every scan.
     """
     cat = article["cat"]
+
+    # Public language cleanup before any card/website decision.
+    # Latin Thaana must not leak as broken English/Dhivehi. Gemini converts it;
+    # if conversion fails, the story is skipped/held instead of damaging quality.
+    try:
+        nt, ns, nlang, ok_lang = normalize_article_language_for_public(
+            article.get("title",""), article.get("summary",""), lang=article.get("lang","en")
+        )
+        if not ok_lang:
+            log.warning(f"⏭️ Skipping language-unclean article: {article.get('title','')[:60]}")
+            return False
+        article["title"], article["summary"], article["lang"] = nt, ns, nlang
+    except Exception as e:
+        log.debug(f"language normalize: {e}")
+
     breaking = is_breaking(article["title"], article["summary"], cat)
     is_dv = article.get("lang") == "dv"
+
+    # Strict low-value / old-story gate.
+    skip, reason = should_skip_low_value(article)
+    if skip and not breaking:
+        log.info(f"⏭️ Skipping low-value story: {reason} — {article.get('title','')[:65]}")
+        seen.add(article["id"]); save_seen(seen)
+        try:
+            db_record_article(article, score=score_article(article),
+                              reliability=source_reliability(article.get("source","")),
+                              status="seen", is_breaking=False)
+        except Exception:
+            pass
+        return False
 
     # Mark seen now so the same article isn't re-processed on the next scan
     seen.add(article["id"]); save_seen(seen)
@@ -3450,7 +4079,7 @@ def post_article(article, seen, social_only=False, allow_social=True):
                         is_breaking=True, allow_social=True
                     )
                     approval_queue[key]["article_id"] = f"{_aid}_dv"
-                    approval_queue[key]["_auto_post_breaking"] = True   # 2hr auto-post flag
+                    approval_queue[key]["_auto_post_breaking"] = False  # Dhivehi auto-post disabled for now
                     approval_queue[key]["summary"] = article.get("summary","")
                     # Pre-fetch bg
                     bg = fetch_background_image(_kw, cat=_cat, title=_title)
@@ -3462,7 +4091,7 @@ def post_article(article, seen, social_only=False, allow_social=True):
                         f"🇲🇻 <b>Dhivehi version ready</b> — <code>{key}</code>\n"
                         f"<i>{_title[:80]}</i>\n\n"
                         f"Approve, edit or reject within 2 hours.\n"
-                        f"If no action taken — <b>posts automatically at 2h mark.</b>\n\n"
+                        f"If no action taken — <b>expires after 2h.</b>\n\n"
                         f"/approved {key} · /approved {key} [corrected text] · /reject {key}",
                         thread_id=CONTENT_LAB_THREAD_ID)
                     log.info(f"🇲🇻 Breaking Dhivehi version queued: {key}")
@@ -3520,6 +4149,7 @@ def post_article(article, seen, social_only=False, allow_social=True):
         approval_queue[key]["article_id"] = article["id"]
         approval_queue[key]["_priority"] = article.get("_priority", priority)
         approval_queue[key]["_confidence"] = confidence
+        approval_queue[key]["_autopost_after_seconds"] = english_autopost_delay_seconds(approval_queue[key])
 
         # Website-first publishing: every English story selected by the bot
         # goes to the website immediately, even while Telegram/socials wait for
@@ -3544,12 +4174,18 @@ def post_article(article, seen, social_only=False, allow_social=True):
         approval_queue[key]["_cluster_size"] = article.get("_cluster_size", 1)
         approval_queue[key]["_trend_theme"] = article.get("_trend_theme", "")
         _send_approval_card(key, approval_queue[key])
+        # High-confidence English does not wait for approval; the preview is sent
+        # for team visibility, then the card enters the 2-minute social queue.
+        if approval_queue.get(key, {}).get("_autopost_after_seconds") == 0:
+            item_now = approval_queue.pop(key, None)
+            if item_now:
+                _auto_publish_approval_item(key, item_now, reason="instant high-confidence")
         db_mark_status(article["id"], "queued")
 
         # ── Auto-generate Dhivehi version in background ──────────────────────
         # Every English article also gets a Dhivehi card queued for approval.
         # Runs in a thread so it doesn't delay the English card.
-        if GEMINI_API_KEY:
+        if GEMINI_API_KEY and (breaking or priority >= CONTENT_LAB_HIGH_SCORE):
             def _auto_dv(_rewritten=rewritten, _title=article["title"],
                          _link=article["link"], _cat=cat, _keyword=keyword,
                          _source=article.get("source","LOCAL"), _aid=article["id"],
@@ -3604,10 +4240,15 @@ def score_article(a):
         maldives_sports = ["maldives","dhivehi","raajje","team maldives","national team"]
         if not any(kw in title_lower + summary_lower for kw in maldives_sports):
             score -= 30  # Heavy penalty for non-Maldives sports
-    # World news — only if Maldives related
+    # World news — support major global updates, but still penalize random foreign filler.
     if cat == "WORLD":
-        if not any(kw in title_lower + summary_lower for kw in ["maldives","indian ocean","south asia","economy"]):
-            score -= 20
+        txt = title_lower + " " + summary_lower
+        if any(kw in txt for kw in ["maldives","indian ocean","south asia","india","sri lanka","economy","oil","dollar"]):
+            score += 35
+        elif is_major_world_news_text(txt):
+            score += 25
+        else:
+            score -= 35
     # Breaking boost
     if is_breaking(a["title"], a.get("summary",""), cat): score += 80
     # Source reliability — trusted sources rank higher (0-25 boost)
@@ -3627,6 +4268,14 @@ def score_article(a):
     cluster_size = a.get("_cluster_size", 1)
     if cluster_size >= 2:
         score += min((cluster_size - 1) * 12, 36)
+    # Freshness boost — Samuga should be fastest, not posting old stories as latest.
+    try:
+        fpts = freshness_bonus(a)
+        score += fpts
+        a["_freshness_pts"] = fpts
+    except Exception as e:
+        log.debug(f"freshness boost: {e}")
+
     # ── Engagement nudge (Phase 2) — ±LEARN_CAP, INERT until /learning on ──
     try:
         eng_pts, eng_theme = topic_weight_for(a["title"], a.get("summary",""))
@@ -3832,24 +4481,27 @@ def format_score_breakdown(a):
         elif a.get("lang") == "dv":
             lines.append("📌 <b>Dhivehi</b> → always queued for Content Lab review.")
         else:
-            lines.append("📌 <b>Regular English</b> → queued; auto-posts in 15 min if not reviewed.")
+            lines.append("📌 <b>Regular English</b> → confidence-based auto-post: high now, medium 5m, lower 15–30m if not reviewed.")
     except Exception:
         pass
     return "\n".join(lines)
 
-def run_job(social_only=False, breaking_only=False):
+def run_job(social_only=False, breaking_only=False, website_only=False):
     """
     Every 15-min scan:
       - Breaking news: posts immediately to all platforms (no queue, no limit)
-      - Breaking low-confidence: goes to Alert, auto-posts in 30 min if no action
-      - Regular English: max 2-3 best per HOUR go to Content Lab — bot picks, not all
-      - Regular Dhivehi: max 2-3 best per HOUR go to Content Lab
-      - Total Content Lab cards: max 6 per hour (3 EN + 3 DV)
+      - Breaking low-confidence: goes to Alert Chat with approve/reject commands; no auto-post
+      - Regular English: strict best stories only; website immediate, socials auto by confidence
+      - Regular Dhivehi: manual-only, expires after 2h
+      - Total Content Lab cards: normal max 4/hour, high-priority drip can reach 6/hour
       - Breaking is completely separate — never counts toward hourly budget
+      - Website-only mode: used at night; publishes selected English stories to website 24/7
+        without sending Content Lab previews or social posts.
     """
     global daily_sports_count, daily_world_count, daily_tourism_count, _pending_article
     h = get_mvt_hour()
-    log.info(f"🕐 MVT {h:02d}:xx | {'DAY' if is_day_mode() else 'NIGHT'}")
+    mode_label = "WEBSITE-ONLY" if website_only else ("DAY" if is_day_mode() else "NIGHT")
+    log.info(f"🕐 MVT {h:02d}:xx | {mode_label}")
     seen = load_seen()
     articles = fetch_news()
 
@@ -3863,6 +4515,30 @@ def run_job(social_only=False, breaking_only=False):
         a["_cluster_size"] = size
         a["_cluster_sources"] = srcs
 
+    # Strict selection first: Samuga should publish fewer, faster, better stories.
+    qualified = []
+    skipped = 0
+    for a in fresh:
+        skip, reason = should_skip_low_value(a)
+        if skip:
+            skipped += 1
+            log.info(f"⏭️ Selection skip: {reason} — {a.get('title','')[:65]}")
+            seen.add(a["id"])
+            try:
+                db_record_article(a, score=score_article(a),
+                                  reliability=source_reliability(a.get("source","")),
+                                  status="seen", is_breaking=is_breaking(a.get("title",""), a.get("summary",""), a.get("cat","")))
+            except Exception:
+                pass
+            continue
+        qualified.append(a)
+    if skipped:
+        save_seen(seen)
+        log.info(f"🧹 Strict selection skipped {skipped} low-value/old item(s)")
+    fresh = qualified
+    if not fresh:
+        log.info("No fresh articles passed strict selection."); return
+
     fresh.sort(key=score_article, reverse=True)
 
     breaking_articles = [a for a in fresh if is_breaking(a["title"], a.get("summary",""), a["cat"])]
@@ -3873,6 +4549,59 @@ def run_job(social_only=False, breaking_only=False):
 
     log.info(f"🔴 {len(breaking_articles)} breaking | 🟡 {len(regular_articles)} regular")
 
+    # ── Website-only night mode ──────────────────────────────────────────────
+    # The website is the live archive and should update 24/7.
+    # At night we do NOT flood Content Lab or socials with regular stories;
+    # we only publish selected English articles to the website. Breaking still
+    # runs through breaking_news_check() every 5 minutes.
+    if website_only:
+        website_published = 0
+        website_seen_titles = set()
+        website_candidates = [a for a in fresh if a.get("lang", "en") == "en"]
+        for a in website_candidates:
+            if website_published >= 5:
+                break
+            if a.get("id") in seen:
+                continue
+            title_key = _caption_match_key(a.get("title", "")) or a.get("title", "").lower()[:80]
+            if title_key in website_seen_titles:
+                continue
+            website_seen_titles.add(title_key)
+            if is_duplicate_story(a.get("title", "")):
+                log.info(f"🌐 Night website skip duplicate: {a.get('title','')[:60]}")
+                seen.add(a["id"])
+                db_mark_status(a.get("id"), "duplicate")
+                continue
+            try:
+                priority = score_article(a)
+                db_record_article(a, score=priority,
+                                  reliability=source_reliability(a.get("source", "")),
+                                  status="seen",
+                                  is_breaking=is_breaking(a.get("title", ""), a.get("summary", ""), a.get("cat", "LOCAL")))
+                db_publish_article_for_website(
+                    article_id=a["id"],
+                    title=a.get("title", ""),
+                    summary=samuga_public_summary(a.get("title", ""), a.get("summary", ""), ""),
+                    category=a.get("cat", "LOCAL"),
+                    source=SAMUGA_PUBLIC_SOURCE,
+                    link=SAMUGA_PUBLIC_LINK,
+                    lang="en",
+                    score=priority,
+                    reliability=source_reliability(a.get("source", "")),
+                    is_breaking=is_breaking(a.get("title", ""), a.get("summary", ""), a.get("cat", "LOCAL"))
+                )
+                remember_story_title(a.get("title", ""))
+                seen.add(a["id"])
+                website_published += 1
+                log.info(f"🌐 Night website-only published EN story: {a.get('title','')[:70]}")
+            except Exception as e:
+                log.error(f"🌐 Night website-only publish failed: {e}")
+        if website_published:
+            save_seen(seen)
+            persist_state()
+        log.info(f"✅ website-only run done — {website_published} EN article(s) published to website")
+        return
+
     # ── 1. BREAKING — fires immediately, no budget, no throttle ─────────────
     if breaking_articles:
         a = breaking_articles[0]
@@ -3882,7 +4611,7 @@ def run_job(social_only=False, breaking_only=False):
     if breaking_only:
         return
 
-    # ── 2. HOURLY BUDGET — Content Lab gets max 6 cards/hr (3 EN + 3 DV) ───
+    # ── 2. HOURLY BUDGET — Content Lab gets strict limited previews ───
     # Count how many cards were already sent to Content Lab THIS hour
     now_mvt = utcnow() + timedelta(hours=5)
     hour_start = now_mvt.replace(minute=0, second=0, microsecond=0)
@@ -3896,13 +4625,16 @@ def run_job(social_only=False, breaking_only=False):
                        if v.get("lang") == "dv"
                        and v.get("created_at", utcnow()) >= hour_start_utc)
 
-    en_budget = max(0, 3 - en_this_hour)   # max 3 English per hour
-    dv_budget = max(0, 3 - dv_this_hour)   # max 3 Dhivehi per hour
+    total_this_hour = en_this_hour + dv_this_hour
+    total_budget = max(0, CONTENT_LAB_NORMAL_MAX_PER_HOUR - total_this_hour)
+    # Dhivehi is manual-only for now, so keep it tighter to avoid flooding Uly.
+    dv_budget = max(0, min(1, total_budget))
+    en_budget = max(0, total_budget)
 
-    log.info(f"📊 Hourly budget: {en_budget} EN + {dv_budget} DV remaining "
-             f"({en_this_hour}+{dv_this_hour} already sent this hour)")
+    log.info(f"📊 Hourly Content Lab budget: {total_budget} total remaining "
+             f"({en_this_hour} EN + {dv_this_hour} DV already this hour)")
 
-    if en_budget == 0 and dv_budget == 0:
+    if total_budget == 0:
         log.info("📵 Hourly Content Lab budget exhausted — skipping regular articles")
         return
 
@@ -3918,11 +4650,12 @@ def run_job(social_only=False, breaking_only=False):
             dv_sent += 1
     if dv_sent:
         log.info(f"🇲🇻 {dv_sent} Dhivehi card(s) sent to Content Lab")
+    en_budget = max(0, total_budget - dv_sent)
 
     # ── 2b. English — best EN articles up to budget ──────────────────────────
     if not can_post_regular():
         secs_left = int(TELEGRAM_GAP_SECONDS - (utcnow() - last_regular_post_time).total_seconds())
-        log.info(f"⏳ Telegram 2hr gap active — {secs_left//60}m left (but still sending to Content Lab)")
+        log.info(f"⏳ Telegram 2-min gap active — {secs_left//60}m left (but still sending to Content Lab)")
         # Still queue for Content Lab review even if Telegram window is closed
         # The approval/auto-expiry handles the actual posting timing
 
@@ -3945,13 +4678,13 @@ def run_job(social_only=False, breaking_only=False):
             if not can_post_cat_today(daily_sports_count, 1):
                 continue
 
-        # World: Maldives-relevant only, max 2/day
+        # World: major global/region/economy updates only, max 3/day
         elif cat == "WORLD":
-            mv_world = ["maldives","indian ocean","south asia","india","china",
+            mv_world = ["maldives","indian ocean","south asia","india","sri lanka","china",
                         "un ","dollar","oil","global economy"]
-            if not any(kw in text_lower for kw in mv_world):
+            if not (any(kw in text_lower for kw in mv_world) or is_major_world_news_text(text_lower)):
                 continue
-            if not can_post_cat_today(daily_world_count, 2):
+            if not can_post_cat_today(daily_world_count, 3):
                 continue
 
         # Tourism: max 2/day
@@ -3994,29 +4727,36 @@ def fetch_breaking_sources():
         if a["title"] not in seen_titles:
             seen_titles.add(a["title"])
             articles.append(a)
-    for fc in BREAKING_SOURCES:
-        try:
-            feed = feedparser.parse(fc["url"])
-            for entry in feed.entries[:5]:
-                title   = entry.get("title", "")
-                summary = entry.get("summary", title)
-                if fc["lang"] == "dv":
-                    title   = gemini_translate(title)
-                    summary = gemini_translate(summary[:300])
-                key = title.lower()[:50]
-                if key in seen_titles or not is_fresh(entry): continue
+    for a in fetch_latest_web_pages(limit_per_source=3):
+        if is_breaking(a.get("title",""), a.get("summary",""), a.get("cat","LOCAL")):
+            key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
+            if key not in seen_titles:
                 seen_titles.add(key)
-                articles.append({
-                    "id":      hashlib.md5(entry.get("link", title).encode()).hexdigest(),
-                    "title":   title,
-                    "summary": summary,
-                    "link":    entry.get("link", ""),
-                    "cat":     fc["cat"],
-                    "lang":    fc["lang"],
-                    "source":  entry.get("source", {}).get("title", fc["cat"]),
-                })
-        except Exception as e:
-            log.error(f"Breaking source feed error ({fc['url']}): {e}")
+                articles.append(a)
+
+    # Telegram can be faster than RSS for Maldives breaking alerts.
+    for a in fetch_all_dv_channels():
+        if is_breaking(a.get("title",""), a.get("summary",""), a.get("cat","LOCAL")):
+            key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
+            if key not in seen_titles:
+                seen_titles.add(key)
+                articles.append(a)
+
+    for fc in BREAKING_SOURCES:
+        for a in fetch_rss_feed_items(fc, limit=5, max_age_hours=12):
+            key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
+            if key in seen_titles:
+                continue
+            seen_titles.add(key)
+            articles.append(a)
+
+    # Major global disasters/conflicts can also be breaking if hard-news criteria match.
+    for a in fetch_world_updates(limit=4):
+        if a.get("cat") == "DISASTER" or is_breaking(a.get("title",""), a.get("summary",""), a.get("cat","WORLD")):
+            key = _caption_match_key(a.get("title", "")) or re.sub(r"\W+", " ", a["title"].lower()).strip()[:70]
+            if key not in seen_titles:
+                seen_titles.add(key)
+                articles.append(a)
     return articles
 
 def breaking_news_check():
@@ -4039,8 +4779,8 @@ def breaking_news_check():
 def scheduled_check():
     h=get_mvt_hour()
     if not is_day_mode():
-        log.info(f"🌙 Night mode (MVT {h:02d}:xx) — breaking news only")
-        run_job(breaking_only=True); return
+        log.info(f"🌙 Night mode (MVT {h:02d}:xx) — website keeps updating 24/7; socials/content lab stay protected")
+        run_job(website_only=True); return
     run_job()
 
 # ── Morning Brief (7AM MVT) ───────────────────────────────────────────────────
@@ -6309,7 +7049,7 @@ def get_sender_info(user_name, first_name):
 
 # ── Newsroom snapshot — cached 10 min, injected into brain when relevant ─────
 _snapshot_cache = {"data": None, "ts": None}
-_SNAPSHOT_TTL = 600  # 10 minutes
+_SNAPSHOT_TTL = 600  # 2 minutes
 
 def get_newsroom_snapshot():
     """
@@ -6655,26 +7395,19 @@ def handle_updates():
                                 reply_to=msg_id)
                             log.info(f"🚫 DM rate limit hit: {display_name} ({user_id})")
                         else:
-                            log.info(f"💬 DM {display_name} [{count}/{limit}]: {text[:50]}")
-                            # Check for story-timeline questions first
-                            story_answer = answer_story_query(text)
-                            if story_answer:
-                                send_text(chat_id, story_answer, reply_to=msg_id, thread_id=thread_id)
-                            elif is_dhivehi(text):
-                                log.info("🇲🇻 Dhivehi detected — using Gemini")
-                                headlines = get_local_headlines()
-                                context = "\n".join(headlines[:5]) if headlines else ""
-                                history = get_conversation(user_id)
-                                reply = chat_with_gemini_dhivehi(text, context, history)
-                                if reply:
-                                    add_to_conversation(user_id, "user", text)
-                                    add_to_conversation(user_id, "assistant", reply)
-                                else:
-                                    reply = chat_with_claude(text, user_id)
-                                    send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
-                            else:
-                                reply = chat_with_claude(text, user_id)
-                                send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
+                            log.info(f"💬 Public Telegram Samuga AI {display_name} [{count}/{limit}]: {text[:50]}")
+                            try:
+                                reply = public_samuga_ai_chat(
+                                    message=text,
+                                    platform="telegram",
+                                    user_key=user_id,
+                                    session_id=str(chat_id),
+                                    lang=("dv" if is_dhivehi(text) else "en")
+                                )
+                            except Exception as e:
+                                log.error(f"Unified public Telegram chat failed: {e}")
+                                reply = "Small issue on my side bro 😅 Try again in a moment."
+                            send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
 
                 elif chat_type in ["group","supergroup"]:
                     is_core_team = str(chat_id) == CORE_TEAM_CHAT_ID
@@ -6778,7 +7511,7 @@ def handle_updates():
                                                     f"📡 <b>ސަމުގާ މީޑިއާ</b> | @samugacommunity"
                                                 )
                                                 card.seek(0)
-                                                # Queue handles Telegram + FB + IG + X with 10-min gap
+                                                # Queue handles Telegram + FB + IG + X with 2-min gap
                                                 # tg_ok=False initially — queue will post Telegram too
                                                 remember_post(_item["title"], _item["cat"], ts_now)
                                                 db_mark_status(_item.get("article_id",""), "posted", posted=True)
@@ -6814,7 +7547,7 @@ def handle_updates():
                                         threading.Thread(target=_process_dv, daemon=True).start()
                                         ok = True  # optimistic — thread handles actual result
                                     else:
-                                        # English — queue for Telegram + social (10-min gap)
+                                        # English — queue for Telegram + social (2-min gap)
                                         # EXCEPT breaking which fires immediately
                                         is_breaking_card = item.get("is_breaking", False)
                                         if is_breaking_card:
@@ -6831,7 +7564,7 @@ def handle_updates():
                                             )
                                             ok = tg_ok
                                         else:
-                                            # Regular — joins queue with 10-min gap
+                                            # Regular — joins queue with 2-min gap
                                             buf = io.BytesIO(item["card_bytes"])
                                             queue_for_social(
                                                 buf, item["caption"],
@@ -7028,9 +7761,9 @@ def handle_updates():
                                             lines.append("   Check GEMINI_API_KEY in Railway vars")
                                     else:
                                         lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ❌ GEMINI_API_KEY not set in Railway")
-                                    # 2. Dhivehi feed check (RSS — expected to fail, kept for reference)
+                                    # 2. Source ladder health
                                     dv_feeds = [f for f in LOCAL_FEEDS if f.get("lang")=="dv"]
-                                    lines.append(f"\n📡 <b>Dhivehi RSS feeds ({len(dv_feeds)}) — now replaced by Telegram:</b>")
+                                    lines.append(f"\n📡 <b>Local RSS health ({len(dv_feeds)} core Dhivehi feeds):</b>")
                                     for f in dv_feeds:
                                         try:
                                             parsed = feedparser.parse(f["url"])
@@ -7038,17 +7771,59 @@ def handle_updates():
                                             domain = f["url"].split("/")[2]
                                             status = f"✅ {n} items" if n > 0 else "❌ 0 items (blocked/down)"
                                             lines.append(f"  {status} — {domain}")
-                                        except Exception as fe:
+                                        except Exception:
                                             lines.append(f"  ❌ {f['url'].split('/')[2]}: error")
-                                    # 3. Telegram Dhivehi channels
-                                    lines.append(f"\n📲 <b>Dhivehi Telegram channels:</b>")
+
+                                    lines.append(f"\n🧗 <b>RSS recovery ladder:</b>")
+                                    try:
+                                        rss_recovery = fetch_local_rss_recovery(limit_per_source=2)
+                                        src_counts = {}
+                                        for a in rss_recovery:
+                                            src_counts[a.get("source", "Unknown")] = src_counts.get(a.get("source", "Unknown"), 0) + 1
+                                        if src_counts:
+                                            for src_name, cnt in sorted(src_counts.items()):
+                                                lines.append(f"  ✅ {src_name}: {cnt} backup item(s)")
+                                        else:
+                                            lines.append("  ⚠️ No RSS recovery items now — latest pages/Telegram still active")
+                                    except Exception as re_err:
+                                        lines.append(f"  ❌ RSS recovery error: {str(re_err)[:50]}")
+
+                                    lines.append(f"\n🌐 <b>Latest-page scraping:</b>")
+                                    try:
+                                        latest = fetch_latest_web_pages(limit_per_source=2)
+                                        counts = {}
+                                        for a in latest:
+                                            counts[a.get("source", "Unknown")] = counts.get(a.get("source", "Unknown"), 0) + 1
+                                        if counts:
+                                            for src_name, cnt in sorted(counts.items()):
+                                                lines.append(f"  ✅ {src_name}: {cnt} headline(s)")
+                                        else:
+                                            lines.append("  ⚠️ No latest-page headlines returned")
+                                    except Exception as we:
+                                        lines.append(f"  ❌ latest-page error: {str(we)[:50]}")
+
+                                    # 3. Telegram/local channels
+                                    lines.append(f"\n📲 <b>Telegram/local channels:</b>")
+                                    seen_handles = set()
                                     for ch in DV_TELEGRAM_CHANNELS:
+                                        if ch.get("handle") in seen_handles:
+                                            continue
+                                        seen_handles.add(ch.get("handle"))
                                         try:
                                             arts = fetch_dv_telegram(ch["handle"], ch["source"])
                                             dv_count = sum(1 for a in arts if a["lang"]=="dv")
-                                            lines.append(f"  ✅ {ch['source']}: {len(arts)} items ({dv_count} Dhivehi)")
+                                            ok = "✅" if len(arts) else "⚠️"
+                                            lines.append(f"  {ok} @{ch['handle']} / {ch['source']}: {len(arts)} items ({dv_count} Dhivehi)")
                                         except Exception as ce:
-                                            lines.append(f"  ❌ {ch['source']}: {str(ce)[:30]}")
+                                            lines.append(f"  ❌ @{ch.get('handle','?')} / {ch['source']}: {str(ce)[:30]}")
+
+                                    lines.append(f"\n🌍 <b>World updates:</b>")
+                                    try:
+                                        world = fetch_world_updates(limit=3)
+                                        lines.append(f"  ✅ {len(world)} major world item(s) available")
+                                    except Exception as world_err:
+                                        lines.append(f"  ❌ World fetch error: {str(world_err)[:50]}")
+
                                     # 4. Queue state
                                     dv_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="dv")
                                     en_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="en")
@@ -7800,22 +8575,20 @@ def handle_updates():
 
                             threading.Thread(target=_reply_coreteam, daemon=True).start()
 
-                    # Regular group — only respond when tagged
+                    # Regular public group — only respond when tagged, using the same public Samuga AI brain
                     elif tagged and clean:
-                        log.info(f"💬 Group {display_name}: {clean[:50]}")
-                        if is_dhivehi(clean):
-                            log.info("🇲🇻 Dhivehi group mention — using Gemini")
-                            headlines = get_local_headlines()
-                            context = "\n".join(headlines[:5]) if headlines else ""
-                            history = get_conversation(user_id)
-                            reply = chat_with_gemini_dhivehi(clean, context, history)
-                            if reply:
-                                add_to_conversation(user_id, "user", clean)
-                                add_to_conversation(user_id, "assistant", reply)
-                            else:
-                                reply = chat_with_claude(clean, user_id)
-                        else:
-                            reply = chat_with_claude(clean, user_id)
+                        log.info(f"💬 Public group Samuga AI {display_name}: {clean[:50]}")
+                        try:
+                            reply = public_samuga_ai_chat(
+                                message=clean,
+                                platform="telegram_group",
+                                user_key=f"{chat_id}:{user_id}",
+                                session_id=str(chat_id),
+                                lang=("dv" if is_dhivehi(clean) else "en")
+                            )
+                        except Exception as e:
+                            log.error(f"Unified public group chat failed: {e}")
+                            reply = "Small issue on my side bro 😅 Try again in a moment."
                         send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
         except Exception as e:
             log.error(f"Update loop: {e}"); time.sleep(5)
@@ -7842,10 +8615,10 @@ def _api_has_thaana(text):
     return any("\u0780" <= ch <= "\u07BF" for ch in str(text or ""))
 
 def _api_lang(title, summary, lang):
-    lang = str(lang or "").lower()
-    if lang in ("dv", "dhivehi"):
-        return "dv"
-    return "dv" if _api_has_thaana((title or "") + " " + (summary or "")) else "en"
+    # Website language must be based on actual script quality.
+    # Do not show Latin Thaana in the Dhivehi side.
+    text = (title or "") + " " + (summary or "")
+    return "dv" if _api_has_thaana(text) else "en"
 
 def _api_category(cat, title="", summary=""):
     try:
@@ -7872,7 +8645,7 @@ def api_home():
         "status": "online",
         "name": "Samuga News Bot API",
         "version": SAMUGA_VERSION,
-        "endpoints": ["/api/stories", "/api/article?id=ARTICLE_ID", "/api/health", "/api/chat"]
+        "endpoints": ["/api/stories", "/api/article?id=ARTICLE_ID", "/api/health", "/api/chat", "/api/public-interest"]
     })
 
 @api_app.get("/api/health")
@@ -7901,6 +8674,25 @@ def api_health():
         "latest": latest,
         "queue": len(_social_queue) if "_social_queue" in globals() else 0
     })
+
+
+@api_app.get("/api/public-interest")
+def api_public_interest():
+    """Aggregated public Samuga AI interest radar. No private messages exposed."""
+    try:
+        rows = db_execute("""
+            SELECT topic, platform, SUM(count) AS total
+            FROM public_interest_daily
+            WHERE day >= CURRENT_DATE - INTERVAL '7 days'
+            GROUP BY topic, platform
+            ORDER BY total DESC
+            LIMIT 50
+        """, fetch="all") or []
+        items = [{"topic": r[0], "platform": r[1], "count": int(r[2] or 0)} for r in rows]
+        return jsonify({"ok": True, "window": "7d", "items": items})
+    except Exception as e:
+        log.error(f"Website API /api/public-interest error: {e}")
+        return jsonify({"ok": False, "items": []})
 
 @api_app.get("/api/stories")
 def api_stories():
@@ -7931,6 +8723,11 @@ def api_stories():
             safe_title = _api_clean_text(strip_source_links(title), 500)
             safe_summary = _api_clean_text(strip_source_links(article_excerpt or summary), 420)
             if not safe_title:
+                continue
+
+            # Hide old broken Latin Thaana rows from the website feed.
+            # New rows are fixed before publish by normalize_article_language_for_public().
+            if looks_latin_thaana(f"{safe_title} {safe_summary}") and not _api_has_thaana(f"{safe_title} {safe_summary}"):
                 continue
 
             # Dedupe same headline in API so the site stays clean
@@ -7986,6 +8783,8 @@ def api_article():
 
         safe_title = _api_clean_text(strip_source_links(title), 500)
         safe_summary = _api_clean_text(strip_source_links(summary), 1800)
+        if looks_latin_thaana(f"{safe_title} {safe_summary}") and not _api_has_thaana(f"{safe_title} {safe_summary}"):
+            return jsonify({"error": "article language cleanup pending"}), 404
         safe_category = _api_category(category, safe_title, safe_summary)
         safe_lang = _api_lang(safe_title, safe_summary, lang)
         body = article_body
@@ -8024,7 +8823,7 @@ def api_article():
 # not from old model memory. It also cleans markdown so replies feel human.
 _PUBLIC_CHAT_RATE = {}  # ip -> [timestamps]
 _PUBLIC_CHAT_LIMIT = 12
-_PUBLIC_CHAT_WINDOW = 60 * 10  # 12 messages per 10 minutes per IP
+_PUBLIC_CHAT_WINDOW = 60 * 10  # 12 messages per 2 minutes per IP
 _PUBLIC_CHAT_MAX_CHARS = 600
 _PUBLIC_CHAT_BLOCKED_COMMANDS = [
     "/approve", "/approved", "/reject", "/confirm", "/cancel", "/ai ",
@@ -8227,13 +9026,256 @@ def _public_chat_context(rows):
     return "\n".join(lines)
 
 
+
+# ── Unified Public Samuga AI Brain ────────────────────────────────────────────
+# Website chat, public Telegram DM, and future WhatsApp should all call this one
+# function so Samuga AI has one public personality, one memory, and one analytics stream.
+
+_PUBLIC_TOPIC_KEYWORDS = {
+    "housing": ["housing","flat","flats","rent","land","apartment","gedhoru","hiya","vinares","ފްލެޓް","ބިން"],
+    "politics": ["politics","president","minister","majlis","parliament","mdp","pnc","ppm","election","bill","law","ރައީސް","މަޖިލީސް"],
+    "economy": ["economy","dollar","usd","mvr","rufiyaa","debt","tax","price","inflation","budget","ޑޮލަރ","ރުފިޔާ"],
+    "tourism": ["tourism","tourist","resort","travel","airport","arrival","hotel","ޓޫރިޒަމް"],
+    "crime": ["police","arrest","court","murder","stab","drug","gang","theft","ފުލުހުން","ކޯޓު"],
+    "health": ["health","hospital","doctor","clinic","aasandha","disease","ސިއްހަތު","ހޮސްޕިޓަލް"],
+    "education": ["school","student","visa","university","teacher","exam","ސްކޫލް","ދަރިވަރު"],
+    "weather": ["weather","rain","storm","wind","sea","alert","mms","ވައި","ވާރޭ"],
+    "foreign": ["iran","israel","us","usa","america","india","china","qatar","uk","war","global","world","އިންޑިޔާ","ޗައިނާ"],
+    "sports": ["sports","football","fifa","match","team","ކުޅިވަރު","ފުޓްބޯޅަ"],
+}
+
+_CURRENT_GLOBAL_WORDS = [
+    "now","current","latest","today","breaking","happening","war","conflict","iran","israel",
+    "america","us ","usa","ukraine","russia","qatar","oil","global","world"
+]
+
+def public_detect_topics(message):
+    low = (message or "").lower()
+    topics = []
+    for topic, kws in _PUBLIC_TOPIC_KEYWORDS.items():
+        if any(k in low for k in kws):
+            topics.append(topic)
+    if not topics and _public_chat_is_news_query(message):
+        topics.append("news")
+    if not topics:
+        topics.append("general")
+    return topics[:5]
+
+def public_detect_intent(message):
+    low = (message or "").lower()
+    if any(w in low for w in ["hi", "hello", "hey", "salaam", "ހެލޯ"]) and len(low.split()) <= 4:
+        return "greeting"
+    if any(w in low for w in ["breaking", "urgent", "ބްރޭކިންގ"]):
+        return "breaking_news"
+    if any(w in low for w in ["summarize", "summary", "briefing", "biggest", "today", "މިއަދު"]):
+        return "briefing"
+    if _public_chat_is_news_query(message):
+        return "news_query"
+    if any(w in low for w in _CURRENT_GLOBAL_WORDS):
+        return "current_global"
+    return "general_chat"
+
+def public_is_global_current_query(message):
+    low = " " + (message or "").lower() + " "
+    local_hits = ["maldives","raajje","dhivehi","male","malé","samuga","ރާއްޖެ","ދިވެހި"]
+    if any(x in low for x in local_hits):
+        return False
+    return any(w in low for w in _CURRENT_GLOBAL_WORDS) or any(t in public_detect_topics(message) for t in ["foreign"])
+
+def public_log_chat(platform, session_id, user_key, user_message, bot_reply, lang, intent, topics, used_search=False):
+    """Store public Samuga AI chats for interest analytics across website/Telegram/future WhatsApp."""
+    try:
+        if not DB_ENABLED:
+            return
+        topics = topics or ["general"]
+        db_execute("""
+            INSERT INTO public_chat_messages
+                (platform, session_id, user_key, user_message, bot_reply, lang, intent, topics, used_search)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            platform, str(session_id or "")[:120], str(user_key or "")[:160],
+            str(user_message or "")[:1200], str(bot_reply or "")[:1800],
+            lang, intent, topics, bool(used_search)
+        ))
+        for topic in topics:
+            db_execute("""
+                INSERT INTO public_interest_daily (day, topic, platform, count, updated_at)
+                VALUES (CURRENT_DATE, %s, %s, 1, NOW())
+                ON CONFLICT (day, topic, platform)
+                DO UPDATE SET count = public_interest_daily.count + 1, updated_at = NOW()
+            """, (topic, platform))
+    except Exception as e:
+        log.debug(f"Public chat analytics save failed: {e}")
+
+def public_session_key(platform, user_key, session_id=""):
+    platform = str(platform or "web").lower()
+    user_key = str(user_key or "anon")[:80]
+    session_id = str(session_id or "default")[:80]
+    if platform == "telegram":
+        return f"public:telegram:{user_key}"
+    if platform == "whatsapp":
+        return f"public:whatsapp:{user_key}"
+    return f"public:web:{user_key}:{session_id}"
+
+def public_get_recent_interest(limit=8):
+    try:
+        rows = db_execute("""
+            SELECT topic, SUM(count) AS c
+            FROM public_interest_daily
+            WHERE day >= CURRENT_DATE - INTERVAL '3 days'
+            GROUP BY topic
+            ORDER BY c DESC
+            LIMIT %s
+        """, (limit,), fetch="all") or []
+        return ", ".join([f"{r[0]} ({r[1]})" for r in rows])
+    except Exception:
+        return ""
+
+def public_build_live_context(message, lang="en"):
+    """Use Tavily smartly: local queries search Maldives; global/current queries search globally."""
+    try:
+        if not TAVILY_API_KEY:
+            return "", False
+        if public_is_global_current_query(message):
+            q = message
+        elif _public_chat_is_news_query(message):
+            q = f"Maldives news {message}"
+        else:
+            # For normal questions we usually don't need search.
+            return "", False
+        ctx = tavily_search(q)
+        return strip_source_links(_api_clean_text(ctx, 1800)), bool(ctx)
+    except Exception as e:
+        log.warning(f"Public Samuga AI live search failed: {e}")
+        return "", False
+
+def public_samuga_ai_chat(message, platform="web", user_key="", session_id="", lang=None):
+    """
+    One public Samuga AI for website + @SamugaNewsBot + future WhatsApp.
+    This is NOT the private core-team brain.
+    """
+    message = _public_chat_clean_message(message)
+    if not message:
+        return "Ask me something bro. I can chat or help with latest news."
+
+    detected_lang = "dv" if (lang == "dv" or is_dhivehi(message)) else "en"
+    skey = public_session_key(platform, user_key, session_id)
+    history = get_conversation(skey)[-8:]
+    intent = public_detect_intent(message)
+    topics = public_detect_topics(message)
+
+    # Story intelligence first if the archive can directly answer.
+    story_answer = None
+    try:
+        story_answer = answer_story_query(message)
+    except Exception as e:
+        log.debug(f"Public story query fallback: {e}")
+
+    latest_rows = []
+    search_rows = []
+    db_context = ""
+    if intent in ("news_query", "breaking_news", "briefing", "current_global") or topics != ["general"]:
+        latest_rows = _public_chat_latest_rows(lang=None if detected_lang == "en" else "dv", limit=8, hours=48)
+        search_rows = _public_chat_search_rows(message, lang=None if detected_lang == "en" else "dv", limit=6)
+        context_rows = search_rows or latest_rows
+        if intent == "breaking_news":
+            breaking_rows = [r for r in latest_rows if str(r.get("category","")).upper() == "BREAKING"]
+            context_rows = breaking_rows or latest_rows[:4]
+        db_context = _public_chat_context(context_rows[:6])
+
+    live_context, used_search = public_build_live_context(message, lang=detected_lang)
+    interests = public_get_recent_interest()
+
+    if story_answer and not public_is_global_current_query(message):
+        reply = _public_chat_clean_reply(story_answer)
+        add_to_conversation(skey, "user", message)
+        add_to_conversation(skey, "assistant", reply)
+        public_log_chat(platform, session_id, user_key, message, reply, detected_lang, intent, topics, used_search=False)
+        return reply
+
+    system = f"""You are Samuga AI, the single public chatbot for Samuga Media.
+You are used on the website, Telegram @SamugaNewsBot, and later WhatsApp.
+You are friendly, sharp, and useful — like a Maldivian news buddy, not a hard-coded bot.
+
+IMPORTANT IDENTITY:
+- You are the PUBLIC Samuga AI, not the private core-team newsroom brain.
+- Never reveal admin/content-lab/private commands.
+- You can answer Maldives news, global current events, and normal questions.
+- For current/global questions, use live search context if provided.
+- For Maldives questions, use Samuga archive first, then live search if helpful.
+- Do not include external source URLs. Send people to @samugacommunity for Samuga updates.
+- Keep replies conversational. No markdown **, ###, long separators, or robotic lists.
+- Short by default. If news: max 3 items unless user asks for more.
+- Remember the chat history and answer follow-ups naturally.
+- If user uses Dhivehi/Thaana, answer in natural Dhivehi. If English, answer in English.
+
+Public interest radar from recent chats: {interests or "not enough data yet"}.
+"""
+
+    user_block = f"""User message:
+{message}
+
+Intent: {intent}
+Topics: {", ".join(topics)}
+Platform: {platform}
+Fresh Samuga archive context:
+{db_context or "No direct Samuga archive context found."}
+
+Live search context:
+{live_context or "No live search context used or available."}
+"""
+
+    try:
+        messages = []
+        for h in history[-8:]:
+            role = h.get("role")
+            content = h.get("content", "")
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content[:1200]})
+        messages.append({"role": "user", "content": user_block})
+
+        if detected_lang == "dv" and GEMINI_API_KEY:
+            # Gemini is stronger for Dhivehi. Include history manually in prompt.
+            hist_txt = "\n".join([f"{h.get('role')}: {h.get('content','')}" for h in history[-6:]])
+            gemini_prompt = f"""{system}
+
+Recent chat history:
+{hist_txt}
+
+{user_block}
+
+Answer now in natural Dhivehi Thaana if the user used Dhivehi; otherwise English.
+"""
+            reply = _gemini_post(gemini_prompt, timeout=25) or ""
+            if not reply:
+                raise RuntimeError("Gemini public chat returned empty")
+        else:
+            msg = ai.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=650,
+                system=system,
+                messages=messages
+            )
+            reply = msg.content[0].text.strip()
+
+    except Exception as e:
+        log.error(f"Unified public Samuga AI failed: {e}")
+        # Safe fallback: show latest DB rows if available.
+        if latest_rows:
+            reply = _public_chat_format_news(latest_rows[:3], lang=detected_lang)
+        else:
+            reply = "I had a small issue checking live updates bro. Try again in a moment."
+
+    reply = _public_chat_clean_reply(reply)
+    add_to_conversation(skey, "user", message)
+    add_to_conversation(skey, "assistant", reply)
+    public_log_chat(platform, session_id, user_key, message, reply, detected_lang, intent, topics, used_search=used_search)
+    return reply
+
+
 @api_app.route("/api/chat", methods=["POST", "OPTIONS"])
 def api_chat():
-    """
-    Public website chat for Samuga AI.
-    This mirrors the public @SamugaNewsBot chat style, NOT the private core-team brain.
-    It can chat normally, but when the user asks news/current questions it uses fresh Samuga DB context first.
-    """
+    """Public website chat endpoint using the unified public Samuga AI brain."""
     if request.method == "OPTIONS":
         return jsonify({"ok": True})
 
@@ -8257,112 +9299,29 @@ def api_chat():
             return jsonify({
                 "ok": False,
                 "error": "empty_message",
-                "reply": "Ask me something bro. I can chat or help with latest Maldives news."
+                "reply": "Ask me something bro. I can chat or help with latest news."
             }), 400
 
         if _public_chat_is_blocked(message):
             return jsonify({
                 "ok": True,
-                "reply": "I can only do public chat and public news here bro. Posting, approvals, and newsroom controls are only for the private Samuga team Telegram."
+                "reply": "I can only do public chat and public news here bro. Posting, approvals, and newsroom controls are only for the private Samuga team."
             })
 
-        user_id = f"web:{client_id}:{session_id}"
-        log.info(f"🌐 Website chat {client_id}: {message[:80]}")
+        log.info(f"🌐 Website public Samuga AI {client_id}: {message[:80]}")
+        reply = public_samuga_ai_chat(
+            message=message,
+            platform="web",
+            user_key=client_id,
+            session_id=session_id,
+            lang=lang
+        )
 
-        # Keep the same public Telegram bot feeling:
-        # 1) Story timeline/search answer if the bot already knows a direct story answer
-        # 2) Fresh Samuga website DB context for news/current questions
-        # 3) Normal friendly public Samuga AI chat for casual/general questions
-        story_answer = None
-        try:
-            story_answer = answer_story_query(message)
-        except Exception as e:
-            log.warning(f"Website story query fallback: {e}")
-
-        if story_answer:
-            reply = story_answer
-        else:
-            is_news_question = _public_chat_is_news_query(message)
-            is_breaking_question = any(w in message.lower() for w in ["breaking", "urgent", "ބްރޭކިންގ"])
-            is_briefing_question = any(w in message.lower() for w in ["briefing", "summarize", "summary", "today", "biggest", "މިއަދު"])
-
-            latest_rows = _public_chat_latest_rows(lang=lang, limit=8, hours=36)
-            search_rows = _public_chat_search_rows(message, lang=lang, limit=6)
-
-            context_rows = search_rows or latest_rows
-            if is_breaking_question:
-                breaking_rows = [r for r in latest_rows if str(r.get("category", "")).upper() == "BREAKING"]
-                context_rows = breaking_rows or latest_rows[:4]
-
-            context = _public_chat_context(context_rows[:6])
-            tavily_context = _public_chat_tavily_context(message, lang=lang) if is_news_question else ""
-
-            # For public website chat, use the public Samuga AI style — not core-team brain.
-            # The prompt keeps answers short and human, while fresh context prevents old memory headlines.
-            if is_news_question:
-                if lang == "dv":
-                    safe_prompt = (
-                        "You are Samuga AI, the public SamugaNewsBot style assistant. "
-                        "Answer in natural Dhivehi if the user used Dhivehi, otherwise simple English. "
-                        "Use fresh Samuga context first, and Tavily live search context only to add current facts. "
-                        "Do not mention old stories from memory. Do not use markdown symbols like ** or ###. "
-                        "Keep it short. For latest news, give maximum 3 items. Do not include external source links; direct users to @samugacommunity. "
-                        "For breaking, only say breaking if context actually looks breaking. "
-                        "Be friendly like a chat, not a formal article.\n\n"
-                        f"Fresh Samuga context:\n{context}\n\nTavily live search context:\n{tavily_context}\n\n"
-                        f"User asked: {message}"
-                    )
-                else:
-                    if is_breaking_question:
-                        mode = "breaking news check"
-                    elif is_briefing_question:
-                        mode = "short daily briefing"
-                    else:
-                        mode = "latest news chat"
-                    safe_prompt = (
-                        "You are Samuga AI, the public @SamugaNewsBot style assistant. "
-                        "Reply naturally, friendly, and human — like a helpful Maldivian news buddy. "
-                        "Use fresh Samuga context first, and Tavily live search context only to add current facts. "
-                        "Do not use old headlines from memory. Do not use markdown symbols like **, ###, or long separators. "
-                        "Do not dump a long list. Maximum 3 short items unless the user asks for more. "
-                        "Avoid repeating the title and summary. Keep each item to one short sentence. "
-                        "Do not include external source links or tell users to visit source websites; send them to @samugacommunity for full updates. End with one natural follow-up question.\n\n"
-                        f"Mode: {mode}\n"
-                        f"Fresh Samuga context:\n{context}\n\nTavily live search context:\n{tavily_context}\n\n"
-                        f"User asked: {message}"
-                    )
-            else:
-                safe_prompt = (
-                    "You are Samuga AI, the public @SamugaNewsBot style assistant. "
-                    "Chat naturally and friendly. You can answer normal questions too. "
-                    "If the question is about news, use the fresh Samuga context below. "
-                    "Do not reveal private newsroom/admin details. Do not approve/reject/post anything. "
-                    "Keep the answer short and conversational. No markdown symbols like **. Do not include external source links; direct users to @samugacommunity when needed.\n\n"
-                    f"Fresh Samuga context if needed:\n{context}\n\n"
-                    f"User message: {message}"
-                )
-
-            if lang == "dv":
-                try:
-                    history = get_conversation(user_id)
-                    reply = chat_with_gemini_dhivehi(safe_prompt, context, history)
-                    if reply:
-                        add_to_conversation(user_id, "user", message)
-                        add_to_conversation(user_id, "assistant", reply)
-                    else:
-                        reply = chat_with_claude(safe_prompt, user_id)
-                except Exception as e:
-                    log.error(f"Website Dhivehi public chat fallback: {e}")
-                    reply = chat_with_claude(safe_prompt, user_id)
-            else:
-                reply = chat_with_claude(safe_prompt, user_id)
-
-        reply = _public_chat_clean_reply(reply) or "Sorry bro, I couldn't answer that right now. Try asking again."
         return jsonify({
             "ok": True,
             "reply": reply,
-            "source": "Samuga AI public chat",
-            "mode": "public_samuganewsbot_style",
+            "source": "Unified public Samuga AI",
+            "mode": "public_samuga_ai",
             "rate_limit": {"limit": limit, "window_seconds": _PUBLIC_CHAT_WINDOW}
         })
 
@@ -8417,9 +9376,9 @@ if __name__ == "__main__":
     log.info("🧠 Core team brain: live newsroom awareness + persistent memory")
     log.info("💬 Smart chat: history, web search, Dhivehi support, story queries")
 
-    # Start social queue worker — drains one post every 10 minutes
+    # Start social queue worker — drains one post every 2 minutes
     threading.Thread(target=_social_queue_worker, daemon=True).start()
-    log.info("📲 Social queue worker started (10-min gap between posts)")
+    log.info("📲 Social queue worker started (2-min gap between posts)")
 
     init_database()  # connect to Postgres (falls back to JSON if unavailable)
     restore_state()  # bring back dedup memory, daily counters, pending cards, analytics
@@ -8433,7 +9392,7 @@ if __name__ == "__main__":
     scheduler.add_job(scheduled_check, "interval", minutes=15)
     # Breaking news fast check every 5 min (LOCAL/DISASTER only)
     scheduler.add_job(breaking_news_check, "interval", minutes=5)
-    # Approval lifecycle — English auto-posts at 15min, Dhivehi expires at 2h. Check every 5 min.
+    # Approval lifecycle — English confidence auto-post, Dhivehi expires at 2h. Check every 5 min.
     scheduler.add_job(expire_old_approvals, "interval", minutes=5)
     scheduler.add_job(release_content_lab_drip, "interval", minutes=10)
     # Morning brief 7AM MVT = 2AM UTC
