@@ -160,18 +160,13 @@ def parse_extra_telegram_sources():
 
 # ── Dhivehi Telegram channel list ────────────────────────────────────────────
 DV_TELEGRAM_CHANNELS = [
-    {"handle": "mihaarulive",      "source": "Mihaaru",   "reliability": 95},
-    {"handle": "mihaaru",          "source": "Mihaaru",   "reliability": 95},
-    {"handle": "avasonline",       "source": "Avas",      "reliability": 88},
-    {"handle": "avasmv",           "source": "Avas",      "reliability": 88},
-    {"handle": "sunmvmv",          "source": "Sun",       "reliability": 92},
-    {"handle": "sunonlinemv",      "source": "Sun",       "reliability": 92},
-    {"handle": "raajjemvlive",     "source": "Raajje",    "reliability": 85},
-    {"handle": "raajjemv",         "source": "Raajje",    "reliability": 85},
-    {"handle": "voicemaldives",    "source": "VoiceMV",   "reliability": 80},
-    {"handle": "voice_mv",         "source": "VoiceMV",   "reliability": 80},
-    {"handle": "mvplusmedia",      "source": "MV+",       "reliability": 82},
-    {"handle": "mvcrisis",         "source": "MvCrisis",  "reliability": 70},
+    {"handle": "mihaarulive",   "source": "Mihaaru",  "reliability": 95},
+    {"handle": "avasonline",    "source": "Avas",     "reliability": 88},
+    {"handle": "sunonlinemv",   "source": "Sun",      "reliability": 92},
+    {"handle": "raajjemvlive",  "source": "Raajje",   "reliability": 85},
+    {"handle": "voicemaldives", "source": "VoiceMV",  "reliability": 80},
+    {"handle": "mvplusmedia",   "source": "MV+",      "reliability": 82},
+    {"handle": "mvcrisis",      "source": "MvCrisis", "reliability": 70},
 ] + parse_extra_telegram_sources()
 
 # ── Ad/promo filter keywords ──────────────────────────────────────────────────
@@ -406,7 +401,7 @@ def fetch_dv_telegram(handle, source, reliability=80):
 
 
 def fetch_all_dv_channels():
-    """Fetch all Dhivehi Telegram channels in parallel threads."""
+    """Fetch selected Telegram channels in parallel and dedupe same-source duplicates."""
     results = []
     lock    = threading.Lock()
 
@@ -415,13 +410,18 @@ def fetch_all_dv_channels():
         with lock:
             results.extend(arts)
 
-    threads = [
-        threading.Thread(target=_fetch, args=(ch,), daemon=True)
-        for ch in DV_TELEGRAM_CHANNELS
-    ]
+    threads = [threading.Thread(target=_fetch, args=(ch,), daemon=True) for ch in DV_TELEGRAM_CHANNELS]
     for t in threads: t.start()
     for t in threads: t.join(timeout=15)
-    return results
+
+    deduped, seen = [], set()
+    for a in results:
+        key = f"{a.get('source','')}::{_caption_match_key(a.get('title',''))}"
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(a)
+    return deduped
 
 
 

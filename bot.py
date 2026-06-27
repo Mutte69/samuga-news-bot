@@ -41,8 +41,9 @@ from weather import (
 )
 from fetchers import (
     fetch_news, fetch_mvcrisis, fetch_all_dv_channels, fetch_dv_telegram,
+    fetch_latest_web_pages, fetch_local_rss_recovery, fetch_world_updates,
     get_local_headlines, rewrite_news, gemini_translate,
-    RSS_FEEDS, LOCAL_FEEDS, DV_TELEGRAM_CHANNELS, DEFAULT_KEYWORDS,
+    RSS_FEEDS, LOCAL_FEEDS, DV_TELEGRAM_CHANNELS, DEFAULT_KEYWORDS, WEB_LATEST_SOURCES,
     has_public_placeholder, public_text_is_safe, fallback_rewritten_news,
     clean_ai_line, safe_image_keyword
 )
@@ -83,15 +84,19 @@ from datetime import timezone as _tz
 # Samuga public platforms; readers are directed back to Samuga Community.
 SAMUGA_PUBLIC_SOURCE = os.environ.get("SAMUGA_PUBLIC_SOURCE", "Samuga Media")
 SAMUGA_PUBLIC_LINK   = os.environ.get("SAMUGA_PUBLIC_LINK", "https://t.me/samugacommunity")
+SAMUGA_CAPTION_LINK  = os.environ.get("SAMUGA_CAPTION_LINK", "https://samugamedia.com")
 
 
 def samuga_public_caption(caption):
-    """Sanitize a caption for public posting: strip competitor/source links so
-    Samuga public platforms never expose external source URLs."""
+    """Sanitize a caption for public posting and append Samuga website."""
     if not caption:
         return caption
     try:
-        return strip_source_links(caption)
+        clean = strip_source_links(caption).strip()
+        site = (SAMUGA_CAPTION_LINK or "").strip()
+        if site and site not in clean:
+            clean = (clean + "\n\n" + site).strip()
+        return clean
     except Exception:
         return caption
 
@@ -1156,7 +1161,7 @@ def _post_to_social_now(img_buf, caption):
         if not public_text_is_safe(clean):
             log.error(f"🚫 Social post blocked unsafe caption: {clean[:120]}")
             return results
-        community_link = SAMUGA_PUBLIC_LINK
+        community_link = SAMUGA_CAPTION_LINK
 
         # FB/IG: full text + Samuga community link only
         fb_ig = clean
@@ -1221,7 +1226,7 @@ def post_to_social(img_buf, caption):
         if not public_text_is_safe(clean):
             log.error(f"🚫 Social post blocked unsafe caption: {clean[:120]}")
             return {}
-        community_link = SAMUGA_PUBLIC_LINK
+        community_link = SAMUGA_CAPTION_LINK
 
         # FB/IG: full text + Samuga community link only
         fb_ig = clean
@@ -2515,6 +2520,118 @@ def tavily_search(query):
     except Exception as e: log.error(f"Tavily: {e}")
     return ""
 
+
+def manual_topic_search_context(headline, subheading="", category="LOCAL", lang_hint="en"):
+    """Get fast web context for manually created social cards so website articles can be richer."""
+    try:
+        q = " ".join(x for x in [headline, subheading] if x).strip()
+        if not q:
+            return ""
+        query = q
+        # If input is Latin Dhivehi, convert to English for search.
+        if looks_latin_thaana(q):
+            try:
+                q_en = gemini_latin_thaana_to_english(q)
+                if q_en:
+                    query = q_en
+            except Exception:
+                pass
+        # Keep search focused on Maldives relevance.
+        if "maldives" not in query.lower():
+            query = "Maldives " + query
+        return tavily_search(query[:220])[:1200]
+    except Exception as e:
+        log.error(f"manual_topic_search_context: {e}")
+        return ""
+
+
+def manual_publish_website_article(title, subheading="", category="LOCAL", source_link="", publish_now=True):
+    """
+    For manual social cards, prepare an English website article, optionally publish it,
+    and always send the detailed article preview to Content Lab.
+    Returns dict with article_id, slug, body, title, summary, published.
+    """
+    try:
+        raw_title = (title or "").strip()
+        raw_sub   = (subheading or "").strip()
+        if not raw_title:
+            return None
+
+        search_seed = (raw_title + ("\n\n" + raw_sub if raw_sub else "")).strip()
+        english_title = raw_title
+        english_summary = raw_sub or raw_title
+
+        if looks_latin_thaana(search_seed):
+            try:
+                conv = gemini_latin_thaana_to_english(search_seed)
+                if conv:
+                    paras = [p.strip() for p in conv.split("\n\n") if p.strip()]
+                    english_title = paras[0][:180] if paras else conv[:180]
+                    english_summary = " ".join(paras[1:]).strip() if len(paras) > 1 else conv[:500]
+            except Exception as e:
+                log.warning(f"manual article latin→english failed: {e}")
+
+        search_ctx = manual_topic_search_context(english_title, english_summary, category=category, lang_hint="en")
+        summary_for_article = english_summary
+        if search_ctx:
+            summary_for_article = (english_summary + "\n\nWeb context:\n" + search_ctx).strip()
+
+        article_id = "manual_" + hashlib.md5((english_title + "|" + summary_for_article + "|" + str(utcnow())).encode()).hexdigest()[:12]
+        body = generate_website_article_body(
+            title=english_title,
+            summary=summary_for_article,
+            category=category or "LOCAL",
+            source=SAMUGA_PUBLIC_SOURCE,
+            is_breaking=(category or "").upper() in ("BREAKING", "DISASTER")
+        )
+        slug = make_article_slug(english_title, article_id)
+
+        if publish_now:
+            db_publish_article_for_website(
+                article_id=article_id,
+                title=english_title[:500],
+                summary=summary_for_article[:2500],
+                category=category or "LOCAL",
+                source=SAMUGA_PUBLIC_SOURCE,
+                link=(source_link or SAMUGA_CAPTION_LINK or "").strip(),
+                lang="en",
+                score=190,
+                reliability=95,
+                is_breaking=(category or "").upper() in ("BREAKING", "DISASTER")
+            )
+            try:
+                row = db_execute("SELECT article_slug, article_body FROM articles WHERE id=%s", (article_id,), fetch="one")
+                if row:
+                    slug = row[0] or slug
+                    body = row[1] or body
+            except Exception:
+                pass
+
+        preview = (
+            f"📝 <b>Manual Website Article {'Published' if publish_now else 'Prepared'}</b>\n\n"
+            f"<b>{english_title}</b>\n\n"
+            f"{(body or summary_for_article or english_title)[:3500]}\n\n"
+            f"🌐 <b>Website:</b> {SAMUGA_CAPTION_LINK}"
+            + (f"/article.html?id={article_id}" if publish_now and article_id else "")
+        )
+        try:
+            send_text(CORE_TEAM_CHAT_ID, preview, thread_id=CONTENT_LAB_THREAD_ID)
+        except Exception as e:
+            log.warning(f"manual article preview to content lab: {e}")
+
+        return {
+            "article_id": article_id,
+            "slug": slug,
+            "body": body,
+            "title": english_title,
+            "summary": summary_for_article,
+            "category": category or "LOCAL",
+            "published": bool(publish_now),
+        }
+    except Exception as e:
+        log.error(f"manual_publish_website_article: {e}")
+        return None
+
 def needs_web_search(msg):
     # Skip search only for simple greetings / meta questions
     # Skip search for short messages or greetings
@@ -3476,16 +3593,38 @@ def handle_updates():
                                             lines.append(f"  {status} — {domain}")
                                         except Exception as fe:
                                             lines.append(f"  ❌ {f['url'].split('/')[2]}: error")
-                                    # 3. Telegram Dhivehi channels
-                                    lines.append(f"\n📲 <b>Dhivehi Telegram channels:</b>")
+                                    # 3. Source ladder / website latest pages
+                                    try:
+                                        lines.append(f"\n🪜 <b>Source ladder:</b>")
+                                        latest_counts = {}
+                                        for src in WEB_LATEST_SOURCES:
+                                            latest_counts[src["source"]] = latest_counts.get(src["source"], 0) + 1
+                                        latest_sample = fetch_latest_web_pages(limit_per_source=2)
+                                        by_src = {}
+                                        for a in latest_sample:
+                                            by_src[a.get("source","?")] = by_src.get(a.get("source","?"), 0) + 1
+                                        for src_name in sorted(set(s.get("source","") for s in WEB_LATEST_SOURCES)):
+                                            lines.append(f"  🌐 {src_name}: {by_src.get(src_name,0)} latest-page headline(s)")
+                                        rss_backup = fetch_local_rss_recovery(limit_per_source=1)
+                                        if rss_backup:
+                                            lines.append(f"\n📡 <b>RSS recovery ladder:</b> ✅ {len(rss_backup)} backup item(s)")
+                                        else:
+                                            lines.append(f"\n📡 <b>RSS recovery ladder:</b> ⚠️ 0 backup item(s)")
+                                        world_items = fetch_world_updates(limit=2)
+                                        lines.append(f"\n🌍 <b>World updates:</b> ✅ {len(world_items)} major world item(s) available")
+                                    except Exception as ce:
+                                        lines.append(f"\n🪜 <b>Source ladder:</b> ❌ {str(ce)[:40]}")
+
+                                    # 4. Telegram channels (signal only — websites are primary)
+                                    lines.append(f"\n📲 <b>Telegram signal channels:</b>")
                                     for ch in DV_TELEGRAM_CHANNELS:
                                         try:
-                                            arts = fetch_dv_telegram(ch["handle"], ch["source"])
+                                            arts = fetch_dv_telegram(ch["handle"], ch["source"], ch.get("reliability",80))
                                             dv_count = sum(1 for a in arts if a["lang"]=="dv")
-                                            lines.append(f"  ✅ {ch['source']}: {len(arts)} items ({dv_count} Dhivehi)")
+                                            lines.append(f"  ✅ @{ch['handle']} / {ch['source']}: {len(arts)} items ({dv_count} Dhivehi)")
                                         except Exception as ce:
-                                            lines.append(f"  ❌ {ch['source']}: {str(ce)[:30]}")
-                                    # 4. Queue state
+                                            lines.append(f"  ❌ @{ch.get('handle','?')} / {ch['source']}: {str(ce)[:30]}")
+                                    # 5. Queue state
                                     dv_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="dv")
                                     en_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="en")
                                     lines.append(f"\n📋 <b>Approval queue:</b> {dv_queued} Dhivehi, {en_queued} English waiting")
@@ -3996,6 +4135,15 @@ def handle_updates():
                                         "📡 <b>Samuga Media</b> | @samugacommunity"
                                     )
 
+                                    # Build/publish website article for manual social cards.
+                                    manual_article = manual_publish_website_article(
+                                        title=card_headline if len(parts) >= 2 else content_text,
+                                        subheading=caption_subhead,
+                                        category=manual_cat,
+                                        source_link=SAMUGA_CAPTION_LINK,
+                                        publish_now=(destination != "all")
+                                    )
+
                                     posted = []
                                     _social_fired = False
 
@@ -4003,11 +4151,15 @@ def handle_updates():
                                         card.seek(0)
                                         if send_to_telegram(card, full_caption):
                                             posted.append("Community ✅")
+                                        if manual_article:
+                                            posted.append("Website ✅")
 
                                     elif destination == "coreteam":
                                         card.seek(0)
                                         if send_photo(CORE_TEAM_CHAT_ID, card, full_caption, thread_id=CONTENT_LAB_THREAD_ID):
                                             posted.append("Content Lab ✅")
+                                        if manual_article:
+                                            posted.append("Website ✅")
 
                                     elif destination == "all":
                                         # ── PREVIEW + CONFIRM gate ────────────────────────
@@ -4023,6 +4175,7 @@ def handle_updates():
                                             "thread_id":    thread_id,
                                             "first_name":   first_name,
                                             "created_at":   utcnow(),
+                                            "manual_article": manual_article,
                                         })
                                         # Send preview card to core team
                                         preview = io.BytesIO(card_bytes_stored)
@@ -4031,6 +4184,7 @@ def handle_updates():
                                             f"{full_caption}\n\n"
                                             f"━━━━━━━━━━━━━━\n"
                                             f"📲 This will post to <b>Telegram Community + Facebook + Instagram + X</b>.\n"
+                                            f"🌐 Website article draft is prepared in parallel and will publish on /confirm.\n"
                                             f"✅ <code>/confirm</code> to post everywhere\n"
                                             f"❌ <code>/cancel</code> to discard"
                                         )
@@ -4096,10 +4250,33 @@ def handle_updates():
                                             tg_ok=tg_ok_now,
                                             post_telegram=False)  # already posted above
 
+                                        manual_article = _pending_manual_post.get("manual_article") or {}
+                                        website_ok = False
+                                        if manual_article and not manual_article.get("published"):
+                                            try:
+                                                db_publish_article_for_website(
+                                                    article_id=manual_article.get("article_id"),
+                                                    title=manual_article.get("title",""),
+                                                    summary=manual_article.get("summary",""),
+                                                    category=manual_article.get("category","LOCAL"),
+                                                    source=SAMUGA_PUBLIC_SOURCE,
+                                                    link=SAMUGA_CAPTION_LINK,
+                                                    lang="en",
+                                                    score=190,
+                                                    reliability=95,
+                                                    is_breaking=(manual_article.get("category","").upper() in ("BREAKING","DISASTER"))
+                                                )
+                                                website_ok = True
+                                            except Exception as we:
+                                                log.error(f"Manual website publish on /confirm: {we}")
+                                        elif manual_article:
+                                            website_ok = True
+
                                         _pending_manual_post.clear()
                                         send_text(chat_id,
                                             f"✅ <b>Confirmed by {first_name}</b>\n"
-                                            f"Telegram {tg_icon} · FB IG X ⏳ queued",
+                                            f"Telegram {tg_icon} · FB IG X ⏳ queued"
+                                            + (f" · Website ✅" if website_ok else ""),
                                             reply_to=msg_id, thread_id=thread_id)
                                         log.info(f"✅ Manual card confirmed by {first_name} — posted everywhere")
                                     except Exception as e:
@@ -4115,7 +4292,7 @@ def handle_updates():
                             else:
                                 _pending_manual_post.clear()
                                 send_text(chat_id,
-                                    f"❌ <b>Cancelled by {first_name}</b> — card discarded, nothing posted.",
+                                    f"❌ <b>Cancelled by {first_name}</b> — card discarded, nothing posted. Website draft not published.",
                                     reply_to=msg_id, thread_id=thread_id)
                                 log.info(f"❌ Manual card cancelled by {first_name}")
 
