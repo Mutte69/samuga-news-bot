@@ -79,6 +79,84 @@ def samuga_public_summary(title="", summary="", rewritten=""):
         primary = f"{strip_source_links(title)}. {primary}"
     return primary[:2600]
 
+# ── Public output safety gate ────────────────────────────────────────────────
+# Blocks AI/template placeholders from reaching Telegram, Buffer/socials, or website.
+# This protects against model replies like "[3-sentence punchy post]" being treated as news.
+_PUBLIC_PLACEHOLDER_RE = re.compile(
+    r"(\[[^\]]*(?:sentence|punchy|rewrite|rewritten|specific|keyword|caption|post|headline|summary|text|image|insert|placeholder)[^\]]*\])"
+    r"|(<[^>]*(?:rewritten|specific|keyword|caption|post|headline|summary|text|image)[^>]*>)"
+    r"|(\b(?:TEXT|IMAGE|CAPTION|POST|HEADLINE|SUMMARY)\s*:\s*(?:\[|<|$))"
+    r"|(\bplaceholder\b|\blorem ipsum\b|\binsert (?:text|caption|headline|summary|keyword)\b)",
+    re.IGNORECASE
+)
+
+def has_public_placeholder(text):
+    """True if text contains AI/template placeholder garbage that must never go public."""
+    s = strip_source_links(text or "")
+    if not s:
+        return True
+    compact = re.sub(r"\s+", " ", s).strip()
+    if not compact:
+        return True
+    # Pure bracket/template line or obvious instruction fragment.
+    if _PUBLIC_PLACEHOLDER_RE.search(compact):
+        return True
+    if compact.startswith("[") and compact.endswith("]") and len(compact) <= 120:
+        return True
+    # Common model failure: it returns the instruction rather than the result.
+    bad_phrases = [
+        "3-sentence punchy post",
+        "three-sentence punchy post",
+        "rewritten news",
+        "specific keyword",
+        "write a short",
+        "generate a caption",
+    ]
+    low = compact.lower()
+    return any(p in low for p in bad_phrases)
+
+def public_text_is_safe(*parts):
+    """Check combined public-facing text before card/Telegram/social/website output."""
+    combined = "\n".join(str(p or "") for p in parts if p is not None)
+    return not has_public_placeholder(combined)
+
+def fallback_rewritten_news(title="", summary="", cat="LOCAL"):
+    """Safe non-AI fallback when Claude returns a placeholder or invalid output."""
+    title = strip_source_links(title or "").strip()
+    summary = strip_source_links(summary or "").strip()
+    summary = re.sub(r"\s+", " ", summary)
+    if summary and summary.lower() != title.lower() and not has_public_placeholder(summary):
+        # Keep it compact for card/social use.
+        return summary[:360].rsplit(" ", 1)[0] if len(summary) > 360 else summary
+    return title or "Samuga Media is following this developing story."
+
+def clean_ai_line(value):
+    """Remove labels/quotes/brackets from a single AI output line."""
+    s = strip_source_links(value or "")
+    s = s.strip().strip('"').strip("'").strip()
+    # If model returned a bracketed template, keep it for validation to reject.
+    return re.sub(r"\s+", " ", s).strip()
+
+def safe_image_keyword(keyword="", cat="LOCAL", title=""):
+    """Return a safe Pexels keyword; never allow placeholder keywords."""
+    kw = clean_ai_line(keyword)
+    if has_public_placeholder(kw) or len(kw.split()) > 6:
+        return DEFAULT_KEYWORDS.get(cat, DEFAULT_KEYWORDS.get(canonical_category(cat, title, ""), "maldives"))
+    return kw or DEFAULT_KEYWORDS.get(cat, "maldives")
+
+def mvt_display_time(dt):
+    """Format DB timestamps in Maldives time. Railway/Postgres often returns UTC."""
+    if not dt:
+        return "Recent"
+    try:
+        # DB timestamps are effectively UTC in Railway; website readers need MVT.
+        return (dt + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+    except Exception:
+        try:
+            return dt.strftime("%d %b %Y • %H:%M")
+        except Exception:
+            return "Recent"
+
 # ── Timezone-aware UTC helper (replaces deprecated utcnow()) ─────────
 from datetime import timezone as _tz
 def utcnow():
@@ -874,6 +952,10 @@ def db_publish_article_for_website(article_id, title="", summary="", category="L
     public_title = strip_source_links(title or "")[:500]
     public_summary = samuga_public_summary(public_title, summary or "")[:2600]
 
+    if not public_text_is_safe(public_title, public_summary):
+        log.warning(f"🌐 Website publish blocked — unsafe placeholder text: {public_title[:70]}")
+        return
+
     # Quality gate: never publish Latin Thaana as broken English/Dhivehi.
     # Gemini converts it to proper English or Thaana. If conversion fails, hold it back.
     public_title, public_summary, lang, lang_ok = normalize_article_language_for_public(
@@ -1096,7 +1178,7 @@ def related_articles_for_api(article_id, category="LOCAL", limit=4):
                 "summary": make_article_excerpt(safe_title, summary or "", lang=lang or "en"),
                 "category": cat or "LOCAL",
                 "url": f"article.html?id={rid}",
-                "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent"
+                "time": mvt_display_time(dt)
             })
         return out
     except Exception as e:
@@ -2678,19 +2760,28 @@ Also give a specific 2-3 word Pexels image keyword for this topic.
 Title: {title}
 Summary: {summary}
 
-Respond EXACTLY:
-TEXT: [rewritten news]
-IMAGE: [specific keyword]"""
+Return exactly two lines, with no brackets and no placeholder text:
+TEXT: final rewritten news post
+IMAGE: 2-3 word visual search keyword
+
+Never return bracketed placeholder text or instruction labels as the final answer."""
     try:
         msg = ai.messages.create(model="claude-haiku-4-5-20251001", max_tokens=400, messages=[{"role":"user","content":prompt}])
         text, kw = "", DEFAULT_KEYWORDS.get(cat,"maldives")
         for line in msg.content[0].text.strip().split('\n'):
-            if line.startswith("TEXT:"): text = line[5:].strip()
-            elif line.startswith("IMAGE:"): kw = line[6:].strip()
-        return (text or title), kw
+            clean_line = line.strip()
+            if clean_line.upper().startswith("TEXT:"):
+                text = clean_ai_line(clean_line[5:])
+            elif clean_line.upper().startswith("IMAGE:"):
+                kw = clean_ai_line(clean_line[6:])
+        if has_public_placeholder(text):
+            log.warning(f"[AI] Placeholder rewrite blocked; using fallback: {title[:70]}")
+            text = fallback_rewritten_news(title, summary, cat)
+        kw = safe_image_keyword(kw, cat=cat, title=title)
+        return (text or fallback_rewritten_news(title, summary, cat)), kw
     except Exception as e:
         log.error(f"Claude rewrite: {e}")
-        return title, DEFAULT_KEYWORDS.get(cat,"maldives")
+        return fallback_rewritten_news(title, summary, cat), DEFAULT_KEYWORDS.get(cat,"maldives")
 
 # ── Pexels ────────────────────────────────────────────────────────────────────
 # Category-specific Pexels keyword pools for manual cards with no photo attached
@@ -3094,6 +3185,9 @@ def generate_card(text, source, timestamp, cat, bg_image=None, morning=False, _s
 # ── Telegram ──────────────────────────────────────────────────────────────────
 def send_to_telegram(buf, caption):
     """Post a photo to the community channel. Returns message_id (int) or False."""
+    if not public_text_is_safe(caption):
+        log.error("🛑 Telegram blocked unsafe placeholder caption")
+        return False
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
@@ -3435,6 +3529,9 @@ def post_to_buffer(image_url, caption, channel_id, metadata=None):
     if not BUFFER_TOKEN or not channel_id: return False
     clean = re.sub(r'<[^>]+>', '', caption)
     clean = clean.replace('&amp;', '&').replace('&#039;', "'").replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>').strip()
+    if not public_text_is_safe(clean):
+        log.error(f"🛑 Buffer blocked unsafe placeholder caption [{channel_id[:8]}]")
+        return False
 
     query = """
 mutation CreatePost($input: CreatePostInput!) {
@@ -3541,6 +3638,16 @@ def _social_queue_worker():
             notify_tid = item.get("notify_thread_id")
             log.info(f"[QUEUE] Posting {key_label} (Telegram + FB+IG+X) — {remaining} remaining")
 
+            if not public_text_is_safe(item.get("title",""), item.get("summary",""), item.get("caption","")):
+                log.error(f"🛑 QUEUE blocked unsafe placeholder post: {key_label}")
+                if notify_cid:
+                    send_text(notify_cid, f"🛑 <b>{key_label}</b> blocked — unsafe AI placeholder text detected.", thread_id=notify_tid)
+                else:
+                    send_text(CORE_TEAM_CHAT_ID, f"🛑 <b>{key_label}</b> blocked — unsafe AI placeholder text detected.", thread_id=CONTENT_LAB_THREAD_ID)
+                try: persist_state()
+                except Exception: pass
+                continue
+
             # 1. Post to Telegram community (respects daily cap + 2hr gap for regular posts)
             tg_ok = False
             if item.get("post_telegram", True):
@@ -3623,6 +3730,14 @@ def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=Non
     immediately when it enters the public publishing queue.
     """
     img_bytes = img_buf.getvalue() if hasattr(img_buf, "getvalue") else img_buf
+
+    if not public_text_is_safe(title, summary, caption):
+        log.error(f"🛑 SOCIAL QUEUE blocked unsafe placeholder post: {(title or key_label)[:70]}")
+        if notify_chat_id:
+            send_text(notify_chat_id,
+                f"🛑 {key_label} blocked — AI/template placeholder detected. Not posted.",
+                thread_id=notify_thread_id)
+        return False
 
     if article_id:
         try:
@@ -3810,6 +3925,10 @@ def _build_card_and_caption(article):
     else:
         display_cat = canonical_category(raw_cat, article["title"], article.get("summary",""))
     rewritten, keyword = rewrite_news(article["title"], article["summary"], raw_cat)
+    if has_public_placeholder(rewritten):
+        log.warning(f"[SAFETY] Bad rewrite blocked before card: {article['title'][:70]}")
+        rewritten = fallback_rewritten_news(article["title"], article.get("summary",""), raw_cat)
+    keyword = safe_image_keyword(keyword, cat=display_cat, title=article["title"])
     bg = fetch_background_image(keyword, cat=display_cat, title=article["title"])
     ts = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
     card = generate_card(rewritten, SAMUGA_PUBLIC_SOURCE, ts, display_cat, bg)
@@ -3838,6 +3957,17 @@ def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_
     # ── Kill-switch check ────────────────────────────────────────────────────
     if POSTING_PAUSED:
         log.warning(f"⏸️ POSTING_PAUSED=true — blocked publish: {title[:60]}")
+        return False, {}
+    if not public_text_is_safe(title, summary, rewritten, caption):
+        log.error(f"🛑 PUBLIC SAFETY blocked publish: {title[:70]}")
+        try:
+            send_text(CORE_TEAM_CHAT_ID,
+                f"🛑 <b>Public post blocked</b> — AI/template placeholder detected.\n\n"
+                f"<b>{strip_source_links(title)[:90]}</b>\n"
+                f"<i>Kept out of Telegram/socials. Please rewrite manually if needed.</i>",
+                thread_id=ALERT_THREAD_ID)
+        except Exception:
+            pass
         return False, {}
     buf = io.BytesIO(card_bytes)
     ts = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
@@ -8748,7 +8878,7 @@ def api_health():
         if row:
             latest = {
                 "title": _api_clean_text(row[0], 160),
-                "time": (row[1] or row[2]).strftime("%d %b %Y • %H:%M") if (row[1] or row[2]) else "Recent",
+                "time": mvt_display_time(row[1] or row[2]),
                 "status": row[3]
             }
     except Exception as e:
@@ -8811,6 +8941,9 @@ def api_stories():
             if not safe_title:
                 continue
 
+            if not public_text_is_safe(safe_title, safe_summary):
+                continue
+
             # Hide old broken Latin Thaana rows from the website feed.
             # New rows are fixed before publish by normalize_article_language_for_public().
             if looks_latin_thaana(f"{safe_title} {safe_summary}") and not _api_has_thaana(f"{safe_title} {safe_summary}"):
@@ -8832,7 +8965,7 @@ def api_stories():
                 "community_url": SAMUGA_PUBLIC_LINK,
                 "article_api": _absolute_api_url(f"/api/article?id={article_id}"),
                 "slug": article_slug or make_article_slug(safe_title, article_id),
-                "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent",
+                "time": mvt_display_time(dt),
                 "lang": _api_lang(safe_title, safe_summary, lang),
                 "status": status or "posted"
             })
@@ -8869,6 +9002,8 @@ def api_article():
 
         safe_title = _api_clean_text(strip_source_links(title), 500)
         safe_summary = _api_clean_text(strip_source_links(summary), 1800)
+        if not public_text_is_safe(safe_title, safe_summary, article_excerpt, article_body):
+            return jsonify({"error": "article safety cleanup pending"}), 404
         if looks_latin_thaana(f"{safe_title} {safe_summary}") and not _api_has_thaana(f"{safe_title} {safe_summary}"):
             return jsonify({"error": "article language cleanup pending"}), 404
         safe_category = _api_category(category, safe_title, safe_summary)
@@ -8893,7 +9028,7 @@ def api_article():
             "source_url": SAMUGA_PUBLIC_LINK,
             "community_url": SAMUGA_PUBLIC_LINK,
             "url": SAMUGA_PUBLIC_LINK,
-            "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent",
+            "time": mvt_display_time(dt),
             "lang": safe_lang,
             "slug": article_slug or make_article_slug(safe_title, rid),
             "related": related_articles_for_api(rid, safe_category, limit=4)
@@ -9008,7 +9143,7 @@ def _public_chat_latest_rows(lang=None, limit=8, hours=30):
                 "category": _api_category(category, safe_title, safe_summary),
                 "source": SAMUGA_PUBLIC_SOURCE,
                 "url": SAMUGA_PUBLIC_LINK,
-                "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent",
+                "time": mvt_display_time(dt),
                 "lang": detected
             })
             if len(clean) >= limit:
@@ -9056,7 +9191,7 @@ def _public_chat_search_rows(message, lang=None, limit=6):
                 "category": _api_category(category, safe_title, safe_summary),
                 "source": SAMUGA_PUBLIC_SOURCE,
                 "url": SAMUGA_PUBLIC_LINK,
-                "time": dt.strftime("%d %b %Y • %H:%M") if dt else "Recent",
+                "time": mvt_display_time(dt),
                 "lang": detected
             })
             if len(clean) >= limit:
