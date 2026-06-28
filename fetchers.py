@@ -656,17 +656,34 @@ def fetch_world_updates(limit=8):
     return articles
 
 def fetch_latest_web_pages(limit_per_source=6):
+    """
+    Tier 1: grab article links from source homepage.
+    Tier 2: link text is a real headline -> use it (free, instant).
+    Tier 3: link text is junk/empty -> Gemini semantic scrape the article
+            page for real title + full body. Fires only when Tier 2 fails.
+    """
     articles = []
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9,dv;q=0.8",
         "Cache-Control": "no-cache",
     }
+
+    # lazy import scraper — only activates if samuga_scraper is wired
+    _scraper = None
+    try:
+        import samuga_scraper as _sx
+        if _sx._gemini_post:
+            _scraper = _sx
+    except ImportError:
+        pass
+
     try:
         from urllib.parse import urljoin, urlparse
     except Exception:
         return articles
+
     for src in WEB_LATEST_SOURCES:
         try:
             resp = requests.get(src["url"], timeout=12, headers=headers)
@@ -674,6 +691,8 @@ def fetch_latest_web_pages(limit_per_source=6):
                 record_source_health(src["source"], ok=False, blocked=(resp.status_code in [403,429]), http_status=resp.status_code, reason="latest-page non-200")
                 log.debug(f"[FETCH] {src['source']} latest page HTTP {resp.status_code}")
                 continue
+
+            # gather article link candidates from homepage
             try:
                 from bs4 import BeautifulSoup
                 soup = BeautifulSoup(resp.text, "html.parser")
@@ -690,35 +709,55 @@ def fetch_latest_web_pages(limit_per_source=6):
                     candidates.append((title, href))
             except Exception:
                 candidates = []
-                for href, title in re.findall(r"""<a[^>]+href=['"]([^'"]+)['"][^>]*>(.*?)</a>""", resp.text, re.I|re.S):
+                for href, title in re.findall(r"""<a[^>]+href=['\"]([^'\"]+)['\"][^>]*>(.*?)</a>""", resp.text, re.I|re.S):
                     title = re.sub(r"<[^>]+>", " ", title)
                     title = " ".join(_html_unescape(title).split())
                     if 18 <= len(title) <= 180:
                         candidates.append((title, urljoin(src["url"], href)))
-            seen_local, kept = set(), 0
+
+            # process candidates — Tier 2 free path, Tier 3 Gemini fallback
+            seen_local, kept, semantic_used = set(), 0, 0
             for title, href in candidates:
+                if kept >= limit_per_source:
+                    break
                 key = re.sub(r"\W+", " ", title.lower()).strip()[:70]
                 if key in seen_local:
                     continue
                 seen_local.add(key)
                 if _looks_like_ad(title):
                     continue
-                lang = "dv" if is_dhivehi(title) else src.get("lang","en")
-                art_id = "web_" + hashlib.md5((href or title).encode()).hexdigest()[:12]
-                articles.append({"id": art_id, "title": title[:150], "summary": title, "link": href, "source": src["source"], "cat": src.get("cat","LOCAL"), "lang": lang, "published": _utcnow()})
-                kept += 1
-                if kept >= limit_per_source:
-                    break
+
+                # Tier 2: link text is a real headline — use directly
+                title_ok = len(title) >= 25 and not re.fullmatch(r"[\W\d\s]+", title)
+                if title_ok:
+                    lang = "dv" if is_dhivehi(title) else src.get("lang", "en")
+                    art_id = "web_" + hashlib.md5((href or title).encode()).hexdigest()[:12]
+                    articles.append({"id": art_id, "title": title[:150], "summary": title,
+                                     "link": href, "source": src["source"],
+                                     "cat": src.get("cat", "LOCAL"), "lang": lang,
+                                     "published": _utcnow()})
+                    kept += 1
+                    continue
+
+                # Tier 3: junk link text — Gemini scrape the article page
+                if _scraper and semantic_used < 3:
+                    art = _scraper.fetch_article(href, source=src["source"])
+                    if not art.get("error") and art.get("title") and art.get("summary"):
+                        art.setdefault("cat", src.get("cat", "LOCAL"))
+                        art["published"] = _utcnow()
+                        articles.append(art)
+                        kept += 1
+                        semantic_used += 1
+                        log.info(f"[FETCH] {src['source']} semantic scrape OK: {art['title'][:50]}")
+
             if kept:
-                record_source_health(src["source"], ok=True, items=kept, ads=0, http_status=resp.status_code, reason="latest-page scrape")
-            log.info(f"[FETCH] {src['source']} latest page: {kept} headline(s)")
+                record_source_health(src["source"], ok=True, items=kept, ads=0,
+                                     http_status=resp.status_code, reason="latest-page scrape")
+            log.info(f"[FETCH] {src['source']} latest page: {kept} headline(s) (semantic: {semantic_used})")
         except Exception as e:
             log.debug(f"[FETCH] latest page {src.get('source')}: {e}")
     return articles
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Master fetch — combines all sources
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def fetch_news():
     articles, seen_titles = [], set()
