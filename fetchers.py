@@ -276,13 +276,31 @@ def parse_extra_telegram_sources():
 
 # ── Dhivehi Telegram channel list ────────────────────────────────────────────
 DV_TELEGRAM_CHANNELS = [
-    {"handle": "mihaarulive",   "source": "Mihaaru",  "reliability": 95},
-    {"handle": "avasonline",    "source": "Avas",     "reliability": 88},
-    {"handle": "sunonlinemv",   "source": "Sun",      "reliability": 92},
-    {"handle": "raajjemvlive",  "source": "Raajje",   "reliability": 85},
-    {"handle": "voicemaldives", "source": "VoiceMV",  "reliability": 80},
-    {"handle": "mvplusmedia",   "source": "MV+",      "reliability": 82},
-    {"handle": "mvcrisis",      "source": "MvCrisis", "reliability": 70},
+    # Tier 1: High-reliability established outlets
+    {"handle": "mihaarulive",    "source": "Mihaaru",       "reliability": 95},
+    {"handle": "avasonline",     "source": "Avas",          "reliability": 88},
+    {"handle": "sunonlinemv",    "source": "Sun",           "reliability": 92},
+    {"handle": "raajjemvlive",   "source": "Raajje",        "reliability": 85},
+    {"handle": "voicemaldives",  "source": "VoiceMV",       "reliability": 80},
+    {"handle": "mvplusmedia",    "source": "MV+",           "reliability": 82},
+    {"handle": "newspsm",        "source": "PSM News",      "reliability": 88},
+    # Tier 2: Breaking/crisis channels
+    {"handle": "mvcrisis",       "source": "MvCrisis",      "reliability": 70},
+    {"handle": "MvCrisisPlus",   "source": "MvCrisis+",     "reliability": 72},
+    # Tier 3: Additional news sources
+    {"handle": "oneonlinemv",    "source": "OneOnline",     "reliability": 75},
+    {"handle": "sun_mv",         "source": "Sun MV",        "reliability": 80},
+    {"handle": "vnewsmv",        "source": "VNews",         "reliability": 72},
+    {"handle": "DhenMaldives",   "source": "Dhen Maldives", "reliability": 70},
+    {"handle": "thepressmv",     "source": "ThePress",      "reliability": 78},
+    {"handle": "dhaurunews",     "source": "Dhauru News",   "reliability": 70},
+    {"handle": "JaviyaniMV",     "source": "Javiyani",      "reliability": 65},
+    {"handle": "thebithufangi",  "source": "Bithufangi",    "reliability": 60},
+    {"handle": "vamundhaagoi",   "source": "Vamundhaagoi",  "reliability": 60},
+    {"handle": "jeeluonline",    "source": "Jeelu",         "reliability": 65},
+    # Special: USD/USDT rate channels
+    {"handle": "boliexchangemv",   "source": "Boli Exchange", "reliability": 85, "type": "rates"},
+    {"handle": "mvdollarexchange", "source": "MV Dollar",     "reliability": 80, "type": "rates"},
 ] + parse_extra_telegram_sources()
 
 # ── Ad/promo filter keywords ──────────────────────────────────────────────────

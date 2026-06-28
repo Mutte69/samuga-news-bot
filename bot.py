@@ -74,6 +74,17 @@ from db import (
     _detect_themes
 )
 
+
+# Story builder -- full article generation from headlines
+try:
+    from story_builder import (
+        build_full_article, parse_rate_update, format_rate_card,
+        make_website_caption, make_dv_website_caption
+    )
+    _STORY_BUILDER_AVAILABLE = True
+except ImportError:
+    _STORY_BUILDER_AVAILABLE = False
+
 # ── Structured logging: tags make Railway logs readable ──────────────────────
 # Usage: log.info("[FETCH] pulled 12 articles")  →  easy to filter in Railway
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
@@ -355,10 +366,11 @@ def store_pending_approval(card_bytes, caption, title, link, cat="LOCAL", lang="
     persist_state()
     # Immediately backup to PostgreSQL so queue survives any crash
     try:
-        kv_set("approval_queue_backup", _serialize_approval_queue())
+        kv_set("approval_queue_backup", _serialize_approval_queue_for_pg())
         kv_set("approval_counter_backup", _approval_counter[0])
-    except Exception:
-        pass
+        log.debug(f"[PG] Queue backup saved: {len(approval_queue)} items")
+    except Exception as pg_err:
+        log.warning(f"[PG] Queue backup failed: {pg_err}")
     return key
 
 def expire_old_approvals():
@@ -4588,6 +4600,67 @@ def handle_updates():
                                     log.error(f"/meta: {e}")
                                     send_text(chat_id, f"❌ Meta test error: {e}", reply_to=msg_id, thread_id=thread_id)
 
+                        # /scrapetest <url> - test semantic scraper on any URL
+                        elif text.strip().lower().startswith("/scrapetest"):
+                            arg = text.strip()[11:].strip()
+                            if not arg.startswith("http"):
+                                send_text(chat_id, "Use <code>/scrapetest [url]</code>\nExample: <code>/scrapetest https://edition.mv/news/12345</code>", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                send_text(chat_id, f"🔍 Scraping... <i>{arg[:80]}</i>", reply_to=msg_id, thread_id=thread_id)
+                                try:
+                                    from samuga_scraper import semantic_scrape
+                                    art = semantic_scrape(arg, source="ScrapeTest")
+                                    if art.get("error"):
+                                        send_text(chat_id, f"❌ <b>Scrape failed</b>\nReason: {art['error']}", reply_to=msg_id, thread_id=thread_id)
+                                    else:
+                                        out = [
+                                            "✅ <b>Scrape OK</b>",
+                                            f"<b>Title:</b> {art.get('title','')}",
+                                            f"<b>Category:</b> {art.get('cat','')}   <b>Lang:</b> {art.get('lang','')}",
+                                            f"<b>ID:</b> <code>{art.get('id','')}</code>",
+                                            f"<b>Body:</b> {str(art.get('summary',''))[:400]}...",
+                                        ]
+                                        send_text(chat_id, "\n".join(out), reply_to=msg_id, thread_id=thread_id)
+                                except Exception as ste:
+                                    send_text(chat_id, f"❌ Scraper error: {ste}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /discovery - manage discovery engine topics
+                        elif text.strip().lower().startswith("/discovery"):
+                            arg = text.strip()[10:].strip()
+                            parts = arg.split(None, 1)
+                            sub = parts[0].lower() if parts else "list"
+                            rest = parts[1] if len(parts) > 1 else ""
+                            try:
+                                from discovery import (
+                                    discovery_list, discovery_add, discovery_remove,
+                                    discovery_pause, discovery_resume, run_discovery as _disc_run
+                                )
+                                if sub in ("", "list"):
+                                    send_text(chat_id, discovery_list(), reply_to=msg_id, thread_id=thread_id)
+                                elif sub == "run":
+                                    send_text(chat_id, "🔍 Running discovery hunt now...", reply_to=msg_id, thread_id=thread_id)
+                                    import threading as _dthr
+                                    _dthr.Thread(target=_disc_run, daemon=True).start()
+                                elif sub == "pause":
+                                    send_text(chat_id, discovery_pause(), reply_to=msg_id, thread_id=thread_id)
+                                elif sub == "resume":
+                                    send_text(chat_id, discovery_resume(), reply_to=msg_id, thread_id=thread_id)
+                                elif sub == "add":
+                                    if not rest:
+                                        send_text(chat_id, "Usage: /discovery add <topic>\nExample: /discovery add fuel price hike", reply_to=msg_id, thread_id=thread_id)
+                                    else:
+                                        send_text(chat_id, discovery_add(rest.strip(), f"Maldives {rest.strip()} 2026"), reply_to=msg_id, thread_id=thread_id)
+                                elif sub == "remove":
+                                    if not rest.isdigit():
+                                        send_text(chat_id, "Usage: /discovery remove <number>\nSee /discovery list for numbers.", reply_to=msg_id, thread_id=thread_id)
+                                    else:
+                                        send_text(chat_id, discovery_remove(int(rest)), reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id, "Commands: /discovery list | add <topic> | remove <n> | run | pause | resume", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as dce:
+                                log.error(f"/discovery: {dce}")
+                                send_text(chat_id, f"❌ Discovery error: {dce}", reply_to=msg_id, thread_id=thread_id)
+
                         # /release — flush ALL pending cards to Content Lab right now (when team is actively reviewing)
                         elif text.strip().lower() in ["/release", "/flush", "/releaseall"]:
                             try:
@@ -6303,6 +6376,7 @@ def _serialize_social_counts():
     return sc
 
 def _serialize_approval_queue():
+    """Serialize queue for STATE FILE — includes card_bytes as base64."""
     import base64
     out = {}
     for k, v in approval_queue.items():
@@ -6315,6 +6389,24 @@ def _serialize_approval_queue():
                 item["card_bytes"] = None
                 item["_card_b64"] = False
         item["created_at"] = item["created_at"].isoformat() if item.get("created_at") else None
+        out[k] = item
+    return out
+
+def _serialize_approval_queue_for_pg():
+    """Serialize queue for POSTGRESQL — strips card_bytes (too large for jsonb).
+    On restore, EN cards without bytes will be marked as needing rebuild.
+    DV cards never had bytes anyway (built on approval).
+    The critical data (title, dv_text, timing) all survives."""
+    out = {}
+    for k, v in approval_queue.items():
+        item = dict(v)
+        # Strip card_bytes — can be 100-500KB as base64, causes silent PG failures
+        item["card_bytes"] = None
+        item["_card_b64"] = False
+        item["_needs_card_rebuild"] = True  # flag so restore knows to skip auto-posting
+        item["created_at"] = item["created_at"].isoformat() if item.get("created_at") else None
+        # Strip bg_image too if present
+        item.pop("_bg_image", None)
         out[k] = item
     return out
 
@@ -6369,11 +6461,12 @@ def persist_state():
         }
         _save_state(state)
         # Also persist approval queue to PostgreSQL — survives Railway restarts/crashes
+        # Use lightweight version (no card_bytes) to prevent silent PG save failures
         try:
-            kv_set("approval_queue_backup", _serialize_approval_queue())
+            kv_set("approval_queue_backup", _serialize_approval_queue_for_pg())
             kv_set("approval_counter_backup", _approval_counter[0])
         except Exception as pg_e:
-            log.debug(f"persist_state PG backup: {pg_e}")
+            log.warning(f"persist_state PG backup: {pg_e}")
     except Exception as e:
         log.error(f"persist_state: {e}")
 
@@ -6487,6 +6580,7 @@ def restore_state():
         log.info(f"📦 State restored: {len(recent_story_titles)} dedup titles, "
                  f"{len(approval_queue)} pending cards, {len(recent_posts)} recent posts")
         # Alert team if pending cards were restored after restart
+        log.info(f"[PG] Queue backup status: {len(approval_queue)} cards in queue, counter={_approval_counter[0]}")
         if len(approval_queue) > 0:
             try:
                 lines = ["🔄 <b>Bot restarted — pending cards restored:</b>\n"]
@@ -6498,9 +6592,16 @@ def restore_state():
                     lang = v.get("lang","en").upper()
                     cat  = v.get("cat","LOCAL")
                     title = v.get("title","")[:50]
-                    lines.append(f"• <code>{k.upper()}</code> [{lang}/{cat}]{age} — {title}")
-                    if v.get("lang") == "dv" and not v.get("_auto_post_breaking"):
-                        lines.append(f"  Approve: <code>/approved {k}</code>  Reject: <code>/reject {k}</code>")
+                    expires = ""
+                    if v.get("created_at"):
+                        remaining = 7200 - int((utcnow() - v["created_at"]).total_seconds())
+                        if remaining > 0:
+                            expires = f" — {remaining//60}min left"
+                        else:
+                            expires = " — EXPIRED"
+                    lines.append(f"• <code>{k}</code> [{lang}/{cat}]{age}{expires}")
+                    lines.append(f"  📰 {title}")
+                    lines.append(f"  ✅ <code>/approved {k}</code>  ❌ <code>/reject {k}</code>")
                 lines.append("\nRun <code>/pending</code> to see full queue.")
                 _startup_queue_msg = "\n".join(lines)
                 # send after bot is fully up — schedule for 10 seconds after start
@@ -6646,6 +6747,17 @@ if __name__ == "__main__":
         log.info("🔍 Discovery Engine scheduled — runs every hour")
     except ImportError:
         log.warning("⚠️ discovery.py not found — Discovery Engine disabled")
+
+    # Wire story builder
+    try:
+        import story_builder as _sb
+        _sb._gemini_post   = _gemini_post
+        _sb.kv_get         = kv_get
+        _sb.kv_set         = kv_set
+        _sb.GEMINI_API_KEY = GEMINI_API_KEY
+        log.info("📝 Story Builder wired — full article generation active")
+    except ImportError:
+        pass
 
     log.info("⏰ Scheduler started!")
     scheduler.start()
