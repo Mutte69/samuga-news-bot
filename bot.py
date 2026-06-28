@@ -76,6 +76,11 @@ from db import (
 from samuga_scraper import (
     fetch_article, semantic_scrape, scrape_many
 )
+from discovery import (
+    run_discovery, discovery_list, discovery_add,
+    discovery_remove, discovery_pause, discovery_resume
+)
+
 
 # ── Structured logging: tags make Railway logs readable ──────────────────────
 # Usage: log.info("[FETCH] pulled 12 articles")  →  easy to filter in Railway
@@ -4341,29 +4346,6 @@ def handle_updates():
                                     lines.append("\n<i>Use /story [number] to see the full timeline.</i>")
                                     send_text(chat_id, "\n".join(lines), reply_to=msg_id, thread_id=thread_id)
 
-                        # /scrapetest <url> — test the semantic scraper on one URL (safe, no publishing)
-                        elif text.strip().lower().startswith("/scrapetest"):
-                            arg = text.strip()[11:].strip()
-                            if not arg.startswith("http"):
-                                send_text(chat_id, "Use <code>/scrapetest [url]</code> — e.g. <code>/scrapetest https://psmnews.mv/en/...</code>", reply_to=msg_id, thread_id=thread_id)
-                            else:
-                                send_text(chat_id, f"🔍 Scraping… <i>{arg[:80]}</i>", reply_to=msg_id, thread_id=thread_id)
-                                try:
-                                    art = semantic_scrape(arg, source="ScrapeTest")
-                                    if art.get("error"):
-                                        send_text(chat_id, f"❌ <b>Scrape failed</b>\nReason: {art['error']}", reply_to=msg_id, thread_id=thread_id)
-                                    else:
-                                        out = [
-                                            "✅ <b>Scrape OK</b>",
-                                            f"<b>Title:</b> {art['title']}",
-                                            f"<b>Category:</b> {art['cat']}   <b>Lang:</b> {art['lang']}",
-                                            f"<b>ID:</b> <code>{art['id']}</code>",
-                                            f"<b>Body:</b> {art['summary'][:400]}…",
-                                        ]
-                                        send_text(chat_id, "\n".join(out), reply_to=msg_id, thread_id=thread_id)
-                                except Exception as e:
-                                    send_text(chat_id, f"❌ <b>Scraper crashed:</b> {e}", reply_to=msg_id, thread_id=thread_id)
-
                         # /story <id> — show the full timeline of a story
                         elif text.strip().lower().startswith("/story"):
                             arg = text.strip()[6:].strip()
@@ -4413,6 +4395,42 @@ def handle_updates():
                                 except Exception as e:
                                     log.error(f"/trends: {e}")
                                     send_text(chat_id, f"❌ Trends error: {e}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /discovery - hunt for unreported stories
+                        elif text.strip().lower().startswith("/discovery"):
+                            arg = text.strip()[10:].strip()
+                            parts = arg.split(None, 1)
+                            sub = parts[0].lower() if parts else "list"
+                            rest = parts[1] if len(parts) > 1 else ""
+                            try:
+                                if sub in ("", "list"):
+                                    send_text(chat_id, discovery_list(), reply_to=msg_id, thread_id=thread_id)
+                                elif sub == "run":
+                                    send_text(chat_id, "🔍 Running discovery hunt now...", reply_to=msg_id, thread_id=thread_id)
+                                    import threading as _thr
+                                    _thr.Thread(target=run_discovery, daemon=True).start()
+                                elif sub == "pause":
+                                    send_text(chat_id, discovery_pause(), reply_to=msg_id, thread_id=thread_id)
+                                elif sub == "resume":
+                                    send_text(chat_id, discovery_resume(), reply_to=msg_id, thread_id=thread_id)
+                                elif sub == "add":
+                                    if not rest:
+                                        send_text(chat_id, "Usage: /discovery add <topic name>\nExample: /discovery add parliament vote tonight", reply_to=msg_id, thread_id=thread_id)
+                                    else:
+                                        # label is what they typed, query auto-built
+                                        label = rest.strip()
+                                        query = f"Maldives {label} 2026"
+                                        send_text(chat_id, discovery_add(label, query), reply_to=msg_id, thread_id=thread_id)
+                                elif sub == "remove":
+                                    if not rest.isdigit():
+                                        send_text(chat_id, "Usage: /discovery remove <number>\nSee /discovery list for numbers.", reply_to=msg_id, thread_id=thread_id)
+                                    else:
+                                        send_text(chat_id, discovery_remove(int(rest)), reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id, "Commands: /discovery list | add <topic> | remove <n> | run | pause | resume", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                log.error(f"/discovery: {e}")
+                                send_text(chat_id, f"❌ Discovery error: {e}", reply_to=msg_id, thread_id=thread_id)
 
                         # /learning on | off | status — engagement learning switch
                         elif text.strip().lower().startswith("/learning"):
@@ -6420,11 +6438,20 @@ if __name__ == "__main__":
     _ft._gemini_post   = _gemini_post
     _ft.GEMINI_API_KEY = GEMINI_API_KEY
 
-    # Wire semantic scraper (same injection pattern as fetchers)
+    # Wire semantic scraper
     import samuga_scraper as _sx
     _sx._gemini_post         = _gemini_post
     _sx.GEMINI_API_KEY       = GEMINI_API_KEY
     _sx.record_source_health = _ft.record_source_health
+
+    # Wire discovery engine
+    import discovery as _disc
+    _disc._gemini_post      = _gemini_post
+    _disc.kv_get            = kv_get
+    _disc.kv_set            = kv_set
+    _disc.send_text         = send_text
+    _disc.CORE_TEAM_CHAT_ID = CORE_TEAM_CHAT_ID
+    _disc.ALERT_THREAD_ID   = ALERT_THREAD_ID
 
     import scoring as _sg
     _sg.utcnow = utcnow
@@ -6480,6 +6507,7 @@ if __name__ == "__main__":
     # Periodic state heartbeat — saves every 5 minutes so restarts lose minimal state
     scheduler.add_job(persist_state, "interval", minutes=5, id="state_heartbeat")
     scheduler.add_job(ops_watchdog, "interval", minutes=10)
+    scheduler.add_job(run_discovery, "interval", hours=1)  # Discovery Engine - hunts every hour
 
     log.info("⏰ Scheduler started!")
     scheduler.start()
