@@ -2310,6 +2310,105 @@ def send_tip_cta():
     send_text(TELEGRAM_CHANNEL_ID, msg)
     log.info("📣 Tip CTA sent")
 
+def night_queue_review():
+    """
+    Runs at 11PM MVT (after night summary).
+    If social queue has pending items, sends list to Content Lab.
+    Team decides what to post or delete.
+    Queue then resets fresh for next day.
+    """
+    with _social_queue_lock:
+        pending = list(_social_queue)
+
+    if not pending:
+        log.info("[NIGHT] Social queue already empty — no review needed")
+        return
+
+    log.info(f"[NIGHT] {len(pending)} pending social queue item(s) — sending review to Content Lab")
+
+    lines = [
+        "🌙 <b>NIGHT QUEUE REVIEW</b>",
+        f"<i>It's 11PM MVT. {len(pending)} post(s) are still queued and won't auto-post tonight.</i>",
+        "<i>Review each item and decide: force post now or delete.</i>\n"
+    ]
+
+    for i, item in enumerate(pending, 1):
+        title = item.get("title", item.get("caption", "?"))[:70]
+        cat   = item.get("cat", "LOCAL")
+        lang  = item.get("lang", "en").upper()
+        queued = item.get("queued_at")
+        age = ""
+        if queued:
+            try:
+                mins = int((utcnow() - queued).total_seconds() / 60)
+                age = f" — queued {mins}min ago"
+            except Exception:
+                pass
+        lines.append(f"<b>{i}.</b> [{lang}/{cat}]{age}")
+        lines.append(f"   📰 {title}")
+        lines.append(f"   ▶️ Post now: <code>/qpost {i}</code>")
+        lines.append(f"   🗑 Delete: <code>/qdel {i}</code>")
+
+    lines.append("")
+    lines.append("🗑 Delete all: <code>/queue clear</code> → <code>/queue clear confirm</code>")
+    lines.append("<i>Anything not actioned will auto-post tomorrow from 6AM MVT.</i>")
+
+    msg = "\n".join(lines)
+    try:
+        send_text(CORE_TEAM_CHAT_ID, msg, thread_id=CONTENT_LAB_THREAD_ID)
+        log.info(f"[NIGHT] Queue review sent to Content Lab: {len(pending)} items")
+    except Exception as e:
+        log.error(f"[NIGHT] Queue review send failed: {e}")
+
+
+def night_queue_autoclear():
+    """
+    Runs at 11:30PM MVT.
+    If social queue still has items (team took no action since 11:05PM review),
+    clears everything automatically and notifies Content Lab.
+    Queue resets fresh for next day starting 6AM.
+    """
+    with _social_queue_lock:
+        pending = list(_social_queue)
+
+    if not pending:
+        log.info("[NIGHT] Auto-clear: queue already empty")
+        return
+
+    # Clear the queue
+    with _social_queue_lock:
+        count = len(_social_queue)
+        _social_queue.clear()
+
+    persist_state()
+    log.info(f"[NIGHT] Auto-cleared {count} pending social queue item(s) at 11:30PM MVT")
+
+    # Notify Content Lab
+    titles = []
+    for item in pending[:5]:
+        t = item.get("title", item.get("caption","?"))[:60]
+        titles.append(f"• {t}")
+
+    lines = [
+        "🌙 <b>NIGHT QUEUE AUTO-CLEARED</b>",
+        f"<i>No action was taken on {count} pending post(s) since the 11:05PM review.</i>",
+        f"<i>All items have been automatically deleted.</i>\n",
+    ]
+    if titles:
+        lines.append("<b>Deleted items:</b>")
+        lines.extend(titles)
+        if count > 5:
+            lines.append(f"  <i>...and {count - 5} more</i>")
+
+    lines.append("")
+    lines.append("✅ <b>Queue is now empty.</b> Fresh start tomorrow from 6AM MVT.")
+
+    try:
+        send_text(CORE_TEAM_CHAT_ID, "\n".join(lines), thread_id=CONTENT_LAB_THREAD_ID)
+    except Exception as e:
+        log.error(f"[NIGHT] Auto-clear notify failed: {e}")
+
+
 def send_night_summary():
     log.info("🌙 Night summary...")
     try:
@@ -4661,6 +4760,166 @@ def handle_updates():
                                 log.error(f"/discovery: {dce}")
                                 send_text(chat_id, f"❌ Discovery error: {dce}", reply_to=msg_id, thread_id=thread_id)
 
+                        # /queue — show social queue contents
+                        elif text.strip().lower() in ["/queue", "/socialqueue", "/sq"]:
+                            try:
+                                with _social_queue_lock:
+                                    q = list(_social_queue)
+                                if not q:
+                                    send_text(chat_id, "📭 Social queue is empty — nothing waiting to post.", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    eta_secs = _calc_eta_seconds()
+                                    lines = [f"📋 <b>Social Queue — {len(q)} item(s) waiting</b>"]
+                                    lines.append(f"⏱ Next post in: <b>{int(eta_secs//60)}m {int(eta_secs%60)}s</b>\n")
+                                    for i, item in enumerate(q, 1):
+                                        key = item.get("key_label", f"item{i}")
+                                        title = item.get("title", item.get("caption","?"))[:60]
+                                        cat = item.get("cat", "?")
+                                        lang = item.get("lang", "en").upper()
+                                        queued = item.get("queued_at")
+                                        age = ""
+                                        if queued:
+                                            try:
+                                                mins = int((utcnow() - queued).total_seconds() / 60)
+                                                age = f" ({mins}min ago)"
+                                            except Exception:
+                                                pass
+                                        lines.append(f"<b>{i}.</b> <code>{key}</code> [{lang}/{cat}]{age}")
+                                        lines.append(f"   📰 {title}")
+                                        lines.append(f"   ▶️ <code>/qpost {i}</code>  🗑 <code>/qdel {i}</code>")
+                                    lines.append(f"\n🗑 Delete all: <code>/queue clear</code>")
+                                    lines.append(f"▶️ Force post next: <code>/qpost 1</code>")
+                                    send_text(chat_id, "\n".join(lines), reply_to=msg_id, thread_id=thread_id)
+                            except Exception as qe:
+                                send_text(chat_id, f"❌ Queue error: {qe}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /queue clear — delete entire social queue (with confirmation)
+                        elif text.strip().lower() in ["/queue clear", "/qclear", "/clearqueue"]:
+                            try:
+                                with _social_queue_lock:
+                                    count = len(_social_queue)
+                                if count == 0:
+                                    send_text(chat_id, "📭 Queue is already empty.", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    # Store pending confirmation
+                                    kv_set(f"queue_clear_confirm_{chat_id}", {"at": utcnow().isoformat(), "count": count})
+                                    send_text(chat_id,
+                                        f"⚠️ <b>Confirm queue clear</b>\n"
+                                        f"This will delete ALL <b>{count}</b> item(s) from the social queue.\n"
+                                        f"They will NOT be posted anywhere.\n\n"
+                                        f"Type <code>/queue clear confirm</code> to proceed.",
+                                        reply_to=msg_id, thread_id=thread_id)
+                            except Exception as qce:
+                                send_text(chat_id, f"❌ Error: {qce}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /queue clear confirm — actually clear the queue
+                        elif text.strip().lower() in ["/queue clear confirm", "/qclear confirm"]:
+                            try:
+                                confirm = kv_get(f"queue_clear_confirm_{chat_id}", None)
+                                if not confirm:
+                                    send_text(chat_id, "⚠️ No pending clear request. Run <code>/queue clear</code> first.", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    with _social_queue_lock:
+                                        count = len(_social_queue)
+                                        _social_queue.clear()
+                                    kv_set(f"queue_clear_confirm_{chat_id}", None)
+                                    persist_state()
+                                    send_text(chat_id,
+                                        f"🗑 <b>Queue cleared</b> — {count} item(s) deleted.\n"
+                                        f"<i>Nothing was posted. Queue is now empty.</i>",
+                                        reply_to=msg_id, thread_id=thread_id)
+                                    log.info(f"[QUEUE] Cleared by {first_name}: {count} items deleted")
+                            except Exception as qcce:
+                                send_text(chat_id, f"❌ Error: {qcce}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /qdel <n> — delete specific item from social queue by position
+                        elif text.strip().lower().startswith("/qdel "):
+                            try:
+                                n = int(text.strip().split()[1]) - 1  # convert to 0-indexed
+                                with _social_queue_lock:
+                                    if 0 <= n < len(_social_queue):
+                                        removed = _social_queue.pop(n)
+                                        title = removed.get("title", removed.get("key_label","?"))[:60]
+                                        send_text(chat_id,
+                                            f"🗑 <b>Deleted from queue:</b>\n{title}\n"
+                                            f"<i>{len(_social_queue)} item(s) remaining</i>",
+                                            reply_to=msg_id, thread_id=thread_id)
+                                        persist_state()
+                                    else:
+                                        send_text(chat_id, f"❌ No item #{n+1} in queue. Use <code>/queue</code> to see current list.", reply_to=msg_id, thread_id=thread_id)
+                            except (ValueError, IndexError):
+                                send_text(chat_id, "Usage: <code>/qdel 2</code> (deletes item #2 from queue)", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as qde:
+                                send_text(chat_id, f"❌ Error: {qde}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /qpost <n> — force post specific item from queue immediately
+                        elif text.strip().lower().startswith("/qpost "):
+                            try:
+                                n = int(text.strip().split()[1]) - 1  # 0-indexed
+                                with _social_queue_lock:
+                                    if 0 <= n < len(_social_queue):
+                                        item = _social_queue.pop(n)
+                                    else:
+                                        item = None
+                                if not item:
+                                    send_text(chat_id, f"❌ No item #{n+1} in queue.", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    title = item.get("title", item.get("key_label","?"))[:60]
+                                    send_text(chat_id, f"▶️ Force posting: <b>{title}</b>...", reply_to=msg_id, thread_id=thread_id)
+                                    try:
+                                        import io as _io
+                                        img_buf = _io.BytesIO(item["img_bytes"])
+                                        result = post_to_buffer(img_buf, item["caption"])
+                                        tg_ok = item.get("tg_ok", False)
+                                        if not tg_ok and item.get("post_telegram", True):
+                                            tg_ok = send_photo_to_community(item["img_bytes"], item["caption"])
+                                        fb = "✅" if result.get("fb") else "❌"
+                                        ig = "✅" if result.get("ig") else "❌"
+                                        x  = "✅" if result.get("x")  else "❌"
+                                        tg = "✅" if tg_ok else "❌"
+                                        send_text(chat_id,
+                                            f"✅ <b>Force posted!</b>\n"
+                                            f"Telegram {tg} · FB {fb} · IG {ig} · X {x}\n"
+                                            f"<i>{len(_social_queue)} item(s) still in queue</i>",
+                                            reply_to=msg_id, thread_id=thread_id)
+                                        global _last_social_post_time
+                                        _last_social_post_time = utcnow()
+                                        persist_state()
+                                    except Exception as fpe:
+                                        # Put back in queue if post failed
+                                        with _social_queue_lock:
+                                            _social_queue.insert(n, item)
+                                        send_text(chat_id, f"❌ Force post failed: {fpe}\nItem put back in queue.", reply_to=msg_id, thread_id=thread_id)
+                            except (ValueError, IndexError):
+                                send_text(chat_id, "Usage: <code>/qpost 1</code> (force posts item #1)", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as qpe:
+                                send_text(chat_id, f"❌ Error: {qpe}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /qrefresh — reset the social queue timer + show queue status
+                        elif text.strip().lower() in ["/qrefresh", "/queue refresh", "/resetqueue"]:
+                            try:
+                                global _last_social_post_time
+                                _last_social_post_time = None
+                                with _social_queue_lock:
+                                    count = len(_social_queue)
+                                # Check what's blocking
+                                blocked_reason = ""
+                                if posting_paused():
+                                    blocked_reason = "\n⚠️ POSTING_PAUSED=true — queue won't post until unpaused"
+                                elif not can_post_social():
+                                    limit = 3 if not is_day_social() else 20
+                                    blocked_reason = (f"\n⚠️ Night mode social limit ({limit}/night) reached."
+                                                      f"\nUse <code>/qpost N</code> to force post individual items."
+                                                      f"\nOr queue will auto-clear at 6AM MVT.")
+                                send_text(chat_id,
+                                    f"🔄 <b>Queue timer reset!</b>\n"
+                                    f"{count} item(s) in queue{blocked_reason}\n\n"
+                                    f"Use <code>/queue</code> to see items and <code>/qpost N</code> to force post.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                                log.info(f"[QUEUE] Timer reset by {first_name}")
+                            except Exception as qre:
+                                send_text(chat_id, f"❌ Error: {qre}", reply_to=msg_id, thread_id=thread_id)
+
                         # /release — flush ALL pending cards to Content Lab right now (when team is actively reviewing)
                         elif text.strip().lower() in ["/release", "/flush", "/releaseall"]:
                             try:
@@ -6717,7 +6976,9 @@ if __name__ == "__main__":
     # AI Nightly Journalist brief 10:30PM MVT = 5:30PM UTC (before night summary)
     scheduler.add_job(send_ai_journalist_brief, "cron", hour=17, minute=30)  # 10:30PM MVT
     # Night summary 12AM MVT = 7PM UTC
-    scheduler.add_job(send_night_summary, "cron", hour=18, minute=0)  # 11PM MVT
+    scheduler.add_job(send_night_summary,   "cron", hour=18, minute=0)   # 11PM MVT
+    scheduler.add_job(night_queue_review,   "cron", hour=18, minute=5)   # 11:05PM MVT — queue review
+    scheduler.add_job(night_queue_autoclear,"cron", hour=18, minute=30)  # 11:30PM MVT — auto clear if no action
     # Weekly digest Friday 6PM MVT = 1PM UTC Friday
     scheduler.add_job(send_weekly_digest, "cron", day_of_week="fri", hour=13, minute=0)
     # Weekly analytics report Friday 6:30PM MVT = 1:30PM UTC Friday
