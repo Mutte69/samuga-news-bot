@@ -430,6 +430,21 @@ def score_breakdown(a):
     elif update_num == 2:
         add("Story update #2", 10)
 
+    # ── Discovery + Social source boost ─────────────────────────────────────
+    # Articles hunted by the Discovery Engine or sourced from social RSS
+    # get a boost because they're often faster and less covered
+    source_tier = a.get("_source_tier", "")
+    if a.get("_discovery") == "social":
+        add("Social discovery source", 15)
+    elif source_tier == "gemini":
+        add("Semantic scraper find", 10)
+    # Semantic importance score from samuga_scraper v2
+    importance = a.get("_importance", 0)
+    if importance >= 80:
+        add(f"High importance ({importance})", 20)
+    elif importance >= 60:
+        add(f"Medium importance ({importance})", 10)
+
     # ── Low-value penalties ───────────────────────────────────────────────────
     low_value = [
         "sponsored", "advertisement", "promo", "promotion", "discount",
