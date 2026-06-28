@@ -61,6 +61,8 @@ from db import (
     db_publish_article_for_website, db_log_learning,
     db_set_article_message, db_set_article_matchkey,
     db_hide_article, db_unhide_article, db_delete_article_by_url, db_hide_all_dhivehi, db_unhide_all_dhivehi, db_bot_stats,
+    db_list_website_articles, db_search_website_articles, db_website_analytics,
+    db_get_featured_articles, db_feature_article, db_unfeature_article, db_get_article_by_identifier,
     kv_get, kv_set, mem_add, mem_list, mem_clear_all, mem_delete_last,
     detect_trends, is_trending_topic, find_or_create_story,
     get_story_timeline, search_stories, get_active_stories,
@@ -3810,7 +3812,7 @@ def handle_updates():
                             else:
                                 send_text(chat_id, f"Key <code>{key}</code> not found — maybe already posted or rejected.", reply_to=msg_id, thread_id=thread_id)
 
-                        # /hide <article_id_or_slug> — remove a website article fast
+                        # /hide <article_id_or_slug_or_url> — remove a website article fast
                         elif text_cmd_low.startswith("/hide "):
                             ident = text_cmd[6:].strip()
                             rows = db_hide_article(ident)
@@ -3820,7 +3822,7 @@ def handle_updates():
                             else:
                                 send_text(chat_id, f"⚠️ No website article found for <code>{ident}</code>", reply_to=msg_id, thread_id=thread_id)
 
-                        # /unhide <article_id_or_slug> — restore hidden article
+                        # /unhide <article_id_or_slug_or_url> — restore hidden article
                         elif text_cmd_low.startswith("/unhide "):
                             ident = text_cmd[8:].strip()
                             rows = db_unhide_article(ident)
@@ -3903,6 +3905,101 @@ def handle_updates():
                             except Exception as e:
                                 send_text(chat_id, f"❌ Delete by URL failed: {str(e)[:150]}", reply_to=msg_id, thread_id=thread_id)
                                 alert_admin(f"Delete by URL failed\n\nReason: {str(e)[:250]}", dedupe_key="cmd_delete_by_url_fail")
+
+# /web — website admin control panel inside Telegram
+                        elif text_cmd_low.startswith("/web"):
+                            try:
+                                raw = text_cmd.strip()
+                                low = raw.lower()
+
+                                if low in ["/web", "/web help"]:
+                                    send_text(chat_id,
+                                        "🌐 <b>Website admin commands</b>\n\n"
+                                        "• <code>/web recent</code> — recent posted website articles\n"
+                                        "• <code>/web hidden</code> — hidden website articles\n"
+                                        "• <code>/web dv</code> — posted Dhivehi website articles\n"
+                                        "• <code>/web en</code> — posted English website articles\n"
+                                        "• <code>/web search keyword</code> — search website articles\n"
+                                        "• <code>/web analytics</code> — website analytics snapshot\n"
+                                        "• <code>/featured</code> — list featured article IDs\n"
+                                        "• <code>/feature URL_or_id</code> — mark featured\n"
+                                        "• <code>/unfeature URL_or_id</code> — remove featured\n"
+                                        "• <code>/hide URL_or_id</code> — hide one article\n"
+                                        "• <code>/unhide URL_or_id</code> — restore one article\n"
+                                        "• <code>/delete URL</code> — hide by public URL",
+                                        reply_to=msg_id, thread_id=thread_id)
+
+                                elif low in ["/web recent", "/web list", "/web posts"]:
+                                    rows = db_list_website_articles(status="posted", limit=8)
+                                    send_text(chat_id, "🌐 <b>Recent website posts</b>\n\n" + _format_web_rows(rows), reply_to=msg_id, thread_id=thread_id)
+
+                                elif low in ["/web hidden", "/web hidden posts"]:
+                                    rows = db_list_website_articles(status="hidden", limit=8)
+                                    send_text(chat_id, "🙈 <b>Hidden website posts</b>\n\n" + _format_web_rows(rows), reply_to=msg_id, thread_id=thread_id)
+
+                                elif low in ["/web dv", "/web dhivehi"]:
+                                    rows = db_list_website_articles(status="posted", lang="dv", limit=8)
+                                    send_text(chat_id, "🇲🇻 <b>Posted Dhivehi website articles</b>\n\n" + _format_web_rows(rows), reply_to=msg_id, thread_id=thread_id)
+
+                                elif low in ["/web en", "/web english"]:
+                                    rows = db_list_website_articles(status="posted", lang="en", limit=8)
+                                    send_text(chat_id, "🇬🇧 <b>Posted English website articles</b>\n\n" + _format_web_rows(rows), reply_to=msg_id, thread_id=thread_id)
+
+                                elif low.startswith("/web search "):
+                                    q = raw[12:].strip()
+                                    if not q:
+                                        send_text(chat_id, "⚠️ Usage: <code>/web search keyword</code>", reply_to=msg_id, thread_id=thread_id)
+                                    else:
+                                        rows = db_search_website_articles(q, limit=8)
+                                        if rows:
+                                            send_text(chat_id, f"🔎 <b>Website search:</b> <code>{q}</code>\n\n" + _format_web_rows(rows, show_status=True), reply_to=msg_id, thread_id=thread_id)
+                                        else:
+                                            send_text(chat_id, f"ℹ️ No website articles found for <code>{q}</code>.", reply_to=msg_id, thread_id=thread_id)
+
+                                elif low in ["/web analytics", "/web stats", "/web top"]:
+                                    send_text(chat_id, _format_web_analytics(days=7), reply_to=msg_id, thread_id=thread_id)
+
+                                else:
+                                    send_text(chat_id, "⚠️ Unknown web command. Try <code>/web help</code>.", reply_to=msg_id, thread_id=thread_id)
+
+                            except Exception as e:
+                                send_text(chat_id, f"❌ Web admin command failed: {str(e)[:180]}", reply_to=msg_id, thread_id=thread_id)
+                                alert_admin(f"/web command failed\n\nReason: {str(e)[:250]}", dedupe_key="cmd_web_admin_fail")
+
+# /featured — list featured article IDs saved for website use
+                        elif text_cmd_low in ["/featured", "/web featured"]:
+                            try:
+                                feats = db_get_featured_articles()
+                                if feats:
+                                    send_text(chat_id, "⭐ <b>Featured article IDs</b>\n\n" + "\n".join([f"• <code>{x}</code>" for x in feats]), reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id, "ℹ️ No featured articles saved yet.", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                send_text(chat_id, f"❌ Featured list failed: {str(e)[:150]}", reply_to=msg_id, thread_id=thread_id)
+
+# /feature <url|id|slug> — save featured article for website/frontend use
+                        elif text_cmd_low.startswith("/feature "):
+                            ident = text_cmd[9:].strip()
+                            try:
+                                rows = db_feature_article(ident)
+                                if rows:
+                                    send_text(chat_id, f"⭐ <b>Article marked featured</b>\n\n• <code>{rows[0]}</code>", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id, f"⚠️ Could not feature <code>{ident}</code>", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                send_text(chat_id, f"❌ Feature failed: {str(e)[:150]}", reply_to=msg_id, thread_id=thread_id)
+
+# /unfeature <url|id|slug> — remove featured mark
+                        elif text_cmd_low.startswith("/unfeature "):
+                            ident = text_cmd[11:].strip()
+                            try:
+                                ok = db_unfeature_article(ident)
+                                if ok:
+                                    send_text(chat_id, f"🧹 <b>Article unfeatured</b>\n\n• <code>{ident}</code>", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id, f"ℹ️ That article was not in featured list: <code>{ident}</code>", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                send_text(chat_id, f"❌ Unfeature failed: {str(e)[:150]}", reply_to=msg_id, thread_id=thread_id)
 
 # /hide_dv — hide all currently posted Dhivehi website articles
                         elif text.strip().lower() in ["/hide_dv", "/hide dv", "/hide all dv"]:
@@ -5102,6 +5199,62 @@ def ops_watchdog():
             alert_admin("<br/>".join(dict.fromkeys(issues)), dedupe_key="ops_watchdog", cooloff_minutes=30)
     except Exception as e:
         log.error(f"ops_watchdog: {e}")
+
+
+def _website_public_url_for(article_id, slug):
+    base = (SAMUGA_CAPTION_LINK or "https://samugamedia.com").rstrip("/")
+    if slug:
+        return f"{base}/{slug}"
+    return f"{base}/article.html?id={article_id}"
+
+def _format_web_rows(rows, show_status=False):
+    if not rows:
+        return "— none —"
+    out = []
+    for row in rows:
+        # supports tuples from db_list/search
+        article_id, title, slug = row[0], row[1], row[2]
+        category = row[3] if len(row) > 3 else ""
+        lang = row[4] if len(row) > 4 else ""
+        status = row[3] if show_status else ""
+        url = _website_public_url_for(article_id, slug)
+        extra = []
+        if show_status and status:
+            extra.append(status)
+        if category:
+            extra.append(str(category))
+        if lang:
+            extra.append(str(lang))
+        extra_txt = f" ({' • '.join(extra)})" if extra else ""
+        out.append(f"• <b>{title[:80]}</b>{extra_txt}\n  <code>{article_id}</code>\n  {url}")
+    return "\n".join(out)
+
+def _format_web_analytics(days=7):
+    a = db_website_analytics(days=days, limit=5) or {}
+    lines = [f"🌐 <b>Website analytics ({int(a.get('days', days))}d)</b>"]
+    lines.append(f"📰 Posted: <b>{a.get('posted_total', 0)}</b>")
+    lines.append(f"👁️ Website views: <b>{a.get('total_views', 0)}</b>")
+    lines.append(f"📲 Telegram views: <b>{a.get('total_tg_views', 0)}</b>")
+    lines.append(f"❤️ Meta engagement: <b>{a.get('total_meta_engagement', 0)}</b>")
+
+    top_views = a.get("top_views") or []
+    if top_views:
+        lines.append("\n🏆 <b>Top website views</b>")
+        for aid, title, slug, views in top_views[:5]:
+            lines.append(f"• {title[:75]} — <b>{int(views or 0)}</b> views")
+
+    top_tg = a.get("top_tg") or []
+    if top_tg:
+        lines.append("\n📲 <b>Top Telegram views</b>")
+        for aid, title, slug, tg_views in top_tg[:5]:
+            lines.append(f"• {title[:75]} — <b>{int(tg_views or 0)}</b> TG views")
+
+    top_meta = a.get("top_meta") or []
+    if top_meta:
+        lines.append("\n❤️ <b>Top Meta engagement</b>")
+        for aid, title, slug, meta_eng in top_meta[:5]:
+            lines.append(f"• {title[:75]} — <b>{int(meta_eng or 0)}</b> interactions")
+    return "\n".join(lines)
 
 def format_bot_stats():
     """Human-friendly stats block for Telegram."""

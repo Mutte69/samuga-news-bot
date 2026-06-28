@@ -515,24 +515,30 @@ def db_set_article_matchkey(article_id, title):
 
 
 def db_hide_article(identifier):
-    """Hide a website article by id or article_slug."""
+    """Hide a website article by id, article_slug, or public URL."""
     if not DB_ENABLED or not identifier:
         return False
-    rows = db_execute(
-        "UPDATE articles SET status='hidden' WHERE id=%s OR article_slug=%s RETURNING id, title",
-        (identifier, identifier), fetch="all"
-    )
-    return rows or []
+    for cand in _resolve_article_candidates(identifier):
+        rows = db_execute(
+            "UPDATE articles SET status='hidden' WHERE id=%s OR article_slug=%s RETURNING id, title",
+            (cand, cand), fetch="all"
+        )
+        if rows:
+            return rows
+    return []
 
 def db_unhide_article(identifier):
-    """Restore a hidden website article by id or article_slug."""
+    """Restore a hidden website article by id, article_slug, or public URL."""
     if not DB_ENABLED or not identifier:
         return False
-    rows = db_execute(
-        "UPDATE articles SET status='posted' WHERE (id=%s OR article_slug=%s) AND status='hidden' RETURNING id, title",
-        (identifier, identifier), fetch="all"
-    )
-    return rows or []
+    for cand in _resolve_article_candidates(identifier):
+        rows = db_execute(
+            "UPDATE articles SET status='posted' WHERE (id=%s OR article_slug=%s) AND status='hidden' RETURNING id, title",
+            (cand, cand), fetch="all"
+        )
+        if rows:
+            return rows
+    return []
 
 def db_delete_article_by_url(url):
     """
@@ -605,6 +611,167 @@ def db_unhide_all_dhivehi():
         fetch="all"
     )
     return rows or []
+
+
+def _resolve_article_candidates(identifier):
+    """Resolve id/slug/url into candidate identifiers."""
+    raw = str(identifier or "").strip()
+    if not raw:
+        return []
+    candidates = []
+    parsed = urlparse(raw)
+    path_last = (parsed.path or "").rstrip("/").split("/")[-1].strip()
+    qs = parse_qs(parsed.query or "")
+    article_id = (qs.get("id") or [""])[0].strip()
+    for x in [article_id, path_last, raw]:
+        if x and x not in candidates:
+            candidates.append(x)
+    return candidates
+
+def db_get_article_by_identifier(identifier):
+    """Return one article row by id, slug, or full URL."""
+    if not DB_ENABLED or not identifier:
+        return None
+    for cand in _resolve_article_candidates(identifier):
+        row = db_execute("""
+            SELECT id, title, article_slug, status, category, lang, posted_at, views, tg_views, meta_engagement
+            FROM articles
+            WHERE id=%s OR article_slug=%s
+            ORDER BY posted_at DESC NULLS LAST, found_at DESC NULLS LAST
+            LIMIT 1
+        """, (cand, cand), fetch="one")
+        if row:
+            return row
+    return None
+
+def db_list_website_articles(status="posted", lang=None, limit=10):
+    """List recent website articles by status/lang."""
+    if not DB_ENABLED:
+        return []
+    limit = max(1, min(int(limit or 10), 25))
+    sql = """
+        SELECT id, title, article_slug, category, lang, posted_at, views, tg_views, meta_engagement
+        FROM articles
+        WHERE status=%s
+    """
+    params = [status]
+    if lang:
+        sql += " AND lang=%s"
+        params.append(lang)
+    sql += " ORDER BY COALESCE(posted_at, found_at) DESC LIMIT %s"
+    params.append(limit)
+    return db_execute(sql, tuple(params), fetch="all") or []
+
+def db_search_website_articles(query, status=None, lang=None, limit=10):
+    """Search website articles by title/summary/body."""
+    if not DB_ENABLED or not query:
+        return []
+    limit = max(1, min(int(limit or 10), 25))
+    like = f"%{str(query).strip()}%"
+    sql = """
+        SELECT id, title, article_slug, status, category, lang, posted_at, views, tg_views, meta_engagement
+        FROM articles
+        WHERE (title ILIKE %s OR summary ILIKE %s OR article_body ILIKE %s)
+    """
+    params = [like, like, like]
+    if status:
+        sql += " AND status=%s"
+        params.append(status)
+    if lang:
+        sql += " AND lang=%s"
+        params.append(lang)
+    sql += " ORDER BY COALESCE(posted_at, found_at) DESC LIMIT %s"
+    params.append(limit)
+    return db_execute(sql, tuple(params), fetch="all") or []
+
+def db_website_analytics(days=7, limit=5):
+    """Website analytics snapshot from article archive."""
+    if not DB_ENABLED:
+        return {}
+    out = {"days": int(days), "limit": int(limit)}
+    try:
+        row = db_execute("""
+            SELECT
+                COUNT(*) FILTER (WHERE status='posted') AS posted_total,
+                COALESCE(SUM(views),0) AS total_views,
+                COALESCE(SUM(tg_views),0) AS total_tg_views,
+                COALESCE(SUM(meta_engagement),0) AS total_meta_engagement
+            FROM articles
+            WHERE posted_at > NOW() - INTERVAL %s
+        """, (f"{int(days)} days",), fetch="one")
+        if row:
+            out["posted_total"] = int(row[0] or 0)
+            out["total_views"] = int(row[1] or 0)
+            out["total_tg_views"] = int(row[2] or 0)
+            out["total_meta_engagement"] = int(row[3] or 0)
+
+        out["top_views"] = db_execute("""
+            SELECT id, title, article_slug, views
+            FROM articles
+            WHERE status='posted' AND posted_at > NOW() - INTERVAL %s
+            ORDER BY views DESC, posted_at DESC
+            LIMIT %s
+        """, (f"{int(days)} days", int(limit)), fetch="all") or []
+
+        out["top_tg"] = db_execute("""
+            SELECT id, title, article_slug, tg_views
+            FROM articles
+            WHERE status='posted' AND posted_at > NOW() - INTERVAL %s
+            ORDER BY tg_views DESC, posted_at DESC
+            LIMIT %s
+        """, (f"{int(days)} days", int(limit)), fetch="all") or []
+
+        out["top_meta"] = db_execute("""
+            SELECT id, title, article_slug, meta_engagement
+            FROM articles
+            WHERE status='posted' AND posted_at > NOW() - INTERVAL %s
+            ORDER BY meta_engagement DESC, posted_at DESC
+            LIMIT %s
+        """, (f"{int(days)} days", int(limit)), fetch="all") or []
+    except Exception:
+        pass
+    return out
+
+def db_get_featured_articles():
+    """Return currently featured article IDs/slugs from bot_kv."""
+    try:
+        return kv_get("featured_articles", []) or []
+    except Exception:
+        return []
+
+def db_set_featured_articles(items):
+    """Persist featured article IDs/slugs into bot_kv."""
+    try:
+        clean = []
+        for x in (items or []):
+            s = str(x or "").strip()
+            if s and s not in clean:
+                clean.append(s)
+        kv_set("featured_articles", clean)
+        return clean
+    except Exception:
+        return []
+
+def db_feature_article(identifier):
+    """Mark an article as featured in bot_kv using its resolved id if possible."""
+    row = db_get_article_by_identifier(identifier)
+    ident = row[0] if row else str(identifier or "").strip()
+    if not ident:
+        return []
+    featured = db_get_featured_articles()
+    if ident not in featured:
+        featured.append(ident)
+    db_set_featured_articles(featured)
+    return [ident]
+
+def db_unfeature_article(identifier):
+    """Remove an article from featured list."""
+    row = db_get_article_by_identifier(identifier)
+    ident = row[0] if row else str(identifier or "").strip()
+    featured = db_get_featured_articles()
+    new_items = [x for x in featured if x != ident and x != str(identifier or "").strip()]
+    db_set_featured_articles(new_items)
+    return featured != new_items
 
 def db_bot_stats():
     """Quick operational stats for Telegram command output."""
