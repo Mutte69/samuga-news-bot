@@ -4599,8 +4599,8 @@ def handle_updates():
                                         try:
                                             _send_approval_card(k, v, force=True)
                                             released += 1
-                                        except Exception as re:
-                                            log.error(f"/release {k}: {re}")
+                                        except Exception as rel_e:
+                                            log.error(f"/release {k}: {rel_e}")
                                     send_text(chat_id,
                                         f"✅ Released <b>{released}/{len(pending)}</b> card(s) to Content Lab.\n"
                                         f"Use <code>/pending</code> to see full queue.",
@@ -6608,6 +6608,7 @@ if __name__ == "__main__":
     # Periodic state heartbeat — saves every 5 minutes so restarts lose minimal state
     scheduler.add_job(persist_state, "interval", minutes=5, id="state_heartbeat")
     scheduler.add_job(ops_watchdog, "interval", minutes=10)
+    scheduler.add_job(run_discovery, "interval", hours=1)  # Discovery Engine
 
     log.info("⏰ Scheduler started!")
     scheduler.start()
