@@ -689,6 +689,13 @@ def send_text(chat_id, text, reply_to=None, thread_id=None):
     except Exception as e: log.error(f"Send text: {e}")
 
 _ops_last_alerts = {}
+_ops_watchdog_state = {
+    "source_health_alerts": {},
+    "duplicate_hits_recent": [],   # utc datetimes
+    "manual_post_failures": [],    # utc datetimes
+    "social_queue_stuck_since": None,
+    "last_posted_dv": 0,
+}
 website_banner = {"active": False, "text": "", "image_url": "", "updated_at": None}
 
 def alert_admin(message, dedupe_key=None, cooloff_minutes=20):
@@ -1686,6 +1693,7 @@ def post_article(article, seen, social_only=False, allow_social=True):
 
     # ── Duplicate story check — skip if same event already posted/queued/rejected ──
     if is_duplicate_story(article["_dedup_title"]):
+        note_duplicate_skip()
         log.info(f"⏭️ Skipping duplicate ({cluster_size} sources): {article['title'][:55]}")
         db_mark_status(article["id"], "duplicate")
         return False
@@ -2014,6 +2022,8 @@ def run_job(social_only=False, breaking_only=False):
             log.info(f"🇲🇻 DV → Content Lab (budget {dv_sent+1}/{dv_budget}): {a['title'][:55]}")
             post_article(a, seen, social_only=False, allow_social=False)
             dv_sent += 1
+        else:
+            note_duplicate_skip()
     if dv_sent:
         log.info(f"🇲🇻 {dv_sent} Dhivehi card(s) sent to Content Lab")
 
@@ -2066,6 +2076,8 @@ def run_job(social_only=False, breaking_only=False):
             post_article(a, seen, social_only=False, allow_social=True)
             posted_cats.add(cat)
             en_sent += 1
+        else:
+            note_duplicate_skip()
 
     if en_sent:
         log.info(f"📰 {en_sent} English card(s) sent to Content Lab")
@@ -4152,6 +4164,12 @@ def handle_updates():
 
                                     # 6. Queue state
                                     lines.append("\n🧠 <b>Queue guards:</b> duplicate translation wall + internal/junk safety wall active")
+                                    try:
+                                        dup_recent = _watchdog_prune_recent("duplicate_hits_recent", minutes=120)
+                                        mpf = _watchdog_prune_recent("manual_post_failures", minutes=180)
+                                        lines.append(f"🔔 <b>Watchdog memory:</b> duplicates {len(dup_recent)} in 2h | manual failures {len(mpf)} in 3h")
+                                    except Exception:
+                                        pass
                                     lines.append("🌐 <b>Dhivehi website rule:</b> no Dhivehi website publish without Content Lab approval")
                                     lines.append(f"🎯 <b>Website banner:</b> {'ON' if website_banner.get('active') else 'OFF'}")
                                     if website_banner.get("image_url"):
@@ -4963,25 +4981,125 @@ def handle_updates():
         except Exception as e:
             log.error(f"Update loop: {e}"); time.sleep(5)
 
+
+def _watchdog_prune_recent(key, minutes=90):
+    cutoff = utcnow() - timedelta(minutes=minutes)
+    arr = _ops_watchdog_state.setdefault(key, [])
+    _ops_watchdog_state[key] = [t for t in arr if isinstance(t, datetime) and t > cutoff]
+    return _ops_watchdog_state[key]
+
+def note_duplicate_skip():
+    arr = _watchdog_prune_recent("duplicate_hits_recent", minutes=120)
+    arr.append(utcnow())
+
+def note_manual_post_failure():
+    arr = _watchdog_prune_recent("manual_post_failures", minutes=180)
+    arr.append(utcnow())
+
+def _watchdog_source_alerts():
+    issues = []
+    snapshot = source_health_summary(limit=20)
+    alerts = _ops_watchdog_state.setdefault("source_health_alerts", {})
+    now = utcnow()
+
+    for row in snapshot:
+        src = row.get("source", "Unknown")
+        key = _caption_match_key(src) or src.lower()
+        last = alerts.get(key)
+
+        if row.get("fetches", 0) >= 4 and row.get("fails", 0) >= 3:
+            if not last or (now - last).total_seconds() > 6 * 3600:
+                issues.append(f"Source looks unstable: <b>{src}</b> has {row.get('fails',0)} failures in {row.get('fetches',0)} fetches.")
+                alerts[key] = now
+
+        if row.get("fetches", 0) >= 6 and row.get("empty", 0) >= max(4, int(row.get("fetches",0) * 0.7)):
+            if not last or (now - last).total_seconds() > 8 * 3600:
+                issues.append(f"Source mostly empty: <b>{src}</b> returned empty {row.get('empty',0)} times in {row.get('fetches',0)} fetches.")
+                alerts[key] = now
+
+        items_total = row.get("items_total", 0)
+        ads_total = row.get("ads_total", 0)
+        if (items_total + ads_total) >= 6 and ads_total >= max(4, items_total):
+            if not last or (now - last).total_seconds() > 8 * 3600:
+                issues.append(f"Source is ad-heavy/noisy: <b>{src}</b> skipped {ads_total} ad-like items.")
+                alerts[key] = now
+
+        if row.get("health", 70) <= 40 and row.get("fetches", 0) >= 4:
+            if not last or (now - last).total_seconds() > 8 * 3600:
+                issues.append(f"Source health is weak: <b>{src}</b> scored only {row.get('health')}/100.")
+                alerts[key] = now
+    return issues
+
 def ops_watchdog():
-    """Light operational watchdog. Sends Alert messages when something looks wrong."""
+    """Operational watchdog. Sends Alert messages when something looks wrong before damage spreads."""
     try:
         issues = []
+
+        # 1. Website Dhivehi leak / unexpected rise
         try:
             stats = db_bot_stats() or {}
-            if int(stats.get("posted_dv", 0)) > 0 and os.environ.get("DHIVEHI_WEBSITE_APPROVED", "false").lower() != "true":
-                issues.append(f"Dhivehi website leak detected: {stats.get('posted_dv',0)} posted Dhivehi article(s) still visible.")
+            posted_dv = int(stats.get("posted_dv", 0))
+            last_posted_dv = int(_ops_watchdog_state.get("last_posted_dv", 0) or 0)
+
+            if posted_dv > 0 and os.environ.get("DHIVEHI_WEBSITE_APPROVED", "false").lower() != "true":
+                issues.append(f"Dhivehi website leak detected: {posted_dv} posted Dhivehi article(s) still visible. Use /hide_dv if needed.")
+
+            if posted_dv > last_posted_dv and last_posted_dv >= 0:
+                issues.append(f"Dhivehi website count increased: {last_posted_dv} → {posted_dv}. Check recent website output.")
+            _ops_watchdog_state["last_posted_dv"] = posted_dv
         except Exception as e:
             issues.append(f"Stats check failed: {str(e)[:120]}")
+
+        # 2. Queue flood / stuck queue
         try:
             if len(approval_queue) >= 25:
                 issues.append(f"Approval queue is high: {len(approval_queue)} items waiting.")
             if len(_social_queue) >= 12:
                 issues.append(f"Social queue is high: {len(_social_queue)} items waiting.")
+
+            if len(_social_queue) > 0:
+                if not _ops_watchdog_state.get("social_queue_stuck_since"):
+                    _ops_watchdog_state["social_queue_stuck_since"] = utcnow()
+                stuck_for = (utcnow() - _ops_watchdog_state["social_queue_stuck_since"]).total_seconds()
+                if stuck_for > 45 * 60 and _last_social_post_time:
+                    issues.append(f"Social queue may be stuck: {len(_social_queue)} item(s) still waiting after {int(stuck_for//60)} minutes.")
+            else:
+                _ops_watchdog_state["social_queue_stuck_since"] = None
         except Exception:
             pass
+
+        # 3. Duplicate flood signal
+        try:
+            dup_recent = _watchdog_prune_recent("duplicate_hits_recent", minutes=120)
+            if len(dup_recent) >= 8:
+                issues.append(f"Duplicate flood detected: {len(dup_recent)} duplicate story skips in the last 2 hours.")
+        except Exception:
+            pass
+
+        # 4. Manual publish failures
+        try:
+            fails = _watchdog_prune_recent("manual_post_failures", minutes=180)
+            if len(fails) >= 3:
+                issues.append(f"Manual website/banner failures repeating: {len(fails)} failure(s) in the last 3 hours.")
+        except Exception:
+            pass
+
+        # 5. Source health warnings
+        try:
+            issues.extend(_watchdog_source_alerts())
+        except Exception as e:
+            issues.append(f"Source health watchdog failed: {str(e)[:120]}")
+
+        # 6. Weather rate-limit reminder
+        try:
+            lb = (_last_buffer_error or {}).get("response", "")
+            if "429" in str(lb):
+                issues.append("Recent platform/API 429 seen in posting pipeline. Watch cache / queue pacing.")
+        except Exception:
+            pass
+
         if issues:
-            alert_admin("<br/>".join(issues), dedupe_key="ops_watchdog", cooloff_minutes=30)
+            alert_admin("<br/>".join(dict.fromkeys(issues)), dedupe_key="ops_watchdog", cooloff_minutes=30)
     except Exception as e:
         log.error(f"ops_watchdog: {e}")
 
@@ -5949,6 +6067,13 @@ def persist_state():
             "social_queue": sq_serialized,
             "website_banner": website_banner,
             "source_health": get_source_health_snapshot(),
+            "ops_watchdog_state": {
+                "source_health_alerts": {k: v.isoformat() if isinstance(v, datetime) else v for k, v in _ops_watchdog_state.get("source_health_alerts", {}).items()},
+                "duplicate_hits_recent": [t.isoformat() for t in _ops_watchdog_state.get("duplicate_hits_recent", []) if isinstance(t, datetime)],
+                "manual_post_failures": [t.isoformat() for t in _ops_watchdog_state.get("manual_post_failures", []) if isinstance(t, datetime)],
+                "social_queue_stuck_since": _ops_watchdog_state.get("social_queue_stuck_since").isoformat() if isinstance(_ops_watchdog_state.get("social_queue_stuck_since"), datetime) else None,
+                "last_posted_dv": _ops_watchdog_state.get("last_posted_dv", 0),
+            },
         }
         _save_state(state)
     except Exception as e:
@@ -5989,6 +6114,16 @@ def restore_state():
             pass
         try:
             load_source_health(state.get("source_health", {}))
+        except Exception:
+            pass
+        try:
+            ws = state.get("ops_watchdog_state", {}) or {}
+            _ops_watchdog_state["source_health_alerts"] = {k: datetime.fromisoformat(v) for k, v in (ws.get("source_health_alerts", {}) or {}).items() if v}
+            _ops_watchdog_state["duplicate_hits_recent"] = [datetime.fromisoformat(t) for t in (ws.get("duplicate_hits_recent", []) or []) if t]
+            _ops_watchdog_state["manual_post_failures"] = [datetime.fromisoformat(t) for t in (ws.get("manual_post_failures", []) or []) if t]
+            sss = ws.get("social_queue_stuck_since")
+            _ops_watchdog_state["social_queue_stuck_since"] = datetime.fromisoformat(sss) if sss else None
+            _ops_watchdog_state["last_posted_dv"] = int(ws.get("last_posted_dv", 0) or 0)
         except Exception:
             pass
         global _last_social_post_time
