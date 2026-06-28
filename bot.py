@@ -73,14 +73,6 @@ from db import (
     gemini_latin_thaana_to_thaana, gemini_latin_thaana_to_english,
     _detect_themes
 )
-from samuga_scraper import (
-    fetch_article, semantic_scrape, scrape_many
-)
-from discovery import (
-    run_discovery, discovery_list, discovery_add,
-    discovery_remove, discovery_pause, discovery_resume
-)
-
 
 # ── Structured logging: tags make Railway logs readable ──────────────────────
 # Usage: log.info("[FETCH] pulled 12 articles")  →  easy to filter in Railway
@@ -234,7 +226,7 @@ _ai_proactive_mode = True   # on by default — team can toggle
 # Every card (English + Dhivehi) waits here for Content Lab approval before posting.
 # Cards expire after 2 hours if not approved.
 ENGLISH_AUTOPOST_SECONDS = 2700   # Regular: auto-post after 45 min if nobody reviews
-BREAKING_AUTOPOST_SECONDS = 1800  # Breaking held for confidence: auto-posts in 30 min
+BREAKING_AUTOPOST_SECONDS = 900   # Breaking held for confidence: auto-posts in 15 min
 TELEGRAM_GAP_SECONDS    = 7200   # 2 hours between regular Telegram posts
 DAILY_TG_POST_MAX       = 12     # Max regular posts per day to Telegram
 DHIVEHI_EXPIRY_SECONDS   = 7200   # Dhivehi: expire (delete) after 2h if not approved
@@ -273,9 +265,14 @@ def can_post_cat_today(counter, max_per_day):
 # Exception: very high priority stories can use up to 6/hour.
 # Breaking with strong confidence posts automatically; breaking with weak confidence
 # goes to Alert Chat, not Content Lab, so Uly's workspace does not get flooded.
-CONTENT_LAB_NORMAL_MAX_PER_HOUR = int(os.environ.get("CONTENT_LAB_NORMAL_MAX_PER_HOUR", "4"))
-CONTENT_LAB_HIGH_MAX_PER_HOUR   = int(os.environ.get("CONTENT_LAB_HIGH_MAX_PER_HOUR", "6"))
-CONTENT_LAB_HIGH_SCORE          = int(os.environ.get("CONTENT_LAB_HIGH_SCORE", "180"))
+CONTENT_LAB_NORMAL_MAX_PER_HOUR = int(os.environ.get("CONTENT_LAB_NORMAL_MAX_PER_HOUR", "4"))  # legacy — kept for _content_lab_slots_available
+CONTENT_LAB_HIGH_MAX_PER_HOUR   = int(os.environ.get("CONTENT_LAB_HIGH_MAX_PER_HOUR", "6"))   # legacy
+CONTENT_LAB_HIGH_SCORE          = int(os.environ.get("CONTENT_LAB_HIGH_SCORE", "180"))         # threshold for "very high score" — 2 cards per scan
+HOURLY_CARD_CAP                 = int(os.environ.get("HOURLY_CARD_CAP", "10"))                 # safety net — never exceed this per hour
+SCAN_NORMAL_CARDS               = 1    # cards per 15-min scan normally
+SCAN_HIGH_CARDS                 = 2    # cards per scan when top article scores 180+
+FUNNEL_KEEP_RATIO               = 0.5  # each funnel pass keeps top 50%
+FUNNEL_MIN_SCORE                = 80   # articles below this get cut at first pass
 _content_lab_sent_log = []  # datetime stamps for approval previews actually sent
 
 def _prune_content_lab_log(now=None):
@@ -417,14 +414,32 @@ def expire_old_approvals():
         except Exception as e:
             log.error(f"Auto-post queue {k}: {e}")
 
+    # DV 30-min warning — alert team before card expires (DV never auto-posts)
+    dv_warning = [k for k, v in approval_queue.items()
+                  if v.get("lang") == "dv"
+                  and not v.get("_warned_30min")
+                  and (now - v["created_at"]).total_seconds() > (DHIVEHI_EXPIRY_SECONDS - 1800)]
+    for k in dv_warning:
+        approval_queue[k]["_warned_30min"] = True
+        title = approval_queue[k].get("title","")[:60]
+        is_brk = approval_queue[k].get("is_breaking", False)
+        brk_tag = "🚨 Breaking " if is_brk else ""
+        send_text(CORE_TEAM_CHAT_ID,
+            f"⚠️ <b>30-min warning</b> — {brk_tag}Dhivehi <code>{k.upper()}</code> expires in 30 minutes!\n"
+            f"📰 {title}\n\n"
+            f"Approve: <code>/approved {k}</code>  |  Reject: <code>/reject {k}</code>\n"
+            f"<i>Dhivehi never auto-posts — it will be deleted if not approved.</i>",
+            thread_id=ALERT_THREAD_ID)
+        persist_state()
+
     # Dhivehi expiry — breaking ones auto-post after 2h, regular ones delete
     dv_due = [k for k, v in approval_queue.items()
               if v["lang"] == "dv" and (now - v["created_at"]).total_seconds() > DHIVEHI_EXPIRY_SECONDS]
     for k in dv_due:
         item = approval_queue.pop(k)
         title = item.get("title","")[:40]
-        # Breaking Dhivehi with auto-post flag → post automatically
-        if item.get("_auto_post_breaking") and item.get("dv_text"):
+        # Dhivehi NEVER auto-posts — all DV cards just expire and get deleted
+        if False and item.get("_auto_post_breaking") and item.get("dv_text"):
             log.info(f"⏰ Breaking Dhivehi {k} auto-posting after 2h: {title}")
             try:
                 kw = item.get("keyword","local")
@@ -1614,14 +1629,8 @@ def _send_approval_card(key, item, force=False):
         return False
     if item.get("_content_lab_sent") and not force:
         return False
-    if not force:
-        ok, limit, sent, high = _content_lab_slots_available(item)
-        if not ok:
-            item["_content_lab_sent"] = False
-            item["_content_lab_delayed"] = True
-            log.info(f"🧯 Content Lab delayed {key}: {sent}/{limit} previews already sent in last hour")
-            persist_state()
-            return False
+    # No drip throttle — cards go to Content Lab immediately when ready
+    # The hourly CARD GENERATION budget (6/hr) is the gating, not Content Lab sending
     cat = item["cat"]
     lang_tag = "🇲🇻 Dhivehi" if item["lang"] == "dv" else "🇬🇧 English"
     brk = "🚨 BREAKING " if item["is_breaking"] else ""
@@ -1642,12 +1651,15 @@ def _send_approval_card(key, item, force=False):
     footer += f"❌ <code>/reject {key}</code>\n\n"
     # Tell the team the auto-post / expiry behaviour
     if item["lang"] == "en":
-        footer += "<i>⏰ Auto-posts in 15 min if not reviewed</i>"
-    else:
-        if item.get("_auto_post_breaking"):
-            footer += "<i>⏰ Breaking Dhivehi — auto-posts in 2h if no action taken</i>"
+        if item.get("is_breaking") and item.get("_held_for_confidence"):
+            footer += "<i>⏰ Breaking (held for review) — auto-posts in 15 min if no action</i>"
+        elif item.get("is_breaking"):
+            footer += "<i>⏰ Breaking — auto-posts in 15 min if no action</i>"
         else:
-            footer += "<i>⏰ Expires in 2h if not approved (regular Dhivehi never auto-posts)</i>"
+            footer += "<i>⏰ Auto-posts in 45 min if not reviewed</i>"
+    else:
+        # Dhivehi NEVER auto-posts — team must approve every single one
+        footer += "<i>⏰ Expires in 2h if not approved — Dhivehi never auto-posts</i>"
     msg = header + footer
 
     # If we have a finished card image, send it as a photo with the caption
@@ -1793,6 +1805,16 @@ def post_article(article, seen, social_only=False, allow_social=True):
                             rewritten=rewritten, summary=article.get("summary",""),
                             article_id=article["id"])
         db_mark_status(article["id"], "posted" if tg_ok else "seen", posted=bool(tg_ok))
+        # Send reference copy to Content Lab (for team awareness, no action needed)
+        if tg_ok:
+            try:
+                send_text(CORE_TEAM_CHAT_ID,
+                    f"🚨 <b>BREAKING posted automatically</b>\n"
+                    f"📰 {article['title'][:100]}\n"
+                    f"Source: {article.get('source','?')} · Score: {score_article(article)}\n"
+                    f"<i>Already posted to Telegram + socials. This is for reference only.</i>",
+                    thread_id=CONTENT_LAB_THREAD_ID)
+            except Exception: pass
 
         # ── Auto-generate Dhivehi version for breaking news ──────────────────
         # Sent to Content Lab for review. If nobody acts in 2 hours, posts automatically.
@@ -1814,7 +1836,7 @@ def post_article(article, seen, social_only=False, allow_social=True):
                     if not key:
                         return
                     approval_queue[key]["article_id"] = f"{_aid}_dv"
-                    approval_queue[key]["_auto_post_breaking"] = True   # 2hr auto-post flag
+                    approval_queue[key]["_auto_post_breaking"] = False  # DV never auto-posts
                     approval_queue[key]["summary"] = article.get("summary","")
                     # Pre-fetch bg
                     bg = fetch_background_image(_kw, cat=_cat, title=_title)
@@ -1998,69 +2020,144 @@ def run_job(social_only=False, breaking_only=False):
     if breaking_only:
         return
 
-    # ── 2. HOURLY BUDGET — Content Lab gets max 6 cards/hr (3 EN + 3 DV) ───
-    # Count how many cards were already sent to Content Lab THIS hour
+    # ── 2. PROGRESSIVE SCORING FUNNEL ────────────────────────────────────────
+    # Each 15-min scan: score all fresh articles → funnel down to 1-2 winners
+    # No hard quota cut — exceptional articles always get through
+    # Hour safety cap: HOURLY_CARD_CAP (10) so Railway doesn't get spammed
+
     now_mvt = utcnow() + timedelta(hours=5)
     hour_start = now_mvt.replace(minute=0, second=0, microsecond=0)
     hour_start_utc = hour_start - timedelta(hours=5)
 
-    # Count queued cards this hour (from approval_queue creation times)
-    en_this_hour = sum(1 for v in approval_queue.values()
-                       if v.get("lang") == "en"
-                       and v.get("created_at", utcnow()) >= hour_start_utc)
-    dv_this_hour = sum(1 for v in approval_queue.values()
-                       if v.get("lang") == "dv"
-                       and v.get("created_at", utcnow()) >= hour_start_utc)
+    # Count cards already created this hour (across both languages)
+    cards_this_hour = sum(1 for v in approval_queue.values()
+                          if v.get("created_at", utcnow()) >= hour_start_utc)
 
-    en_budget = max(0, 3 - en_this_hour)   # max 3 English per hour
-    dv_budget = max(0, 3 - dv_this_hour)   # max 3 Dhivehi per hour
-
-    log.info(f"📊 Hourly budget: {en_budget} EN + {dv_budget} DV remaining "
-             f"({en_this_hour}+{dv_this_hour} already sent this hour)")
-
-    if en_budget == 0 and dv_budget == 0:
-        log.info("📵 Hourly Content Lab budget exhausted — skipping regular articles")
+    if cards_this_hour >= HOURLY_CARD_CAP:
+        log.info(f"📵 Hourly safety cap hit ({cards_this_hour}/{HOURLY_CARD_CAP}) — skipping scan")
         return
 
-    # ── 2a. Dhivehi — best DV articles up to budget ─────────────────────────
-    dv_articles = [a for a in regular_articles if a.get("lang") == "dv"]
+    scan_slots = HOURLY_CARD_CAP - cards_this_hour  # remaining capacity this hour
+
+    def progressive_funnel(articles, label=""):
+        """
+        Progressive scoring funnel:
+        Score all → keep top 50% → score again → keep top 50% → repeat
+        until 1-3 articles remain. Returns ordered list of winners.
+        This mirrors how a senior editor thinks — first cut obvious low quality,
+        then keep re-evaluating until the best stories surface naturally.
+        """
+        if not articles:
+            return []
+
+        # First: attach scores to all articles (sort by recency bonus too)
+        scored = []
+        for a in articles:
+            s = score_article(a)
+            # Freshness bonus: articles from this scan get +10 so newest rises faster
+            pub = a.get("published")
+            if pub:
+                try:
+                    age_mins = (utcnow() - pub).total_seconds() / 60
+                    if age_mins < 30:
+                        s += 15   # very fresh — just posted
+                    elif age_mins < 60:
+                        s += 8    # fresh — within the hour
+                except Exception:
+                    pass
+            a["_funnel_score"] = s
+            scored.append(a)
+
+        # Cut anything below minimum threshold immediately
+        scored = [a for a in scored if a["_funnel_score"] >= FUNNEL_MIN_SCORE]
+        if not scored:
+            log.info(f"[FUNNEL] {label}: all articles below min score {FUNNEL_MIN_SCORE}")
+            return []
+
+        scored.sort(key=lambda a: a["_funnel_score"], reverse=True)
+        log.info(f"[FUNNEL] {label}: {len(articles)} → {len(scored)} after min score cut")
+
+        # Progressive halving passes
+        pool = scored
+        pass_num = 0
+        while len(pool) > 3:
+            pass_num += 1
+            # Re-score with latest context (cluster size may have grown)
+            for a in pool:
+                a["_funnel_score"] = score_article(a)
+            pool.sort(key=lambda a: a["_funnel_score"], reverse=True)
+            keep = max(1, int(len(pool) * FUNNEL_KEEP_RATIO))
+            prev = len(pool)
+            pool = pool[:keep]
+            log.info(f"[FUNNEL] {label} pass {pass_num}: {prev} → {len(pool)}")
+
+        # Final sort — highest score first
+        pool.sort(key=lambda a: a["_funnel_score"], reverse=True)
+
+        if len(pool) == 0:
+            return []
+
+        # Decide how many cards this scan gets:
+        # Normally 1. If top article scores 180+ AND second also high → 2.
+        top_score = pool[0]["_funnel_score"]
+        if top_score >= CONTENT_LAB_HIGH_SCORE and len(pool) >= 2 and pool[1]["_funnel_score"] >= CONTENT_LAB_HIGH_SCORE:
+            winners = pool[:2]
+            log.info(f"[FUNNEL] {label}: 2 winners (both scored {pool[0]['_funnel_score']} + {pool[1]['_funnel_score']})")
+        else:
+            winners = pool[:1]
+            log.info(f"[FUNNEL] {label}: 1 winner (score {top_score}) — {'2nd scored too low' if len(pool) >= 2 else 'only 1 article'}")
+
+        return winners
+
+    # Run funnel separately for EN and DV
+    en_regular = [a for a in regular_articles if a.get("lang", "en") == "en"]
+    dv_regular  = [a for a in regular_articles if a.get("lang") == "dv"]
+
+    en_winners = progressive_funnel(en_regular, label="EN") if en_regular else []
+    dv_winners = progressive_funnel(dv_regular, label="DV") if dv_regular else []
+
+    all_winners = en_winners + dv_winners
+    log.info(f"[FUNNEL] Final: {len(en_winners)} EN + {len(dv_winners)} DV winners this scan "
+             f"| {cards_this_hour}/{HOURLY_CARD_CAP} cards used this hour")
+
+    if not all_winners:
+        log.info("📭 No articles passed the funnel this scan")
+        return
+
+    # Re-use existing budget variables for downstream compatibility
+    en_budget = len(en_winners)
+    dv_budget = len(dv_winners)
+
+    # ── 2a. Dhivehi — funnel winners only ────────────────────────────────────
     dv_sent = 0
-    for a in dv_articles:
-        if dv_sent >= dv_budget:
-            break
+    for a in dv_winners:
         if not is_duplicate_story(a["title"]):
-            log.info(f"🇲🇻 DV → Content Lab (budget {dv_sent+1}/{dv_budget}): {a['title'][:55]}")
+            log.info(f"🇲🇻 DV winner (score {a.get('_funnel_score',0)}): {a['title'][:55]}")
             post_article(a, seen, social_only=False, allow_social=False)
             dv_sent += 1
         else:
             note_duplicate_skip()
     if dv_sent:
-        log.info(f"🇲🇻 {dv_sent} Dhivehi card(s) sent to Content Lab")
+        log.info(f"🇲🇻 {dv_sent} Dhivehi card(s) → Content Lab")
 
-    # ── 2b. English — best EN articles up to budget ──────────────────────────
+    # ── 2b. English — funnel winners only ────────────────────────────────────
     if not can_post_regular():
         secs_left = int(TELEGRAM_GAP_SECONDS - (utcnow() - last_regular_post_time).total_seconds())
-        log.info(f"⏳ Telegram 2hr gap active — {secs_left//60}m left (but still sending to Content Lab)")
-        # Still queue for Content Lab review even if Telegram window is closed
-        # The approval/auto-expiry handles the actual posting timing
+        log.info(f"⏳ Telegram 2hr gap active — {secs_left//60}m left (but Content Lab still gets cards)")
 
-    en_articles = [a for a in regular_articles if a.get("lang","en") == "en"]
     en_sent = 0
-    posted_cats = set()
-
-    for a in en_articles:
-        if en_sent >= en_budget:
-            break
+    for a in en_winners:
         cat = a["cat"]
-        a_score = score_article(a)
         text_lower = (a["title"] + " " + a.get("summary","")).lower()
 
         # Sports: Maldives national team only, max 1/day
         if cat in ["SPORTS", "FOOTBALL"]:
             mv_sports = ["maldives","dhivehi","raajje","national team","team maldives"]
             if not any(kw in text_lower for kw in mv_sports):
+                log.info(f"⏭️ EN winner filtered (non-MV sports): {a['title'][:50]}")
                 continue
             if not can_post_cat_today(daily_sports_count, 1):
+                log.info(f"⏭️ EN winner filtered (sports daily cap): {a['title'][:50]}")
                 continue
 
         # World: Maldives-relevant only, max 2/day
@@ -2068,6 +2165,7 @@ def run_job(social_only=False, breaking_only=False):
             mv_world = ["maldives","indian ocean","south asia","india","china",
                         "un ","dollar","oil","global economy"]
             if not any(kw in text_lower for kw in mv_world):
+                log.info(f"⏭️ EN winner filtered (non-MV world): {a['title'][:50]}")
                 continue
             if not can_post_cat_today(daily_world_count, 2):
                 continue
@@ -2077,14 +2175,9 @@ def run_job(social_only=False, breaking_only=False):
             if not can_post_cat_today(daily_tourism_count, 2):
                 continue
 
-        # No two same category unless score is exceptional
-        if cat in posted_cats and a_score < 160:
-            continue
-
         if not is_duplicate_story(a["title"]):
-            log.info(f"🟡 EN → Content Lab (budget {en_sent+1}/{en_budget}, score {a_score}): {a['title'][:55]}")
+            log.info(f"🟡 EN winner (score {a.get('_funnel_score',0)}) → Content Lab: {a['title'][:55]}")
             post_article(a, seen, social_only=False, allow_social=True)
-            posted_cats.add(cat)
             en_sent += 1
         else:
             note_duplicate_skip()
@@ -3865,7 +3958,12 @@ def handle_updates():
                                     send_text(chat_id, msg_text, reply_to=msg_id, thread_id=thread_id)
                                 else:
                                     send_text(chat_id,
-                                        "⚠️ I couldn't delete that Telegram message. Check bot admin rights in the group.",
+                                        "⚠️ <b>Couldn't delete that message.</b>\n\n"
+                                        "Common reasons:\n"
+                                        "• You replied to a <b>human message</b> — /delete only works on <b>bot messages</b>\n"
+                                        "• Message is older than 48h — Telegram blocks deletion after that\n"
+                                        "• Bot lost admin rights temporarily\n\n"
+                                        "Reply directly to a <b>Samuga AI bot message</b> (a card or queue message) and try again.",
                                         reply_to=msg_id, thread_id=thread_id)
                                     alert_admin("Content Lab delete failed. Check bot delete permissions in Telegram.", dedupe_key="telegram_delete_permission")
 
@@ -4396,42 +4494,6 @@ def handle_updates():
                                     log.error(f"/trends: {e}")
                                     send_text(chat_id, f"❌ Trends error: {e}", reply_to=msg_id, thread_id=thread_id)
 
-                        # /discovery - hunt for unreported stories
-                        elif text.strip().lower().startswith("/discovery"):
-                            arg = text.strip()[10:].strip()
-                            parts = arg.split(None, 1)
-                            sub = parts[0].lower() if parts else "list"
-                            rest = parts[1] if len(parts) > 1 else ""
-                            try:
-                                if sub in ("", "list"):
-                                    send_text(chat_id, discovery_list(), reply_to=msg_id, thread_id=thread_id)
-                                elif sub == "run":
-                                    send_text(chat_id, "🔍 Running discovery hunt now...", reply_to=msg_id, thread_id=thread_id)
-                                    import threading as _thr
-                                    _thr.Thread(target=run_discovery, daemon=True).start()
-                                elif sub == "pause":
-                                    send_text(chat_id, discovery_pause(), reply_to=msg_id, thread_id=thread_id)
-                                elif sub == "resume":
-                                    send_text(chat_id, discovery_resume(), reply_to=msg_id, thread_id=thread_id)
-                                elif sub == "add":
-                                    if not rest:
-                                        send_text(chat_id, "Usage: /discovery add <topic name>\nExample: /discovery add parliament vote tonight", reply_to=msg_id, thread_id=thread_id)
-                                    else:
-                                        # label is what they typed, query auto-built
-                                        label = rest.strip()
-                                        query = f"Maldives {label} 2026"
-                                        send_text(chat_id, discovery_add(label, query), reply_to=msg_id, thread_id=thread_id)
-                                elif sub == "remove":
-                                    if not rest.isdigit():
-                                        send_text(chat_id, "Usage: /discovery remove <number>\nSee /discovery list for numbers.", reply_to=msg_id, thread_id=thread_id)
-                                    else:
-                                        send_text(chat_id, discovery_remove(int(rest)), reply_to=msg_id, thread_id=thread_id)
-                                else:
-                                    send_text(chat_id, "Commands: /discovery list | add <topic> | remove <n> | run | pause | resume", reply_to=msg_id, thread_id=thread_id)
-                            except Exception as e:
-                                log.error(f"/discovery: {e}")
-                                send_text(chat_id, f"❌ Discovery error: {e}", reply_to=msg_id, thread_id=thread_id)
-
                         # /learning on | off | status — engagement learning switch
                         elif text.strip().lower().startswith("/learning"):
                             arg = text.strip().lower().replace("/learning", "").strip()
@@ -4519,6 +4581,33 @@ def handle_updates():
                                 except Exception as e:
                                     log.error(f"/meta: {e}")
                                     send_text(chat_id, f"❌ Meta test error: {e}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /release — flush ALL pending cards to Content Lab right now (when team is actively reviewing)
+                        elif text.strip().lower() in ["/release", "/flush", "/releaseall"]:
+                            try:
+                                pending = [(k, v) for k, v in approval_queue.items()
+                                           if not v.get("_content_lab_sent") and not v.get("_content_lab_suppressed")]
+                                if not pending:
+                                    send_text(chat_id, "📭 No pending cards waiting to be released — all already sent to Content Lab.", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id,
+                                        f"📤 Releasing <b>{len(pending)}</b> pending card(s) to Content Lab now...\n"
+                                        f"<i>Use this when your team is actively reviewing so you don't miss anything.</i>",
+                                        reply_to=msg_id, thread_id=thread_id)
+                                    released = 0
+                                    for k, v in pending:
+                                        try:
+                                            _send_approval_card(k, v, force=True)
+                                            released += 1
+                                        except Exception as re:
+                                            log.error(f"/release {k}: {re}")
+                                    send_text(chat_id,
+                                        f"✅ Released <b>{released}/{len(pending)}</b> card(s) to Content Lab.\n"
+                                        f"Use <code>/pending</code> to see full queue.",
+                                        reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                log.error(f"/release: {e}")
+                                send_text(chat_id, f"❌ Release error: {e}", reply_to=msg_id, thread_id=thread_id)
 
                         # /why <key> — explain how a queued card scored
                         elif text.strip().lower().startswith("/why"):
@@ -6365,6 +6454,33 @@ def restore_state():
                 log.error(f"restore approval {k}: {e}")
         log.info(f"📦 State restored: {len(recent_story_titles)} dedup titles, "
                  f"{len(approval_queue)} pending cards, {len(recent_posts)} recent posts")
+        # Alert team if pending cards were restored after restart
+        if len(approval_queue) > 0:
+            try:
+                lines = ["🔄 <b>Bot restarted — pending cards restored:</b>\n"]
+                for k, v in list(approval_queue.items()):
+                    age = ""
+                    if v.get("created_at"):
+                        mins = int((utcnow() - v["created_at"]).total_seconds() / 60)
+                        age = f" ({mins}min ago)"
+                    lang = v.get("lang","en").upper()
+                    cat  = v.get("cat","LOCAL")
+                    title = v.get("title","")[:50]
+                    lines.append(f"• <code>{k.upper()}</code> [{lang}/{cat}]{age} — {title}")
+                    if v.get("lang") == "dv" and not v.get("_auto_post_breaking"):
+                        lines.append(f"  Approve: <code>/approved {k}</code>  Reject: <code>/reject {k}</code>")
+                lines.append("\nRun <code>/pending</code> to see full queue.")
+                _startup_queue_msg = "\n".join(lines)
+                # send after bot is fully up — schedule for 10 seconds after start
+                import threading as _st
+                def _send_startup_alert():
+                    import time as _t; _t.sleep(10)
+                    try:
+                        send_text(CORE_TEAM_CHAT_ID, _startup_queue_msg, thread_id=ALERT_THREAD_ID)
+                    except Exception: pass
+                _st.Thread(target=_send_startup_alert, daemon=True).start()
+            except Exception as _e:
+                log.warning(f"startup queue alert: {_e}")
     except Exception as e:
         log.error(f"restore_state: {e}")
 
@@ -6438,21 +6554,6 @@ if __name__ == "__main__":
     _ft._gemini_post   = _gemini_post
     _ft.GEMINI_API_KEY = GEMINI_API_KEY
 
-    # Wire semantic scraper
-    import samuga_scraper as _sx
-    _sx._gemini_post         = _gemini_post
-    _sx.GEMINI_API_KEY       = GEMINI_API_KEY
-    _sx.record_source_health = _ft.record_source_health
-
-    # Wire discovery engine
-    import discovery as _disc
-    _disc._gemini_post      = _gemini_post
-    _disc.kv_get            = kv_get
-    _disc.kv_set            = kv_set
-    _disc.send_text         = send_text
-    _disc.CORE_TEAM_CHAT_ID = CORE_TEAM_CHAT_ID
-    _disc.ALERT_THREAD_ID   = ALERT_THREAD_ID
-
     import scoring as _sg
     _sg.utcnow = utcnow
     _sg.normalize_story_signal = story_signal_key
@@ -6477,7 +6578,7 @@ if __name__ == "__main__":
     scheduler.add_job(breaking_news_check, "interval", minutes=5)
     # Approval lifecycle — English auto-posts at 15min, Dhivehi expires at 2h. Check every 5 min.
     scheduler.add_job(expire_old_approvals, "interval", minutes=5)
-    scheduler.add_job(release_content_lab_drip, "interval", minutes=10)
+    # release_content_lab_drip removed — cards now go to Content Lab immediately when ready
     # Morning brief 7AM MVT = 2AM UTC
     scheduler.add_job(send_morning_brief, "cron", hour=1, minute=0)  # 6AM MVT
     # AI Nightly Journalist brief 10:30PM MVT = 5:30PM UTC (before night summary)
@@ -6507,7 +6608,6 @@ if __name__ == "__main__":
     # Periodic state heartbeat — saves every 5 minutes so restarts lose minimal state
     scheduler.add_job(persist_state, "interval", minutes=5, id="state_heartbeat")
     scheduler.add_job(ops_watchdog, "interval", minutes=10)
-    scheduler.add_job(run_discovery, "interval", hours=1)  # Discovery Engine - hunts every hour
 
     log.info("⏰ Scheduler started!")
     scheduler.start()
