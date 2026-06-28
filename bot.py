@@ -353,6 +353,12 @@ def store_pending_approval(card_bytes, caption, title, link, cat="LOCAL", lang="
         oldest = list(approval_queue.keys())[0]
         del approval_queue[oldest]
     persist_state()
+    # Immediately backup to PostgreSQL so queue survives any crash
+    try:
+        kv_set("approval_queue_backup", _serialize_approval_queue())
+        kv_set("approval_counter_backup", _approval_counter[0])
+    except Exception:
+        pass
     return key
 
 def expire_old_approvals():
@@ -6362,6 +6368,12 @@ def persist_state():
             },
         }
         _save_state(state)
+        # Also persist approval queue to PostgreSQL — survives Railway restarts/crashes
+        try:
+            kv_set("approval_queue_backup", _serialize_approval_queue())
+            kv_set("approval_counter_backup", _approval_counter[0])
+        except Exception as pg_e:
+            log.debug(f"persist_state PG backup: {pg_e}")
     except Exception as e:
         log.error(f"persist_state: {e}")
 
@@ -6443,7 +6455,19 @@ def restore_state():
                         })
                     except Exception: pass
             log.info(f"📲 Social queue restored: {len(_social_queue)} post(s) waiting")
-        for k, item in state.get("approval_queue", {}).items():
+        # Restore approval queue — try PostgreSQL first (survives crashes), then fall back to file
+        pg_queue = {}
+        try:
+            pg_queue = kv_get("approval_queue_backup", {}) or {}
+            if pg_queue:
+                log.info(f"📦 Loading approval queue from PostgreSQL ({len(pg_queue)} items)")
+        except Exception as pg_e:
+            log.debug(f"restore PG queue: {pg_e}")
+
+        # Merge: PG takes priority for keys it has, file fills the rest
+        queue_source = {**state.get("approval_queue", {}), **pg_queue}
+
+        for k, item in queue_source.items():
             try:
                 if item.get("_card_b64") and item.get("card_bytes"):
                     item["card_bytes"] = base64.b64decode(item["card_bytes"])
@@ -6452,6 +6476,14 @@ def restore_state():
                 approval_queue[k] = item
             except Exception as e:
                 log.error(f"restore approval {k}: {e}")
+
+        # Also restore approval counter from PG if available
+        try:
+            pg_counter = kv_get("approval_counter_backup", None)
+            if pg_counter is not None and pg_counter > _approval_counter[0]:
+                _approval_counter[0] = pg_counter
+        except Exception:
+            pass
         log.info(f"📦 State restored: {len(recent_story_titles)} dedup titles, "
                  f"{len(approval_queue)} pending cards, {len(recent_posts)} recent posts")
         # Alert team if pending cards were restored after restart
