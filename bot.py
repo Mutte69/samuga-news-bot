@@ -73,6 +73,9 @@ from db import (
     gemini_latin_thaana_to_thaana, gemini_latin_thaana_to_english,
     _detect_themes
 )
+from samuga_scraper import (
+    fetch_article, semantic_scrape, scrape_many
+)
 
 # ── Structured logging: tags make Railway logs readable ──────────────────────
 # Usage: log.info("[FETCH] pulled 12 articles")  →  easy to filter in Railway
@@ -4338,6 +4341,29 @@ def handle_updates():
                                     lines.append("\n<i>Use /story [number] to see the full timeline.</i>")
                                     send_text(chat_id, "\n".join(lines), reply_to=msg_id, thread_id=thread_id)
 
+                        # /scrapetest <url> — test the semantic scraper on one URL (safe, no publishing)
+                        elif text.strip().lower().startswith("/scrapetest"):
+                            arg = text.strip()[11:].strip()
+                            if not arg.startswith("http"):
+                                send_text(chat_id, "Use <code>/scrapetest [url]</code> — e.g. <code>/scrapetest https://psmnews.mv/en/...</code>", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                send_text(chat_id, f"🔍 Scraping… <i>{arg[:80]}</i>", reply_to=msg_id, thread_id=thread_id)
+                                try:
+                                    art = semantic_scrape(arg, source="ScrapeTest")
+                                    if art.get("error"):
+                                        send_text(chat_id, f"❌ <b>Scrape failed</b>\nReason: {art['error']}", reply_to=msg_id, thread_id=thread_id)
+                                    else:
+                                        out = [
+                                            "✅ <b>Scrape OK</b>",
+                                            f"<b>Title:</b> {art['title']}",
+                                            f"<b>Category:</b> {art['cat']}   <b>Lang:</b> {art['lang']}",
+                                            f"<b>ID:</b> <code>{art['id']}</code>",
+                                            f"<b>Body:</b> {art['summary'][:400]}…",
+                                        ]
+                                        send_text(chat_id, "\n".join(out), reply_to=msg_id, thread_id=thread_id)
+                                except Exception as e:
+                                    send_text(chat_id, f"❌ <b>Scraper crashed:</b> {e}", reply_to=msg_id, thread_id=thread_id)
+
                         # /story <id> — show the full timeline of a story
                         elif text.strip().lower().startswith("/story"):
                             arg = text.strip()[6:].strip()
@@ -6393,6 +6419,12 @@ if __name__ == "__main__":
     _ft.ai             = ai
     _ft._gemini_post   = _gemini_post
     _ft.GEMINI_API_KEY = GEMINI_API_KEY
+
+    # Wire semantic scraper (same injection pattern as fetchers)
+    import samuga_scraper as _sx
+    _sx._gemini_post         = _gemini_post
+    _sx.GEMINI_API_KEY       = GEMINI_API_KEY
+    _sx.record_source_health = _ft.record_source_health
 
     import scoring as _sg
     _sg.utcnow = utcnow
