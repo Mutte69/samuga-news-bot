@@ -6608,7 +6608,12 @@ if __name__ == "__main__":
     # Periodic state heartbeat — saves every 5 minutes so restarts lose minimal state
     scheduler.add_job(persist_state, "interval", minutes=5, id="state_heartbeat")
     scheduler.add_job(ops_watchdog, "interval", minutes=10)
-    scheduler.add_job(run_discovery, "interval", hours=1)  # Discovery Engine
+    try:
+        from discovery import run_discovery as _run_discovery
+        scheduler.add_job(_run_discovery, "interval", hours=1)
+        log.info("🔍 Discovery Engine scheduled — runs every hour")
+    except ImportError:
+        log.warning("⚠️ discovery.py not found — Discovery Engine disabled")
 
     log.info("⏰ Scheduler started!")
     scheduler.start()
