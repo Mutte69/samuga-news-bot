@@ -34,9 +34,10 @@ GEMINI_API_KEY       = os.environ.get("GEMINI_API_KEY", "")
 record_source_health = None   # bot.py: samuga_scraper.record_source_health = _ft.record_source_health
 
 # ── Config ───────────────────────────────────────────────────────────────────
-SCRAPER_UA        = "Mozilla/5.0 (compatible; SamugaBot/7.0; +https://samuga.mv)"
+SCRAPER_UA        = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 SCRAPER_TIMEOUT   = 15
-SCRAPER_MAX_CHARS = 30000   # cap content sent to Gemini — token control
+SCRAPER_MAX_CHARS = 40000   # cap content sent to Gemini — raised for WordPress pages
 SCRAPER_MIN_BODY  = 200     # body shorter than this = extraction failed
 VALID_CATS        = {"BREAKING", "LOCAL", "POLITICAL", "BUSINESS",
                      "SPORTS", "WORLD", "LIFESTYLE", "DISASTER", "TOURISM"}
@@ -62,8 +63,11 @@ def _health(source, **kw):
 # ─── NODE 1: FETCH ───────────────────────────────────────────────────────────
 def _fetch_html(url):
     try:
-        resp = requests.get(url, timeout=SCRAPER_TIMEOUT,
-                            headers={"User-Agent": SCRAPER_UA})
+        resp = requests.get(url, timeout=SCRAPER_TIMEOUT, headers={
+            "User-Agent": SCRAPER_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
         if resp.status_code != 200:
             return None, f"http {resp.status_code}", resp.status_code
         resp.encoding = resp.apparent_encoding or "utf-8"  # protects Thaana UTF-8
@@ -74,7 +78,9 @@ def _fetch_html(url):
 
 # ─── NODE 2: CLEAN ───────────────────────────────────────────────────────────
 def _clean_html(html):
-    """Strip noise, keep main content. Cuts tokens 60-70% before Gemini sees it."""
+    """Strip noise, keep main content. Cuts tokens before Gemini sees it.
+    WordPress-aware: tries common WP article containers, then falls back to
+    the full cleaned page so Gemini can find the body itself."""
     try:
         from bs4 import BeautifulSoup
     except ImportError:
@@ -82,13 +88,33 @@ def _clean_html(html):
         return ""
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "nav", "footer", "header",
-                    "aside", "form", "iframe", "noscript", "svg"]):
+                    "aside", "form", "iframe", "noscript", "svg",
+                    "button", "input"]):
         tag.decompose()
-    main = (soup.find("article") or soup.find("main")
-            or soup.find("div", class_=re.compile(r"(content|article|post|story)", re.I))
-            or soup.body)
-    text = main.get_text(separator="\n", strip=True) if main else ""
-    return text[:SCRAPER_MAX_CHARS]
+
+    # Try specific containers first (covers most WordPress themes + others)
+    candidates = [
+        soup.find("article"),
+        soup.find("main"),
+        soup.find("div", class_=re.compile(
+            r"(entry-content|post-content|article-content|td-post-content|"
+            r"single-content|content-area|story-?body|article-?body|post-?body)", re.I)),
+        soup.find("div", class_=re.compile(r"(content|article|post|story)", re.I)),
+        soup.find("div", id=re.compile(r"(content|article|post|story|main)", re.I)),
+    ]
+    best = ""
+    for c in candidates:
+        if c:
+            t = c.get_text(separator="\n", strip=True)
+            if len(t) > len(best):
+                best = t
+
+    # Fallback: if no container gave us a real body, send the whole page text.
+    # Server-rendered (WordPress) pages always have the body in the HTML.
+    if len(best) < SCRAPER_MIN_BODY and soup.body:
+        best = soup.body.get_text(separator="\n", strip=True)
+
+    return best[:SCRAPER_MAX_CHARS]
 
 
 # ─── NODE 3: GEMINI SEMANTIC EXTRACT ─────────────────────────────────────────
@@ -98,13 +124,19 @@ Return ONLY a valid JSON object. No markdown, no backticks, no preamble.
 CRITICAL: Preserve all Thaana/Dhivehi script (U+0780-U+07BF) EXACTLY as written.
 Never transliterate, romanize, or translate Dhivehi unless asked.
 
+The content below is raw text from a news web page. It may contain leftover
+menu items, category links, "related articles", ads, or footer text mixed in.
+IGNORE that noise. Find the ONE main news article on the page and extract only
+its real headline and body. If there is no actual news article (e.g. it's just
+a homepage list of links), set "title" and "summary" to empty strings.
+
 Extract these keys:
-  "title"    : the headline (string)
-  "summary"  : the article body, cleaned of ads/nav/related-links (string)
+  "title"    : the main article headline (string)
+  "summary"  : the main article body only, clean prose, no menus/links/ads (string)
   "category" : one of BREAKING, LOCAL, POLITICAL, BUSINESS, SPORTS, WORLD, LIFESTYLE
   "lang"     : "dv" if the body is mainly Dhivehi Thaana, else "en"
 
-If a field is missing, use an empty string. Output the JSON object only.
+Output the JSON object only.
 
 Web page content:
 {content}
