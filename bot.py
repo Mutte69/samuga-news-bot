@@ -4882,8 +4882,7 @@ def handle_updates():
                                             f"Telegram {tg} · FB {fb} · IG {ig} · X {x}\n"
                                             f"<i>{len(_social_queue)} item(s) still in queue</i>",
                                             reply_to=msg_id, thread_id=thread_id)
-                                        global _last_social_post_time
-                                        _last_social_post_time = utcnow()
+                                        globals()["_last_social_post_time"] = utcnow()
                                         persist_state()
                                     except Exception as fpe:
                                         # Put back in queue if post failed
@@ -4898,8 +4897,7 @@ def handle_updates():
                         # /qrefresh — reset the social queue timer + show queue status
                         elif text.strip().lower() in ["/qrefresh", "/queue refresh", "/resetqueue"]:
                             try:
-                                global _last_social_post_time
-                                _last_social_post_time = None
+                                globals()["_last_social_post_time"] = None
                                 with _social_queue_lock:
                                     count = len(_social_queue)
                                 # Check what's blocking
