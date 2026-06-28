@@ -58,17 +58,32 @@ CLUSTER_WINDOW_HOURS = 6
 
 BREAKING_KEYWORDS = [
     "killed", "dead", "dies", "murder", "shot", "stabbed", "explosion", "bomb", "attack",
-    "tsunami", "earthquake", "flood", "disaster", "sinking", "collapsed", "hostage",
+    "tsunami", "earthquake", "flood", "sinking", "collapsed", "hostage",
     "missing person", "fire broke", "crash landed", "emergency landing", "gas leak",
     "capsized", "swept away", "search and rescue"
 ]
+
+# These require the keyword to appear WITHOUT nearby org/authority context
+BREAKING_CONTEXT_KEYWORDS = {
+    "disaster": ["disaster management", "disaster authority", "disaster relief org",
+                 "national disaster", "disaster preparedness", "disaster response org",
+                 "disaster management authority"],
+    "flood":    ["flood relief", "flood management authority"],
+    "fire":     ["fire service", "fire department", "fire station", "fire authority"],
+}
 
 BREAKING_BLACKLIST = [
     "world cup", "football", "cricket", "sports", "fifa", "champions league",
     "premier league", "tourism", "resort", "hotel", "travel", "award", "ranking",
     "luxury", "boutique", "hospitality", "destination", "lagoon", "civil war",
     "squad", "team", "player", "match", "game", "season", "transfer",
-    "economy", "business", "market", "price", "investment", "opening", "launch", "event"
+    "economy", "business", "market", "price", "investment", "opening", "launch", "event",
+    # Government routine — MOU signings, agreements, appointments are NOT breaking
+    "memoranda of understanding", "memorandum of understanding", "mou signed",
+    "has signed", "signing ceremony", "agreement signed", "signed agreement",
+    "mou with", "partnership agreement", "cooperation agreement",
+    "appointed", "appointment of", "reappointed", "sworn in as",
+    "budget approved", "budget passed", "bill passed", "ratified",
 ]
 
 # Ad/promo markers (same as fetchers — self-contained copy so no cross-import)
@@ -92,6 +107,16 @@ def is_dhivehi(text):
     """Check if text contains Thaana script (Dhivehi)."""
     return any('\u0780' <= c <= '\u07BF' for c in text)
 
+def _is_context_breaking(text, kw, false_contexts):
+    """Check if a keyword appears in a real breaking context vs org/authority name."""
+    if kw not in text:
+        return False
+    # If any false context phrase appears near the keyword, it's NOT breaking
+    for ctx in false_contexts:
+        if ctx in text:
+            return False
+    return True
+
 def is_breaking(title, summary="", cat=""):
     """Return True if article qualifies as breaking news."""
     text = (title + " " + summary).lower()
@@ -102,7 +127,14 @@ def is_breaking(title, summary="", cat=""):
         return False
     if any(bl in text for bl in BREAKING_BLACKLIST):
         return False
-    if not any(kw in text for kw in BREAKING_KEYWORDS):
+    # Check standard keywords
+    standard_hit = any(kw in text for kw in BREAKING_KEYWORDS)
+    # Check context-aware keywords (e.g. "disaster" only if NOT "disaster management authority")
+    context_hit = any(
+        _is_context_breaking(text, kw, false_ctxs)
+        for kw, false_ctxs in BREAKING_CONTEXT_KEYWORDS.items()
+    )
+    if not standard_hit and not context_hit:
         return False
     if cat == "LOCAL":
         mv_terms = ["maldives", "male", "malé", "dhivehi", "maldivian", "raajje",
