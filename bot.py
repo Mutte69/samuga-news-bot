@@ -705,12 +705,17 @@ def download_telegram_photo(photo_list):
         log.error(f"Photo download: {e}")
         return None
 
-def send_photo(chat_id, buf, caption, thread_id=None):
+def _make_inline_kb(buttons):
+    """Build Telegram inline_keyboard JSON from list of (text, callback_data) tuples per row."""
+    return {"inline_keyboard": [[{"text": t, "callback_data": c} for t, c in row] for row in buttons]}
+
+def send_photo(chat_id, buf, caption, thread_id=None, reply_markup=None):
     """Send a photo to any Telegram chat/channel, optionally to a topic thread"""
     try:
         buf.seek(0)
         data = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
-        if thread_id: data["message_thread_id"] = thread_id
+        if thread_id:    data["message_thread_id"] = thread_id
+        if reply_markup: data["reply_markup"] = json.dumps(reply_markup)
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
             data=data,
@@ -718,18 +723,47 @@ def send_photo(chat_id, buf, caption, thread_id=None):
             timeout=30
         )
         resp.raise_for_status()
+        msg_id = resp.json().get("result", {}).get("message_id")
         log.info("✅ Photo sent to Telegram")
-        return True
+        return msg_id
     except Exception as e:
         log.error(f"send_photo: {e}")
-        return False
+        return None
 
-def send_text(chat_id, text, reply_to=None, thread_id=None):
-    payload={"chat_id":chat_id,"text":text,"parse_mode":"HTML"}
-    if reply_to: payload["reply_to_message_id"]=reply_to
-    if thread_id: payload["message_thread_id"]=thread_id
-    try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",json=payload,timeout=15)
-    except Exception as e: log.error(f"Send text: {e}")
+def send_text(chat_id, text, reply_to=None, thread_id=None, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_to:     payload["reply_to_message_id"] = reply_to
+    if thread_id:    payload["message_thread_id"] = thread_id
+    if reply_markup: payload["reply_markup"] = json.dumps(reply_markup)
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json=payload, timeout=15)
+        return resp.json().get("result", {}).get("message_id")
+    except Exception as e:
+        log.error(f"Send text: {e}")
+        return None
+
+def edit_message_reply_markup(chat_id, message_id, reply_markup):
+    """Remove or update buttons on a previously sent message."""
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup",
+            json={"chat_id": chat_id, "message_id": message_id,
+                  "reply_markup": json.dumps(reply_markup)},
+            timeout=10)
+    except Exception as e:
+        log.error(f"edit_markup: {e}")
+
+def answer_callback_query(callback_query_id, text="", show_alert=False):
+    """Acknowledge a button tap so Telegram stops showing the loading spinner."""
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": callback_query_id, "text": text, "show_alert": show_alert},
+            timeout=10)
+    except Exception as e:
+        log.error(f"answer_callback: {e}")
 
 _ops_last_alerts = {}
 _ops_watchdog_state = {
@@ -1680,12 +1714,32 @@ def _send_approval_card(key, item, force=False):
         footer += "<i>⏰ Expires in 2h if not approved — Dhivehi never auto-posts</i>"
     msg = header + footer
 
+    # ── Inline buttons — one tap approve/reject ──────────────────────────────
+    if item["lang"] == "dv":
+        buttons = [
+            [("✅ Approve DV", f"approve:{key}"), ("❌ Reject", f"reject:{key}")],
+            [("✏️ Edit & Approve", f"edit_approve:{key}")]
+        ]
+    else:
+        buttons = [
+            [("✅ Approve", f"approve:{key}"), ("❌ Reject", f"reject:{key}")]
+        ]
+    kb = _make_inline_kb(buttons)
+
     # If we have a finished card image, send it as a photo with the caption
+    msg_id = None
     if item.get("card_bytes"):
         buf = io.BytesIO(item["card_bytes"])
-        send_photo(CORE_TEAM_CHAT_ID, buf, msg, thread_id=CONTENT_LAB_THREAD_ID)
+        msg_id = send_photo(CORE_TEAM_CHAT_ID, buf, msg,
+                            thread_id=CONTENT_LAB_THREAD_ID, reply_markup=kb)
     else:
-        send_text(CORE_TEAM_CHAT_ID, msg, thread_id=CONTENT_LAB_THREAD_ID)
+        msg_id = send_text(CORE_TEAM_CHAT_ID, msg,
+                           thread_id=CONTENT_LAB_THREAD_ID, reply_markup=kb)
+
+    # Store message_id so we can remove buttons after action
+    if msg_id:
+        item["_lab_message_id"] = msg_id
+
     _mark_content_lab_sent(item)
     log.info(f"📨 Approval card sent to Content Lab: {key} ({item['lang']})")
     return True
@@ -3697,6 +3751,94 @@ def dm_check_and_increment(user_id):
 
 def handle_updates():
     # Use persisted offset so we never miss messages across restarts
+    def publish_approved_item(item, key, approver="Team", corrected=None):
+        """
+        Shared approve logic — called by both text command and button tap.
+        Wraps the same queue/publish flow used by the existing /approved handler.
+        """
+        try:
+            if item["lang"] == "dv":
+                # Run DV card generation in background thread
+                final_dv = corrected if corrected else item.get("dv_text","")
+                kw = item.get("keyword", item["cat"].lower())
+                bg = item.get("_bg_image") or fetch_background_image(kw)
+                ts_now = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+                card = generate_card(final_dv, SAMUGA_PUBLIC_SOURCE, ts_now, item["cat"], bg)
+                full_caption = (
+                    f"🇲🇻 <b>{item['title']}</b>\n\n"
+                    f"{final_dv}\n\n"
+                    f"📡 <b>ސަމުގާ މީޑިއާ</b> | @samugacommunity"
+                )
+                card.seek(0)
+                remember_post(item["title"], item["cat"], ts_now)
+                db_mark_status(item.get("article_id",""), "posted", posted=True)
+                db_log_learning(
+                    article_id=item.get("article_id"),
+                    action=("edited" if corrected else "approved"),
+                    member=approver,
+                    category=item.get("cat",""),
+                    source=item.get("source",""),
+                    theme=item.get("_trend_theme",""),
+                    original_caption=item.get("dv_text",""),
+                    final_caption=(corrected or item.get("dv_text","")),
+                    lang="dv")
+                queue_for_social(
+                    io.BytesIO(card.getvalue()), full_caption,
+                    notify_chat_id=CORE_TEAM_CHAT_ID,
+                    notify_thread_id=CONTENT_LAB_THREAD_ID,
+                    key_label=key.upper(),
+                    tg_ok=False,
+                    post_telegram=True,
+                    article_id=item.get("article_id"),
+                    title=item.get("title",""),
+                    summary=item.get("summary",""),
+                    cat=item.get("cat","LOCAL"),
+                    source=item.get("source","Samuga Media"),
+                    link=item.get("link",""),
+                    lang="dv",
+                    is_breaking=item.get("is_breaking", False))
+            else:
+                # English — use existing card bytes
+                is_breaking_card = item.get("is_breaking", False)
+                if is_breaking_card:
+                    _publish_now(
+                        item["card_bytes"], item["caption"], item["cat"],
+                        item["title"], item["link"],
+                        is_breaking_flag=True,
+                        allow_social=True,
+                        article_id=item.get("article_id",""))
+                else:
+                    db_mark_status(item.get("article_id",""), "posted", posted=True)
+                    db_log_learning(
+                        article_id=item.get("article_id"),
+                        action="approved",
+                        member=approver,
+                        category=item.get("cat",""),
+                        source=item.get("source",""),
+                        theme=item.get("_trend_theme",""),
+                        original_caption=item.get("caption",""),
+                        final_caption=item.get("caption",""),
+                        lang="en")
+                    queue_for_social(
+                        io.BytesIO(item["card_bytes"]), item["caption"],
+                        notify_chat_id=CORE_TEAM_CHAT_ID,
+                        notify_thread_id=CONTENT_LAB_THREAD_ID,
+                        key_label=key.upper(),
+                        tg_ok=False,
+                        post_telegram=True,
+                        article_id=item.get("article_id"),
+                        title=item.get("title",""),
+                        summary=item.get("summary",""),
+                        cat=item.get("cat","LOCAL"),
+                        source=item.get("source","Samuga Media"),
+                        link=item.get("link",""),
+                        lang="en",
+                        is_breaking=is_breaking_card)
+        except Exception as e:
+            log.error(f"publish_approved_item error: {e}")
+            send_text(CORE_TEAM_CHAT_ID, f"❌ Error publishing {key}: {e}",
+                      thread_id=CONTENT_LAB_THREAD_ID)
+
     offset = _poll_offset[0]
     bot_mention=f"@{BOT_USERNAME}".lower()
     log.info(f"💬 Chat listening for @{BOT_USERNAME}... (offset={offset})")
@@ -3711,6 +3853,83 @@ def handle_updates():
                 # Save offset every 10 updates — cheap insurance against missing messages on restart
                 if offset % 10 == 0:
                     persist_state()
+                # ── Handle inline button taps (callback_query) ────────────────────
+                cbq = update.get("callback_query")
+                if cbq:
+                    cbq_id   = cbq["id"]
+                    cbq_data = cbq.get("data","")
+                    cbq_user = cbq.get("from",{})
+                    cbq_chat = cbq.get("message",{}).get("chat",{})
+                    cbq_msg_id = cbq.get("message",{}).get("message_id")
+                    cbq_chat_id = cbq_chat.get("id")
+                    cbq_name = cbq_user.get("first_name","Team")
+
+                    if cbq_data.startswith("approve:") or cbq_data.startswith("reject:") or cbq_data.startswith("edit_approve:"):
+                        parts    = cbq_data.split(":", 1)
+                        action   = parts[0]
+                        cb_key   = parts[1].lower() if len(parts) > 1 else ""
+
+                        if action == "approve" and cb_key in approval_queue:
+                            answer_callback_query(cbq_id, "✅ Approving...")
+                            item = approval_queue.pop(cb_key)
+                            persist_state()
+                            # Remove buttons from the card message
+                            edit_message_reply_markup(cbq_chat_id, cbq_msg_id, {"inline_keyboard": []})
+                            # Run the same approve logic as the text command
+                            try:
+                                ok = False
+                                if item["lang"] == "dv":
+                                    import threading as _thr
+                                    def _approve_dv_bg(itm, k, nm):
+                                        try:
+                                            from cards import generate_dhivehi_card, fetch_background_image
+                                            bg = fetch_background_image(None, itm.get("cat","LOCAL"), itm.get("title",""))
+                                            buf = generate_dhivehi_card(itm.get("dv_text",""), itm.get("source",""), itm.get("timestamp",""), itm.get("cat","LOCAL"), bg)
+                                            if buf:
+                                                itm["card_bytes"] = buf.getvalue() if hasattr(buf,"getvalue") else buf.read()
+                                        except Exception as ex:
+                                            log.error(f"DV card bg: {ex}")
+                                        publish_approved_item(itm, k, approver=nm)
+                                    _thr.Thread(target=_approve_dv_bg, args=(item, cb_key, cbq_name), daemon=True).start()
+                                    send_text(cbq_chat_id, f"✅ <b>{cbq_name}</b> approved <b>{cb_key.upper()}</b> (Dhivehi) — generating card...", thread_id=CONTENT_LAB_THREAD_ID)
+                                else:
+                                    publish_approved_item(item, cb_key, approver=cbq_name)
+                                    send_text(cbq_chat_id, f"✅ <b>{cbq_name}</b> approved <b>{cb_key.upper()}</b> — publishing!", thread_id=CONTENT_LAB_THREAD_ID)
+                            except Exception as e:
+                                log.error(f"Button approve error: {e}")
+                                send_text(cbq_chat_id, f"⚠️ Error approving {cb_key}: {e}", thread_id=CONTENT_LAB_THREAD_ID)
+
+                        elif action == "reject" and cb_key in approval_queue:
+                            import random as _rnd
+                            answer_callback_query(cbq_id, "❌ Rejected")
+                            item = approval_queue.pop(cb_key)
+                            persist_state()
+                            edit_message_reply_markup(cbq_chat_id, cbq_msg_id, {"inline_keyboard": []})
+                            quip = _rnd.choice(REJECT_RESPONSES)
+                            send_text(cbq_chat_id,
+                                f"❌ <b>{cbq_name}</b> rejected <b>{cb_key.upper()}</b>\n\n<i>{quip}</i>",
+                                thread_id=CONTENT_LAB_THREAD_ID)
+                            log.info(f"❌ {cb_key} rejected via button by {cbq_name}")
+
+                        elif action == "edit_approve":
+                            # Prompt for corrected text via reply
+                            answer_callback_query(cbq_id, "✏️ Reply with corrected Dhivehi text")
+                            send_text(cbq_chat_id,
+                                f"✏️ <b>{cbq_name}</b>, reply with the corrected Dhivehi text for <b>{cb_key.upper()}</b>:\n"
+                                f"Or just type: <code>/approved {cb_key} [corrected text]</code>",
+                                thread_id=CONTENT_LAB_THREAD_ID)
+
+                        elif cb_key not in approval_queue:
+                            answer_callback_query(cbq_id, "⚠️ Card no longer in queue (already actioned or expired)", show_alert=True)
+                            edit_message_reply_markup(cbq_chat_id, cbq_msg_id, {"inline_keyboard": []})
+
+                    else:
+                        answer_callback_query(cbq_id)
+                    # Always advance offset after callback_query
+                    offset = update["update_id"] + 1
+                    _poll_offset[0] = offset
+                    continue  # Don't process as message
+
                 msg=update.get("message",{})
                 if not msg: continue
                 text=msg.get("text","") or msg.get("caption","")
