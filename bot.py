@@ -882,10 +882,54 @@ def _gemini_post(prompt, timeout=15):
     log.error("[AI] All Gemini models failed")
     return None
 
+def _strip_telegram_metadata(text):
+    """Remove Telegram forwarding/relay artifacts that leak into scraped DV/EN
+    channel text before it reaches public captions (Instagram/Facebook/X).
+
+    Strips:
+      - forward arrows  -->  and leading/trailing  >  relay markers
+      - Telegram relative timestamps: "8 hour 36 minutes ago",
+        including the Dhivehi filler "ވަރަށް" wedged inside them
+      - @channel mentions and t.me / telegram.me links
+      - "Forwarded from ..." / "via @..." attribution lines
+    """
+    if not text:
+        return text
+    s = str(text)
+
+    # t.me / telegram.me links
+    s = re.sub(r"https?://(?:t\.me|telegram\.me)/\S+", "", s, flags=re.I)
+    # Forwarded-from / via attribution lines
+    s = re.sub(r"(?im)^\s*(?:forwarded\s+from|via)\b.*$", "", s)
+    # @channel mentions
+    s = re.sub(r"(?<!\w)@[A-Za-z0-9_]{4,}", "", s)
+    # Telegram relative timestamps, e.g. "8 hour 36 minutes ago",
+    # "about 2 hours ago", with optional Dhivehi filler words in between.
+    s = re.sub(
+        r"(?i)(?:about\s+)?\d+\s*(?:[^\d\n]{0,12}?)"
+        r"(?:second|minute|min|hour|hr|day|week|month|year)s?"
+        r"(?:\s*[^\d\n]{0,12}?\d+\s*(?:second|minute|min|hour|hr|day|week|month|year)s?)?"
+        r"\s*ago\b",
+        "",
+        s,
+    )
+    # Forward arrows and stray relay markers
+    s = s.replace("-->", "").replace("—>", "").replace("→", "")
+    s = re.sub(r"(?m)^\s*>+\s*", "", s)   # leading quote/relay markers
+    s = re.sub(r"\s*-->\s*", " ", s)
+
+    # Tidy whitespace left behind
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    s = re.sub(r"^\s+|\s+$", "", s)
+    return s
+
 def make_dhivehi_caption(english_text, title):
     """Convert English/Latin news text to clean Dhivehi Thaana using Gemini."""
     if not GEMINI_API_KEY:
         return None
+    english_text = _strip_telegram_metadata(english_text)
+    title = _strip_telegram_metadata(title)
     prompt = f"""You are a Maldivian news editor for Samuga Media.
 
 Write a short public news caption in proper Dhivehi Thaana script.
@@ -908,7 +952,7 @@ Summary:
     result = _gemini_post(prompt)
     if result and is_dhivehi(result):
         log.info("✅ Gemini Dhivehi caption done")
-        return strip_source_links(result).strip()
+        return _strip_telegram_metadata(strip_source_links(result).strip())
 
     if result:
         log.warning("Gemini Dhivehi caption returned non-Thaana text — rejected")
@@ -1424,6 +1468,7 @@ def _post_to_social_now(img_buf, caption):
 
         # Public Samuga posts must never expose original source links.
         # Send viewers to Samuga Community only.
+        clean = _strip_telegram_metadata(clean)
         clean = strip_source_links(clean)
         if not public_text_is_safe(clean):
             log.error(f"🚫 Social post blocked unsafe caption: {clean[:120]}")
@@ -1489,6 +1534,7 @@ def post_to_social(img_buf, caption):
 
         # Public Samuga posts must never expose original source links.
         # Send viewers to Samuga Community only.
+        clean = _strip_telegram_metadata(clean)
         clean = strip_source_links(clean)
         if not public_text_is_safe(clean):
             log.error(f"🚫 Social post blocked unsafe caption: {clean[:120]}")
@@ -1542,7 +1588,7 @@ def _build_card_and_caption(article):
         display_cat = "BREAKING"
     else:
         display_cat = canonical_category(raw_cat, article["title"], article.get("summary",""))
-    rewritten, keyword = rewrite_news(article["title"], article["summary"], raw_cat)
+    rewritten, keyword = rewrite_news(_strip_telegram_metadata(article["title"]), _strip_telegram_metadata(article["summary"]), raw_cat)
     if not public_text_is_safe(rewritten):
         log.warning(f"🚫 Card rewrite unsafe; using fallback for: {article['title'][:80]}")
         rewritten = fallback_rewritten_news(article.get("title",""), article.get("summary",""))
@@ -1933,7 +1979,7 @@ def post_article(article, seen, social_only=False, allow_social=True):
     # ── Dhivehi cards: generate Dhivehi text, queue for approval (card built on approval) ──
     if is_dv:
         try:
-            rewritten, keyword = rewrite_news(article["title"], article["summary"], cat)
+            rewritten, keyword = rewrite_news(_strip_telegram_metadata(article["title"]), _strip_telegram_metadata(article["summary"]), cat)
             dv_text = make_dhivehi_caption(rewritten, article["title"])
             if not dv_text:
                 log.warning(f"Dhivehi caption failed for: {article['title'][:50]}")
