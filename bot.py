@@ -1,5179 +1,7287 @@
 """
-Samuga Travels Bot v1.2
-Multi-tenant speedboat booking platform for the Maldives.
-Single-file | asyncpg | Railway + PostgreSQL | Cloudinary
+═══════════════════════════════════════════════════════════════════════════════
+  SAMUGA AI  —  Maldivian AI-Powered Newsroom Bot
+  Version: 7.0  |  github.com/samuga-news-bot  |  Railway + PostgreSQL
+═══════════════════════════════════════════════════════════════════════════════
+
+  WHAT THIS FILE CONTAINS (search these tags to jump to a section):
+
+    [CONFIG]      Environment vars, feeds, constants          (top of file)
+    [DATABASE]    PostgreSQL: articles, stories, memory, kv
+    [MODELS]      Article dataclass + helpers
+    [FETCHERS]    RSS, Google News, MvCrisis scraping
+    [SCORING]     Article scoring, dedup, clustering, reliability
+    [STORIES]     Story Intelligence — timeline threads
+    [AI]          Claude rewrite, Gemini Dhivehi, core-team brain
+    [CARDS]       Pillow card generation (news + weather)
+    [WEATHER]     Tomorrow.io, prayer times, Hijri, MMS alerts
+    [PUBLISHING]  Telegram, Buffer, Meta Graph API
+    [COMMANDS]    All /command handlers
+    [SCHEDULER]   Cron jobs (news loop, weather, briefs)
+
+  DEPLOYMENT:  push bot.py to GitHub → Railway auto-deploys
+  COST:        ~$25/month (Claude Haiku + Railway + Buffer)
+═══════════════════════════════════════════════════════════════════════════════
 """
 
-import os, io, logging, asyncio, json, random, string, signal
-import cloudinary, cloudinary.uploader, requests
-import asyncpg
-from datetime import datetime
-from decimal import Decimal
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+import os, io, threading, time, logging, hashlib, json, feedparser, requests, anthropic, re
+from dataclasses import dataclass
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance
+from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
+from apscheduler.schedulers.blocking import BlockingScheduler
+from io import BytesIO
+from cards import generate_card, generate_dhivehi_card, fetch_background_image, draw_weather_icon
+from weather import (
+    get_weather_data, get_island_forecasts, get_prayer_times,
+    generate_weather_card, weather_code_to_info,
+    detect_weather_alert, send_weather_alert, send_weather_update,
+    MMS_ALERT_LEVELS, weather_alerts_today, ISLAND_LOCATIONS,
+    HIJRI_SPECIAL_DAYS, SPECIAL_DAY_DETAILS, ISLAMIC_REMINDERS
+)
+from fetchers import (
+    fetch_news, fetch_mvcrisis, fetch_all_dv_channels, fetch_dv_telegram,
+    fetch_latest_web_pages, fetch_local_rss_recovery, fetch_world_updates,
+    get_local_headlines, rewrite_news, gemini_translate,
+    RSS_FEEDS, LOCAL_FEEDS, DV_TELEGRAM_CHANNELS, DEFAULT_KEYWORDS, WEB_LATEST_SOURCES,
+    has_public_placeholder, public_text_is_safe, fallback_rewritten_news,
+    clean_ai_line, safe_image_keyword,
+    get_source_health_snapshot, load_source_health, source_health_score, source_health_summary
+)
+from scoring import (
+    is_breaking, is_dhivehi, source_reliability,
+    score_article, score_breakdown, confidence_score,
+    should_hold_for_review, format_score_breakdown,
+    is_duplicate_story, remember_story_title, register_in_cluster,
+    recent_posts, user_conversations, recent_story_titles,
+    BREAKING_KEYWORDS, BREAKING_BLACKLIST, SOURCE_RELIABILITY
+)
+from db import (
+    init_database, db_execute, db_record_article, db_mark_status,
+    db_publish_article_for_website, db_log_learning,
+    db_set_article_message, db_set_article_matchkey,
+    db_hide_article, db_unhide_article, db_delete_article_by_url, db_hide_all_dhivehi, db_unhide_all_dhivehi, db_bot_stats,
+    db_list_website_articles, db_search_website_articles, db_website_analytics,
+    db_get_featured_articles, db_feature_article, db_unfeature_article, db_get_article_by_identifier,
+    kv_get, kv_set, mem_add, mem_list, mem_clear_all, mem_delete_last,
+    detect_trends, is_trending_topic, find_or_create_story,
+    get_story_timeline, search_stories, get_active_stories,
+    canonical_category, strip_source_links, samuga_public_summary,
+    normalize_article_language_for_public, _caption_match_key,
+    make_article_slug, generate_website_article_body,
+    TREND_THEMES, DB_ENABLED, is_dhivehi, looks_latin_thaana,
+    gemini_latin_thaana_to_thaana, gemini_latin_thaana_to_english,
+    _detect_themes
+)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-BOT_TOKEN        = os.environ.get("BOT_TOKEN", "")
-if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN env var not set!")
-DATABASE_URL     = os.environ.get("DATABASE_URL", "")
-ADMIN_GROUP_ID   = int(os.environ.get("ADMIN_GROUP_ID",  "-1004397030483"))
-ADMIN_THREAD_ID  = int(os.environ.get("ADMIN_THREAD_ID", "2"))
-GENERAL_THREAD_ID= int(os.environ.get("GENERAL_THREAD_ID","1"))
-# Your personal Telegram ID — gets full admin access
-SUPER_ADMINS    = [int(x) for x in os.environ.get("SUPER_ADMINS", "").split(",") if x.strip().isdigit()]
-
-CLOUDINARY_CLOUD = os.environ.get("CLOUDINARY_CLOUD", "dfhj3clbh")
-CLOUDINARY_KEY   = os.environ.get("CLOUDINARY_KEY",   "")
-CLOUDINARY_SECRET= os.environ.get("CLOUDINARY_SECRET","")
-
-# Configure Cloudinary immediately so uploads don't silently fail
-if CLOUDINARY_KEY and CLOUDINARY_SECRET:
-    cloudinary.config(
-        cloud_name=CLOUDINARY_CLOUD,
-        api_key=CLOUDINARY_KEY,
-        api_secret=CLOUDINARY_SECRET,
-        secure=True
+# Story builder -- full article generation from headlines
+try:
+    from story_builder import (
+        build_full_article, parse_rate_update, format_rate_card,
+        make_website_caption, make_dv_website_caption
     )
-else:
-    import warnings
-    warnings.warn("⚠️ CLOUDINARY_KEY / CLOUDINARY_SECRET not set — image uploads will fail!")
+    _STORY_BUILDER_AVAILABLE = True
+except ImportError:
+    _STORY_BUILDER_AVAILABLE = False
 
-# SamugaAI — Gemini free tier for customer/operator chat
-GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
+# ── Structured logging: tags make Railway logs readable ──────────────────────
+# Usage: log.info("[FETCH] pulled 12 articles")  →  easy to filter in Railway
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
+log = logging.getLogger(__name__)
 
-# ── STATES ────────────────────────────────────────────────────────────────────
-OP_IDLE="op_idle"; OP_AWAIT_BUSINESS_NAME="op_await_business_name"
-OP_AWAIT_LOGO="op_await_logo"; OP_AWAIT_BOAT_NAME="op_await_boat_name"
-OP_AWAIT_SEATS="op_await_seats"; OP_AWAIT_TYPE="op_await_type"
-OP_AWAIT_ROUTES="op_await_routes"; OP_AWAIT_OWNER_NAME="op_await_owner_name"
-OP_AWAIT_OWNER_CONTACT="op_await_owner_contact"; OP_AWAIT_OWNER_ID_PHOTO="op_await_owner_id_photo"
-OP_AWAIT_BML_ACCOUNT="op_await_bml_account"; OP_AWAIT_MIB_ACCOUNT="op_await_mib_account"; OP_REGISTERED="op_registered"
-OP_AWAIT_SCHEDULE_ROUTE="op_await_schedule_route"; OP_AWAIT_SCHEDULE_TIME="op_await_schedule_time"
-OP_AWAIT_SCHEDULE_PRICE="op_await_schedule_price"; OP_AWAIT_SCHEDULE_SEATS="op_await_schedule_seats"
-CX_IDLE="cx_idle"; CX_AWAIT_DATE="cx_await_date"
-CX_AWAIT_CONTACT="cx_await_contact"
-CX_AWAIT_PASSENGER_COUNT="cx_await_passenger_count"
-CX_COLLECTING_PASSENGERS="cx_collecting_passengers"; CX_AWAIT_PAYMENT_SLIP="cx_await_payment_slip"
-CX_BOOKING_COMPLETE="cx_booking_complete"
-# Fleet/boat states
-OP_AWAIT_BOAT_ADD_NAME="op_await_boat_add_name"
-OP_AWAIT_BOAT_ADD_CAPACITY="op_await_boat_add_capacity"
-# Schedule extra states
-OP_AWAIT_SCHEDULE_LOCATION="op_await_schedule_location"
-OP_AWAIT_SCHEDULE_DAYS="op_await_schedule_days"
-OP_AWAIT_CHANGE_NOTE="op_await_change_note"
-# Bulk schedule setup
-OP_BULK_LOCATION="op_bulk_location"
-OP_BULK_PRICE="op_bulk_price"
-OP_BULK_SEATS="op_bulk_seats"
-OP_BULK_SATHU_DEPS="op_bulk_sathu_deps"
-OP_BULK_FRI_DEPS="op_bulk_fri_deps"
-# Admin states
-ADMIN_AWAIT_BROADCAST="admin_await_broadcast"
-# Refund states
-CX_AWAIT_REFUND_ACCOUNT="cx_await_refund_account"
-OP_AWAIT_REFUND_SLIP="op_await_refund_slip"
-# AI chat state
-CX_AI_CHAT="cx_ai_chat"
-OP_AI_CHAT="op_ai_chat"
-# Rate limit: max 10 AI questions per user per day (Gemini free tier)
-_ai_usage: dict = {}  # {user_id: {"count": int, "date": str}}
-ADMIN_AWAIT_LOGO="admin_await_logo"
-ADMIN_AWAIT_REVIEW_TEXT="admin_await_review_text"
-# Subscription states
-OP_AWAIT_SUB_SLIP="op_await_sub_slip"
+SAMUGA_VERSION = "7.0"
 
-# ── SMART INPUT HELPERS ──────────────────────────────────────────────────────
-def normalize_input(text: str) -> str:
-    """Clean up common input variations"""
-    return text.strip()
+# Module-level timezone alias (used by utcnow() below and elsewhere).
+from datetime import timezone as _tz
 
-def parse_name_id(text: str) -> tuple[str, str] | None:
-    """
-    Flexibly parse 'Name, ID' from user input.
-    Accepts: comma, dash, slash, pipe, space+ID as separators.
-    Also handles: 'Ahmed Ali A123456' (space before ID starting with A/A0-9)
-    """
-    import re
-    text = text.strip()
-    # Try comma first (preferred)
-    if "," in text:
-        parts = text.split(",", 1)
-        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
-            return parts[0].strip(), parts[1].strip()
-    # Try other separators: | / - (with spaces)
-    for sep in [" | ", " / ", " - ", "|", "/"]:
-        if sep in text:
-            parts = text.split(sep, 1)
-            if len(parts) == 2 and parts[0].strip() and parts[1].strip():
-                return parts[0].strip(), parts[1].strip()
-    # Try: name followed by ID card pattern (A + digits or passport)
-    match = re.search(r'^(.+?)\s+([A-Za-z]\d{5,}|[A-Z]{2}\d{6,})$', text)
-    if match:
-        return match.group(1).strip(), match.group(2).strip()
-    return None
+# Public destination shown to readers. We never expose competitor/source links on
+# Samuga public platforms; readers are directed back to Samuga Community.
+SAMUGA_PUBLIC_SOURCE = os.environ.get("SAMUGA_PUBLIC_SOURCE", "Samuga Media")
+SAMUGA_PUBLIC_LINK   = os.environ.get("SAMUGA_PUBLIC_LINK", "https://t.me/samugacommunity")
+SAMUGA_CAPTION_LINK  = os.environ.get("SAMUGA_CAPTION_LINK", "https://samugamedia.com")
 
-def is_cancel(text: str) -> bool:
-    """Check if user wants to cancel"""
-    return text.strip().lower() in ["cancel", "stop", "quit", "exit", "/cancel", "back", "nope", "no"]
 
-def is_skip(text: str) -> bool:
-    """Check if user wants to skip optional step"""
-    return text.strip().lower() in ["skip", "no", "nope", "none", "-", "n/a", "na", "next"]
-
-def parse_number(text: str) -> int | None:
-    """Extract number from text like '2 seats', '2pax', '2 people'"""
-    import re
-    text = text.strip()
-    match = re.search(r'\d+', text)
-    if match:
-        return int(match.group())
-    return None
-
-def parse_price(text: str) -> float | None:
-    """Parse price from '250', '250MVR', 'MVR250', '250 mvr', '250.00'"""
-    import re
-    text = text.strip().upper().replace(",", "")
-    text = text.replace("MVR", "").replace("RF", "").replace("MRF", "").strip()
+def samuga_public_caption(caption):
+    """Sanitize a caption for public posting and append Samuga website."""
+    if not caption:
+        return caption
     try:
-        return float(text)
-    except ValueError:
-        match = re.search(r'[\d.]+', text)
-        if match:
-            try:
-                return float(match.group())
-            except ValueError:
-                pass
-    return None
-
-def parse_time_24hr(text: str) -> str | None:
-    """
-    Parse and normalise departure time to 24hr HH:MM format.
-    Accepts: 16:00, 04:00PM, 4:00pm, 16.00, 4pm, 16h00
-    Rejects AM/PM and converts to 24hr.
-    Returns None if unparseable.
-    """
-    import re as _re
-    text = text.strip().upper().replace("H", ":").replace(".", ":")
-    # Try HH:MM AM/PM
-    m = _re.match(r"(\d{1,2}):(\d{2})\s*(AM|PM)?$", text)
-    if m:
-        h, mn, period = int(m.group(1)), int(m.group(2)), m.group(3)
-        if period == "PM" and h != 12: h += 12
-        if period == "AM" and h == 12: h = 0
-        if 0 <= h <= 23 and 0 <= mn <= 59:
-            return f"{h:02d}:{mn:02d}"
-    # Try HH AM/PM (no minutes)
-    m2 = _re.match(r"(\d{1,2})\s*(AM|PM)$", text)
-    if m2:
-        h, period = int(m2.group(1)), m2.group(2)
-        if period == "PM" and h != 12: h += 12
-        if period == "AM" and h == 12: h = 0
-        if 0 <= h <= 23:
-            return f"{h:02d}:00"
-    return None
-
-def parse_date_flexible(text: str):
-    """Parse date from many formats"""
-    from datetime import datetime as _dt
-    text = text.strip()
-    formats = [
-        "%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y",
-        "%Y-%m-%d",
-        "%d-%m-%y", "%d/%m/%y",
-    ]
-    for fmt in formats:
-        try:
-            return _dt.strptime(text, fmt).date()
-        except ValueError:
-            continue
-    return None
-
-def parse_bulk_departures(text: str):
-    """
-    Parse multiple departure lines like:
-      10:15 Male to Airport to Thoddoo
-      06:45 Thoddoo to Airport to Male
-    Returns list of {
-      "time": "10:15",
-      "from": "Male",
-      "to": "Thoddoo",
-      "stops": ["Male", "Airport", "Thoddoo"],
-      "full_route": "Male → Airport → Thoddoo"
-    }
-    or None if nothing parseable found.
-    """
-    import re
-    results = []
-    lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
-    time_pat = re.compile(r"^(\d{1,2}[:.]\d{2}\s*(?:AM|PM)?)", re.IGNORECASE)
-    to_pat   = re.compile(r"\bto\b", re.IGNORECASE)
-
-    for line in lines:
-        line = re.sub(r"^\d+[.)\-\s]+", "", line).strip()
-        m = time_pat.match(line)
-        if not m:
-            continue
-        raw_time = m.group(1).strip()
-        time_str = parse_time_24hr(raw_time) or raw_time.upper().replace(".", ":")
-        rest = line[m.end():].strip()
-        parts = [p.strip().title() for p in to_pat.split(rest) if p.strip()]
-        if len(parts) >= 2:
-            results.append({
-                "time": time_str,
-                "from": parts[0],
-                "to":   parts[-1],
-                "stops": parts,
-                "full_route": " → ".join(parts)
-            })
-    return results if results else None
-
-# ── DB POOL ───────────────────────────────────────────────────────────────────
-_pool = None
-
-async def get_pool():
-    global _pool
-    if _pool is None:
-        if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL is not set! Add it in Railway Variables.")
-        db_url = DATABASE_URL.replace("postgres://", "postgresql://")
-        for attempt in range(5):
-            try:
-                _pool = await asyncpg.create_pool(db_url, min_size=1, max_size=10)
-                logger.info("✅ Database pool created")
-                break
-            except Exception as e:
-                logger.error(f"DB pool attempt {attempt+1} failed: {e}")
-                if attempt < 4:
-                    await asyncio.sleep(3)
-                else:
-                    raise
-    return _pool
-
-async def init_db():
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS operators (
-                id SERIAL PRIMARY KEY,
-                telegram_id BIGINT UNIQUE NOT NULL,
-                telegram_username TEXT,
-                business_name TEXT,
-                boat_name TEXT,
-                logo_url TEXT,
-                seat_count INTEGER DEFAULT 0,
-                boat_type TEXT DEFAULT 'ferry',
-                routes TEXT[],
-                owner_name TEXT,
-                owner_contact TEXT,
-                owner_id_photo_url TEXT,
-                bml_account TEXT,
-                payment_accounts TEXT DEFAULT '[]',
-                status TEXT DEFAULT 'pending',
-                is_recommended BOOLEAN DEFAULT FALSE,
-                review_text TEXT,
-                average_rating DECIMAL(3,2) DEFAULT 0,
-                total_reviews INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS schedules (
-                id SERIAL PRIMARY KEY,
-                operator_id INTEGER REFERENCES operators(id) ON DELETE CASCADE,
-                route_from TEXT NOT NULL,
-                route_to TEXT NOT NULL,
-                departure_time TEXT NOT NULL,
-                price_per_seat DECIMAL(10,2) NOT NULL,
-                total_seats INTEGER NOT NULL,
-                available_seats INTEGER NOT NULL,
-                is_active BOOLEAN DEFAULT TRUE,
-                sched_stops TEXT DEFAULT '[]',
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS bookings (
-                id SERIAL PRIMARY KEY,
-                booking_ref TEXT UNIQUE NOT NULL,
-                customer_telegram_id BIGINT NOT NULL,
-                customer_name TEXT,
-                operator_id INTEGER REFERENCES operators(id),
-                schedule_id INTEGER REFERENCES schedules(id),
-                travel_date DATE NOT NULL,
-                passenger_count INTEGER NOT NULL,
-                passengers TEXT DEFAULT '[]',
-                total_amount DECIMAL(10,2) NOT NULL,
-                status TEXT DEFAULT 'pending_payment',
-                payment_slip_url TEXT,
-                ticket_url TEXT,
-                created_at TIMESTAMP DEFAULT NOW(),
-                confirmed_at TIMESTAMP
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_states (
-                telegram_id BIGINT PRIMARY KEY,
-                role TEXT DEFAULT 'customer',
-                state TEXT DEFAULT 'cx_idle',
-                temp_data TEXT DEFAULT '{}',
-                updated_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS reviews (
-                id SERIAL PRIMARY KEY,
-                operator_id INTEGER REFERENCES operators(id),
-                customer_telegram_id BIGINT NOT NULL,
-                booking_id INTEGER REFERENCES bookings(id),
-                rating INTEGER CHECK (rating >= 1 AND rating <= 5),
-                comment TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        # Fleet: multiple boats per operator
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS boats (
-                id SERIAL PRIMARY KEY,
-                operator_id INTEGER REFERENCES operators(id) ON DELETE CASCADE,
-                boat_name TEXT NOT NULL,
-                capacity INTEGER DEFAULT 0,
-                status TEXT DEFAULT 'active',
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        # Daily schedule overrides (boat swap, time change, cancellation)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS schedule_changes (
-                id SERIAL PRIMARY KEY,
-                schedule_id INTEGER REFERENCES schedules(id) ON DELETE CASCADE,
-                change_date DATE NOT NULL,
-                new_boat_name TEXT,
-                new_time TEXT,
-                note TEXT,
-                status TEXT DEFAULT 'active',
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        # Prevent duplicate daily overrides for the same schedule/date.
-        # Clean old duplicates first so index creation will not fail on existing databases.
-        await conn.execute("""
-            DELETE FROM schedule_changes a
-            USING schedule_changes b
-            WHERE a.schedule_id=b.schedule_id
-              AND a.change_date=b.change_date
-              AND a.id > b.id
-        """)
-        await conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS unique_schedule_change_per_day
-            ON schedule_changes(schedule_id, change_date)
-        """)
-        # Add columns to schedules if missing
-        await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS location TEXT DEFAULT 'Jetty No. 1, Male'")
-        await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS run_days TEXT DEFAULT 'daily'")
-        await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS boat_name TEXT")
-        # Add columns to bookings if missing
-        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN DEFAULT FALSE")
-        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS boarded_at TIMESTAMP")
-        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS boarded_by BIGINT")
-        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP")
-        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancelled_by TEXT")
-        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancellation_reason TEXT")
-        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS refund_account TEXT")
-        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS refund_account_name TEXT")
-        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS refund_slip_url TEXT")
-        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS refund_status TEXT DEFAULT 'none'")
-        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS refund_at TIMESTAMP")
-        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_alert_stage INTEGER DEFAULT 0")
-        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_alert_last_at TIMESTAMP")
-        # AI usage tracking table (persistent — survives Railway restarts)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS ai_usage (
-                telegram_id BIGINT,
-                usage_date  DATE,
-                count       INTEGER DEFAULT 0,
-                PRIMARY KEY (telegram_id, usage_date)
-            )
-        """)
-        # Settings table for admin-configurable values
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT,
-                updated_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        # Insert defaults
-        await conn.execute("""
-            INSERT INTO settings (key, value) VALUES ('samuga_logo_url', '')
-            ON CONFLICT (key) DO NOTHING
-        """)
-        await conn.execute("""
-            INSERT INTO settings (key, value) VALUES ('subscription_fee', '500')
-            ON CONFLICT (key) DO NOTHING
-        """)
-        await conn.execute("""
-            INSERT INTO settings (key, value) VALUES ('subscription_accounts', '[]')
-            ON CONFLICT (key) DO NOTHING
-        """)
-        await conn.execute("""
-            INSERT INTO settings (key, value) VALUES ('commission_rate', '0')
-            ON CONFLICT (key) DO NOTHING
-        """)
-        # Subscriptions table
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS subscriptions (
-                id SERIAL PRIMARY KEY,
-                operator_id INTEGER REFERENCES operators(id) ON DELETE CASCADE,
-                plan TEXT DEFAULT 'trial',
-                trial_started_at TIMESTAMP DEFAULT NOW(),
-                trial_ends_at TIMESTAMP,
-                paid_until TIMESTAMP,
-                status TEXT DEFAULT 'trial',
-                payment_slip_url TEXT,
-                payment_amount DECIMAL(10,2),
-                created_at TIMESTAMP DEFAULT NOW(),
-                updated_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        # Add trial columns to operators if missing
-        await conn.execute("ALTER TABLE operators ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMP DEFAULT NOW()")
-        await conn.execute("ALTER TABLE operators ADD COLUMN IF NOT EXISTS subscription_status TEXT DEFAULT 'trial'")
-    logger.info("✅ Database initialized")
-
-# ── DB HELPERS ────────────────────────────────────────────────────────────────
-async def get_user_state(telegram_id: int) -> dict:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM user_states WHERE telegram_id = $1", telegram_id)
-    if row:
-        d = dict(row)
-        d["temp_data"] = json.loads(d.get("temp_data") or "{}")
-        return d
-    return {"telegram_id": telegram_id, "role": "customer", "state": CX_IDLE, "temp_data": {}}
-
-async def set_user_state(telegram_id: int, state: str, temp_data: dict = None, role: str = None):
-    pool = await get_pool()
-    td = json.dumps(temp_data or {})
-    async with pool.acquire() as conn:
-        if role:
-            await conn.execute("""
-                INSERT INTO user_states (telegram_id, state, temp_data, role)
-                VALUES ($1,$2,$3,$4)
-                ON CONFLICT (telegram_id) DO UPDATE
-                SET state=$2, temp_data=$3, role=$4, updated_at=NOW()
-            """, telegram_id, state, td, role)
-        else:
-            await conn.execute("""
-                INSERT INTO user_states (telegram_id, state, temp_data)
-                VALUES ($1,$2,$3)
-                ON CONFLICT (telegram_id) DO UPDATE
-                SET state=$2, temp_data=$3, updated_at=NOW()
-            """, telegram_id, state, td)
-
-async def update_temp_key(telegram_id: int, key: str, value):
-    sd = await get_user_state(telegram_id)
-    temp = sd.get("temp_data", {}) or {}
-    temp[key] = value
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE user_states SET temp_data=$1, updated_at=NOW() WHERE telegram_id=$2",
-            json.dumps(temp), telegram_id)
-
-async def get_setting(key: str, default: str = "") -> str:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT value FROM settings WHERE key=$1", key)
-    return row["value"] if row and row["value"] else default
-
-async def set_setting(key: str, value: str):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO settings (key, value, updated_at) VALUES ($1,$2,NOW())
-            ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()
-        """, key, value)
-
-async def safe_edit(query, text: str, parse_mode: str = "Markdown", reply_markup=None):
-    """Edit either a caption message or a text message; fallback to reply if editing fails."""
-    try:
-        await query.edit_message_caption(caption=text, parse_mode=parse_mode, reply_markup=reply_markup)
-        return
+        clean = strip_source_links(caption).strip()
+        site = (SAMUGA_CAPTION_LINK or "").strip()
+        if site and site not in clean:
+            clean = (clean + "\n\n" + site).strip()
+        return clean
     except Exception:
-        pass
+        return caption
+
+
+def utcnow():
+    """Naive UTC datetime — same value as the old utcnow() but not deprecated."""
+    return datetime.now(_tz.utc).replace(tzinfo=None)
+
+def mvt_now():
+    """Current Maldives time (UTC+5) as naive datetime."""
+    return utcnow() + timedelta(hours=5)
+
+def mvt_display_time(dt):
+    """Display DB UTC timestamps as Maldives time for website/API output."""
+    if not dt:
+        return "Recent"
     try:
-        await query.edit_message_text(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
-        return
+        # psycopg2 TIMESTAMPTZ may be timezone-aware; normalize by adding offset only for naive UTC.
+        if getattr(dt, "tzinfo", None) is not None:
+            return dt.astimezone(_tz.utc).replace(tzinfo=None).__add__(timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+        return (dt + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
     except Exception:
-        pass
-    try:
-        await query.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
-    except Exception as e:
-        logger.error(f"safe_edit failed: {e}")
+        return "Recent"
 
-async def get_subscription(operator_id: int) -> dict | None:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM subscriptions WHERE operator_id=$1 ORDER BY created_at DESC LIMIT 1",
-            operator_id)
-    return dict(row) if row else None
+def posting_paused():
+    """Live Railway env kill switch: POSTING_PAUSED=true blocks all public posting."""
+    return os.environ.get("POSTING_PAUSED", "false").lower() == "true"
 
-async def create_trial(operator_id: int):
-    """Create a 2-month free trial when operator is first approved."""
-    from datetime import timedelta
-    trial_end = datetime.now() + timedelta(days=60)
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO subscriptions (operator_id, plan, trial_ends_at, status)
-            VALUES ($1, 'trial', $2, 'trial')
-            ON CONFLICT DO NOTHING
-        """, operator_id, trial_end)
-        await conn.execute("""
-            UPDATE operators SET subscription_status='trial', trial_started_at=NOW()
-            WHERE id=$1
-        """, operator_id)
+def social_paused():
+    """Live Railway env kill switch: SOCIAL_PAUSED=true blocks Buffer/social posting."""
+    return os.environ.get("SOCIAL_PAUSED", "false").lower() == "true" or posting_paused()
 
-async def get_sub_status(operator_id: int) -> dict:
-    """
-    Returns subscription status dict:
-    {
-      "status": "trial" | "active" | "expired" | "grace",
-      "days_left": int,
-      "trial": bool,
-      "message": str
-    }
-    """
-    from datetime import timedelta
-    sub = await get_subscription(operator_id)
-    now = datetime.now()
+def _posting_block_reason():
+    if posting_paused():
+        return "POSTING_PAUSED=true"
+    if social_paused():
+        return "SOCIAL_PAUSED=true"
+    return ""
 
-    if not sub:
-        return {"status": "trial", "days_left": 60, "trial": True,
-                "message": "Free trial active"}
+# ═══════════════════════════════════════════════════════════════════════════
+# [CONFIG] — Environment variables & API keys
+# ═══════════════════════════════════════════════════════════════════════════
+TELEGRAM_BOT_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "@samugacommunity")
+ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
+PEXELS_API_KEY      = os.environ.get("PEXELS_API_KEY", "")
+GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
+TAVILY_API_KEY      = os.environ.get("TAVILY_API_KEY", "")
+BOT_USERNAME        = os.environ.get("BOT_USERNAME", "SamugaNewsBot")
+IMGBB_API_KEY       = os.environ.get("IMGBB_API_KEY", "")
+BUFFER_TOKEN        = os.environ.get("BUFFER_ACCESS_TOKEN", "")
+BUFFER_FB_ID        = os.environ.get("BUFFER_FACEBOOK_ID", "")
+BUFFER_IG_ID        = os.environ.get("BUFFER_INSTAGRAM_ID", "")
+BUFFER_TW_ID        = os.environ.get("BUFFER_TWITTER_ID", "")
+_last_buffer_error  = {"response": "No posts attempted yet"}
+# Meta Graph API — reads FB + IG engagement off your own page
+META_PAGE_TOKEN     = os.environ.get("META_PAGE_TOKEN", "")
+META_PAGE_ID        = os.environ.get("META_PAGE_ID", "")
+META_APP_SECRET     = os.environ.get("META_APP_SECRET", "")
+META_IG_ID          = os.environ.get("META_IG_ID", "")  # optional; auto-resolved if blank
+META_API_VER        = os.environ.get("META_API_VER", "v21.0")
+TOMORROW_API_KEY    = os.environ.get("TOMORROW_API_KEY", "")  # weather data
 
-    if sub["status"] == "trial":
-        trial_end = sub["trial_ends_at"]
-        if trial_end and now < trial_end:
-            days_left = (trial_end - now).days
-            return {"status": "trial", "days_left": days_left, "trial": True,
-                    "message": f"Free trial — {days_left} days remaining"}
-        else:
-            return {"status": "expired", "days_left": 0, "trial": False,
-                    "message": "Free trial ended — please subscribe to continue"}
+# ── Killer posting switches ──────────────────────────────────────────────────
+# POSTING_PAUSED=true blocks all public Telegram + Buffer/social posting.
+# SOCIAL_PAUSED=true blocks Buffer/social only.
+# These are read live from Railway env vars on every post attempt.
+POSTING_PAUSED = os.environ.get("POSTING_PAUSED", "false").lower() == "true"
+SOCIAL_PAUSED  = os.environ.get("SOCIAL_PAUSED",  "false").lower() == "true"
 
-    if sub["status"] == "active":
-        paid_until = sub["paid_until"]
-        if paid_until and now < paid_until:
-            days_left = (paid_until - now).days
-            if days_left <= 7:
-                return {"status": "grace", "days_left": days_left, "trial": False,
-                        "message": f"⚠️ Subscription expires in {days_left} days!"}
-            return {"status": "active", "days_left": days_left, "trial": False,
-                    "message": f"Subscription active — {days_left} days remaining"}
-        else:
-            return {"status": "expired", "days_left": 0, "trial": False,
-                    "message": "Subscription expired — renew to stay listed"}
+ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    return {"status": "expired", "days_left": 0, "trial": False,
-            "message": "Subscription required"}
+# ═══════════════════════════════════════════════════════════════════════════
+# [MODELS] — Article shape (documentation + optional helper)
+# ═══════════════════════════════════════════════════════════════════════════
+# Articles flow through the pipeline as plain dicts for flexibility. This
+# dataclass documents the canonical shape so future-you (and any new dev) can
+# see at a glance what fields an article carries. Use Article.from_dict() if you
+# ever want type safety, but the dict form remains the working currency.
+@dataclass
+class Article:
+    id: str                       # unique hash of the article
+    title: str                    # headline
+    summary: str = ""             # body/excerpt
+    link: str = ""                # source URL
+    source: str = ""              # outlet name (Mihaaru, Sun, etc)
+    cat: str = "LOCAL"            # BREAKING | LOCAL | POLITICAL | SPORTS | LIFESTYLE | WORLD
+    lang: str = "en"              # en | dv
+    # ── runtime fields added during processing ──
+    score: int = 0                # newsroom priority score
+    reliability: int = 0          # source trust score
+    is_breaking: bool = False
+    cluster_size: int = 1         # how many sources reporting this (_cluster_size)
+    story_id: int = None          # attached Story Intelligence thread (_story_id)
 
-async def operator_is_active(operator_id: int) -> bool:
-    """Check if operator can receive bookings (trial or paid)."""
-    status = await get_sub_status(operator_id)
-    return status["status"] in ["trial", "active", "grace"]
-
-# ── SAMUGA AI ─────────────────────────────────────────────────────────────────
-async def _ai_check_limit(user_id: int) -> tuple[bool, int]:
-    """Returns (allowed, remaining). 10 messages/day — stored in DB, survives restarts."""
-    from datetime import date
-    today = date.today()
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT count FROM ai_usage WHERE telegram_id=$1 AND usage_date=$2",
-            user_id, today)
-    count = row["count"] if row else 0
-    remaining = 10 - count
-    return remaining > 0, max(0, remaining)
-
-async def _ai_increment(user_id: int):
-    from datetime import date
-    today = date.today()
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO ai_usage (telegram_id, usage_date, count)
-            VALUES ($1, $2, 1)
-            ON CONFLICT (telegram_id, usage_date)
-            DO UPDATE SET count = ai_usage.count + 1
-        """, user_id, today)
-
-async def ask_samuga_ai(question: str, role: str, context: dict = None) -> str:
-    """
-    Ask Gemini a question with Samuga Travels context.
-    role: "customer" or "operator"
-    context: optional dict with operator name, route info etc.
-    """
-    if not GEMINI_API_KEY:
-        return (
-            "🤖 SamugaAI is not configured yet.\n\n"
-            "Contact @SamugaTravels for help! 🙏"
+    @classmethod
+    def from_dict(cls, d: dict) -> "Article":
+        return cls(
+            id=d.get("id",""), title=d.get("title",""), summary=d.get("summary",""),
+            link=d.get("link",""), source=d.get("source",""), cat=d.get("cat","LOCAL"),
+            lang=d.get("lang","en"), score=d.get("score",0),
+            reliability=d.get("reliability",0), is_breaking=d.get("is_breaking",False),
+            cluster_size=d.get("_cluster_size",1), story_id=d.get("_story_id"),
         )
 
-    if role == "operator":
-        system_prompt = """You are SamugaAI, the helpful assistant for Samuga Travels operators in the Maldives.
-You help speedboat and ferry operators with:
-- How to add and manage schedules
-- How to confirm bookings and send tickets
-- How to manage their fleet
-- Subscription and billing questions
-- How to use bot commands
-- General Maldives maritime travel questions
+# ═══════════════════════════════════════════════════════════════════════════
+# [FETCHERS] — RSS Feeds
+# ═══════════════════════════════════════════════════════════════════════════
+# ── RSS Feeds (v4 Strategy) ───────────────────────────────────────────────────
+# LOCAL (70%) — Maldivian sources, priority order
+core_team_session_context = {}  # user_id -> stored context
 
-Key facts about Samuga Travels:
-- Operators use /profile to see their dashboard
-- Bulk schedule setup: tap Add Schedule → Bulk Setup → enter routes and times in 24hr format
-- Subscription: MVR 500/month after 2-month free trial
-- Booking confirmation: tap ✅ Confirm & Send Ticket when you receive payment slip
-- All times must be in 24hr format (16:00 not 4:00PM)
+# Pending manual card waiting for /confirm before firing to all platforms
+# Only one at a time — new "create card and post" replaces the previous pending one.
+_pending_manual_post = {}  # {card_bytes, full_caption, chat_id, thread_id, first_name}
 
-Keep answers SHORT (max 3-4 sentences). Use simple English. Be friendly and helpful.
-If you don't know something, say "Contact @SamugaTravels for this."
-Never make up prices, policies, or features that aren't mentioned."""
-    else:
-        system_prompt = """You are SamugaAI, the helpful travel assistant for Samuga Travels customers in the Maldives.
-You help passengers with:
-- How to search and book speedboats
-- What to bring on a boat trip
-- Island information (Thoddoo, Maafushi, Dhigurah, etc.)
-- What to expect during the journey
-- Payment and ticket questions
-- Travel tips for the Maldives
+# ── Samuga AI proactive mode toggle ─────────────────────────────────────────
+# /ai on  → bot reads every core team message and decides whether to jump in
+# /ai off → bot only responds when directly tagged (default safe mode)
+_ai_proactive_mode = True   # on by default — team can toggle
 
-Key facts:
-- Search boats by typing your route e.g. "Male to Thoddoo"
-- Pay via BML or MIB bank transfer then upload screenshot
-- Ticket arrives within 5-10 minutes after operator confirms
-- 45-minute reminder is sent before departure
-- Bring your National ID card (Maldivians) or Passport (foreigners)
-- Use FollowMe app to track your boat
+# ── Universal Approval Queue (in-memory) ─────────────────────────────────────
+# Every card (English + Dhivehi) waits here for Content Lab approval before posting.
+# Cards expire after 2 hours if not approved.
+ENGLISH_AUTOPOST_SECONDS = 2700   # Regular: auto-post after 45 min if nobody reviews
+BREAKING_AUTOPOST_SECONDS = 900   # Breaking held for confidence: auto-posts in 15 min
+TELEGRAM_GAP_SECONDS    = 7200   # 2 hours between regular Telegram posts
+DAILY_TG_POST_MAX       = 12     # Max regular posts per day to Telegram
+DHIVEHI_EXPIRY_SECONDS   = 7200   # Dhivehi: expire (delete) after 2h if not approved
 
-Keep answers SHORT (max 3-4 sentences). Be warm and friendly.
-Never make up schedules, prices, or routes — say "Search in the bot to see current options."
-If asked about refunds or complaints, say "Contact @SamugaTravels directly."
-"""
+approval_queue = {}  # key -> {card_bytes, caption, title, link, cat, lang, dv_text, created_at, ...}
+_approval_counter = [0]
 
-    ctx_str = ""
-    if context:
-        if context.get("operator_name"):
-            ctx_str = f"\n(Operator: {context['operator_name']})"
-        if context.get("customer_route"):
-            ctx_str = f"\n(Looking for: {context['customer_route']})"
+# ── Global state variables (removed from db block, restored here) ──────────────
+analytics           = {"posts_by_cat": {}, "breaking_count": 0, "social_success": 0, "social_fail": 0, "week_start": None}
+last_regular_post_time = None
+daily_sports_count  = {"date": None, "count": 0}
+daily_world_count   = {"date": None, "count": 0}
+daily_tourism_count = {"date": None, "count": 0}
 
+
+def can_post_cat_today(counter, max_per_day):
+    """Check a per-category daily counter against its cap. Resets on a new MVT
+    day and increments the counter when posting is allowed. Returns True if a
+    post in this category is still within today's budget."""
+    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+    if counter.get("date") != today:
+        counter["date"] = today
+        counter["count"] = 0
+    if counter["count"] >= max_per_day:
+        return False
+    counter["count"] += 1
+    try:
+        persist_state()
+    except Exception:
+        pass
+    return True
+
+
+# ── Content Lab flood control ────────────────────────────────────────────────
+# Goal: normal newsroom flow = max 4 approval cards/hour.
+# Exception: very high priority stories can use up to 6/hour.
+# Breaking with strong confidence posts automatically; breaking with weak confidence
+# goes to Alert Chat, not Content Lab, so Uly's workspace does not get flooded.
+CONTENT_LAB_NORMAL_MAX_PER_HOUR = int(os.environ.get("CONTENT_LAB_NORMAL_MAX_PER_HOUR", "4"))  # legacy — kept for _content_lab_slots_available
+CONTENT_LAB_HIGH_MAX_PER_HOUR   = int(os.environ.get("CONTENT_LAB_HIGH_MAX_PER_HOUR", "6"))   # legacy
+CONTENT_LAB_HIGH_SCORE          = int(os.environ.get("CONTENT_LAB_HIGH_SCORE", "180"))         # threshold for "very high score" — 2 cards per scan
+HOURLY_CARD_CAP                 = int(os.environ.get("HOURLY_CARD_CAP", "10"))                 # safety net — never exceed this per hour
+SCAN_NORMAL_CARDS               = 1    # cards per 15-min scan normally
+SCAN_HIGH_CARDS                 = 2    # cards per scan when top article scores 180+
+FUNNEL_KEEP_RATIO               = 0.5  # each funnel pass keeps top 50%
+FUNNEL_MIN_SCORE                = 80   # articles below this get cut at first pass
+_content_lab_sent_log = []  # datetime stamps for approval previews actually sent
+
+def _prune_content_lab_log(now=None):
+    now = now or utcnow()
+    cutoff = now - timedelta(hours=1)
+    _content_lab_sent_log[:] = [t for t in _content_lab_sent_log if t > cutoff]
+
+def _content_lab_slots_available(item=None):
+    now = utcnow()
+    _prune_content_lab_log(now)
+    sent = len(_content_lab_sent_log)
+    priority = int((item or {}).get("_priority") or (item or {}).get("score") or 0)
+    high_priority = bool((item or {}).get("is_breaking")) or priority >= CONTENT_LAB_HIGH_SCORE
+    limit = CONTENT_LAB_HIGH_MAX_PER_HOUR if high_priority else CONTENT_LAB_NORMAL_MAX_PER_HOUR
+    return sent < limit, limit, sent, high_priority
+
+def _mark_content_lab_sent(item=None):
+    _prune_content_lab_log()
+    _content_lab_sent_log.append(utcnow())
+    if item is not None:
+        item["_content_lab_sent"] = True
+        item["_content_lab_sent_at"] = utcnow().isoformat()
+
+def release_content_lab_drip():
+    """Send delayed approval cards slowly so Content Lab gets max 4/hour, 6 if high priority."""
+    try:
+        pending = [
+            (k, v) for k, v in approval_queue.items()
+            if not v.get("_content_lab_sent") and not v.get("_content_lab_suppressed")
+        ]
+        pending.sort(key=lambda kv: kv[1].get("created_at") or utcnow())
+        if not pending:
+            return
+        for k, v in pending:
+            ok, limit, sent, high = _content_lab_slots_available(v)
+            if not ok:
+                log.info(f"🧯 Content Lab drip paused: {sent}/{limit} sent in last hour, {len(pending)} waiting")
+                return
+            _send_approval_card(k, v, force=True)
+    except Exception as e:
+        log.error(f"Content Lab drip: {e}")
+
+def store_pending_approval(card_bytes, caption, title, link, cat="LOCAL", lang="en",
+                           dv_text=None, keyword="maldives news", source="LOCAL",
+                           is_breaking=False, allow_social=True, dedup_title=None, summary=""):
+    """Store a fully-built card awaiting approval. Returns the key or None if blocked."""
+    safe_ok, safe_reason = contentlab_candidate_is_safe(
+        title=title,
+        summary=(dv_text or caption or summary or ""),
+        source=source,
+        lang=lang,
+    )
+    if not safe_ok:
+        log.warning(f"🧱 Content Lab blocked candidate: {safe_reason} — {str(title)[:90]}")
+        return None
+
+    _approval_counter[0] += 1
+    prefix = "dv" if lang == "dv" else "en"
+    key = f"{prefix}{_approval_counter[0]}"
+    approval_queue[key] = {
+        "card_bytes": card_bytes,   # PNG bytes of the finished card (None for dv until approved)
+        "caption": caption,          # full telegram caption
+        "title": title,
+        "link": link,
+        "cat": cat,
+        "lang": lang,
+        "dv_text": dv_text,          # Dhivehi text (for dv cards, editable)
+        "keyword": keyword,
+        "source": source,
+        "is_breaking": is_breaking,
+        "allow_social": allow_social,
+        "created_at": utcnow(),
+        "_dedup_title": dedup_title or title,
+        "summary": summary or "",
+    }
+    # Cap queue size
+    if len(approval_queue) > 40:
+        oldest = list(approval_queue.keys())[0]
+        del approval_queue[oldest]
+    persist_state()
+    # Immediately backup to PostgreSQL so queue survives any crash
+    try:
+        kv_set("approval_queue_backup", _serialize_approval_queue_for_pg())
+        kv_set("approval_counter_backup", _approval_counter[0])
+        log.debug(f"[PG] Queue backup saved: {len(approval_queue)} items")
+    except Exception as pg_err:
+        log.warning(f"[PG] Queue backup failed: {pg_err}")
+    return key
+
+def expire_old_approvals():
+    """
+    Runs every few minutes:
+    - Breaking held (low confidence): auto-posts after 30 min if no team action
+    - Regular English: auto-posts after 45 min via queue
+    - Dhivehi breaking: auto-posts after 2h
+    - Regular Dhivehi: deleted after 2h
+    """
+    now = utcnow()
+
+    # Breaking held for confidence — auto-post after 30 min
+    breaking_held = [k for k, v in approval_queue.items()
+                     if v.get("lang") == "en"
+                     and v.get("is_breaking", False)
+                     and v.get("_held_for_confidence", False)
+                     and (now - v["created_at"]).total_seconds() > BREAKING_AUTOPOST_SECONDS]
+    for k in breaking_held:
+        item = approval_queue.pop(k)
+        log.info(f"⏰ Breaking {k} auto-posting (30min, no review): {item.get('title','')[:50]}")
+        try:
+            buf = io.BytesIO(item["card_bytes"])
+            queue_for_social(buf, item["caption"],
+                key_label=f"{k.upper()} (breaking auto)",
+                tg_ok=False, post_telegram=True, is_breaking=True,
+                article_id=item.get("article_id"), title=item.get("title",""),
+                summary=item.get("summary",""), cat=item.get("cat","BREAKING"),
+                source=item.get("source","Samuga Media"), link=item.get("link",""),
+                lang=item.get("lang","en"))
+            send_text(CORE_TEAM_CHAT_ID,
+                f"⏰ <b>{k.upper()} Breaking auto-posted</b> (30min, no review)\n"
+                f"📰 {item.get('title','')[:80]}",
+                thread_id=ALERT_THREAD_ID)
+        except Exception as e:
+            log.error(f"Breaking auto-post {k}: {e}")
+
+    # Regular English auto-post after 45 min
+    en_due = [k for k, v in approval_queue.items()
+              if v.get("lang") == "en"
+              and not v.get("is_breaking", False)
+              and (now - v["created_at"]).total_seconds() > ENGLISH_AUTOPOST_SECONDS]
+    for k in en_due:
+        item = approval_queue.pop(k)
+        title = item.get("title","")[:50]
+        log.info(f"⏰ English {k} auto-queuing (45min, no review): {title}")
+        try:
+            buf = io.BytesIO(item["card_bytes"])
+            queue_for_social(buf, item["caption"],
+                key_label=f"{k.upper()} (auto)",
+                tg_ok=False, post_telegram=True,
+                article_id=item.get("article_id"), title=item.get("title",""),
+                summary=item.get("summary",""), cat=item.get("cat","LOCAL"),
+                source=item.get("source","Samuga Media"), link=item.get("link",""),
+                lang=item.get("lang","en"), is_breaking=item.get("is_breaking", False))
+            send_text(CORE_TEAM_CHAT_ID,
+                f"⏰ <b>{k.upper()}</b> auto-posted (45min, no review)\n📰 {item.get('title','')[:80]}",
+                thread_id=ALERT_THREAD_ID)
+        except Exception as e:
+            log.error(f"Auto-post queue {k}: {e}")
+
+    # DV 30-min warning — alert team before card expires (DV never auto-posts)
+    dv_warning = [k for k, v in approval_queue.items()
+                  if v.get("lang") == "dv"
+                  and not v.get("_warned_30min")
+                  and (now - v["created_at"]).total_seconds() > (DHIVEHI_EXPIRY_SECONDS - 1800)]
+    for k in dv_warning:
+        approval_queue[k]["_warned_30min"] = True
+        title = approval_queue[k].get("title","")[:60]
+        is_brk = approval_queue[k].get("is_breaking", False)
+        brk_tag = "🚨 Breaking " if is_brk else ""
+        send_text(CORE_TEAM_CHAT_ID,
+            f"⚠️ <b>30-min warning</b> — {brk_tag}Dhivehi <code>{k.upper()}</code> expires in 30 minutes!\n"
+            f"📰 {title}\n\n"
+            f"Approve: <code>/approved {k}</code>  |  Reject: <code>/reject {k}</code>\n"
+            f"<i>Dhivehi never auto-posts — it will be deleted if not approved.</i>",
+            thread_id=ALERT_THREAD_ID)
+        persist_state()
+
+    # Dhivehi expiry — breaking ones auto-post after 2h, regular ones delete
+    dv_due = [k for k, v in approval_queue.items()
+              if v["lang"] == "dv" and (now - v["created_at"]).total_seconds() > DHIVEHI_EXPIRY_SECONDS]
+    for k in dv_due:
+        item = approval_queue.pop(k)
+        title = item.get("title","")[:40]
+        # Dhivehi NEVER auto-posts — all DV cards just expire and get deleted
+        if False and item.get("_auto_post_breaking") and item.get("dv_text"):
+            log.info(f"⏰ Breaking Dhivehi {k} auto-posting after 2h: {title}")
+            try:
+                kw = item.get("keyword","local")
+                bg = item.get("_bg_image") or fetch_background_image(kw, cat=item.get("cat"), title=item.get("title",""))
+                ts_now = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+                card = generate_card(item["dv_text"], SAMUGA_PUBLIC_SOURCE, ts_now, item.get("cat","BREAKING"), bg)
+                full_caption = (
+                    f"🇲🇻 <b>{item['title']}</b>\n\n"
+                    f"{item['dv_text']}\n\n"
+                    f"📡 <b>ސަމުގާ މީޑިއާ</b> | @samugacommunity"
+                )
+                card.seek(0)
+                tg_ok = send_to_telegram(card, full_caption)
+                if tg_ok:
+                    card.seek(0)
+                    queue_for_social(io.BytesIO(card.getvalue()), full_caption,
+                                     key_label=k.upper(), tg_ok=True,
+                                     article_id=item.get("article_id"), title=item.get("title",""),
+                                     summary=item.get("summary",""), cat=item.get("cat","BREAKING"),
+                                     source=item.get("source","Samuga Media"), link=item.get("link",""),
+                                     lang="dv", is_breaking=True)
+                    send_text(CORE_TEAM_CHAT_ID,
+                        f"⏰ <b>{k.upper()} Breaking Dhivehi auto-posted</b> (2h, no review)\n"
+                        f"📰 {item['title'][:70]}",
+                        thread_id=ALERT_THREAD_ID)
+                    log.info(f"⏰ Breaking Dhivehi {k} auto-posted to community")
+            except Exception as e:
+                log.error(f"Breaking DV auto-post {k}: {e}")
+        else:
+            log.info(f"⏰ Dhivehi {k} expired (2h, not breaking, deleted): {title}")
+
+    if en_due or dv_due:
+        persist_state()
+
+# Backwards-compat alias (old code references dhivehi_pending)
+dhivehi_pending = approval_queue
+
+# ── Core Team Config ──────────────────────────────────────────────────────────
+CORE_TEAM_CHAT_ID = "-1002829230299"
+CONTENT_LAB_THREAD_ID = 9061   # approvals, queue confirmations — Uly's workspace
+ALERT_THREAD_ID       = 10169  # bot suggestions, developing stories, briefs, proactive insights
+
+CORE_TEAM_MEMBERS = {
+    "manchii": {"name": "Manchii", "full": "Abdul Muhsin", "role": "Founder & MD", "notes": "Big ideas, entrepreneur, boss, loves to push boundaries"},
+    "mutte":   {"name": "Manchii", "full": "Abdul Muhsin", "role": "Founder & MD", "notes": "Big ideas, entrepreneur, boss, loves to push boundaries"},
+    "uly":     {"name": "Uly", "full": "Mariyam Ulya", "role": "Co-Founder & Editor-in-Chief", "notes": "Journalist brain, editorial standards, keeps content sharp"},
+    "ulya":    {"name": "Uly", "full": "Mariyam Ulya", "role": "Co-Founder & Editor-in-Chief", "notes": "Journalist brain, editorial standards, keeps content sharp"},
+    "thooma":  {"name": "Thooma", "full": "Aminath Thooma", "role": "Presenter & Marketing Assistant", "notes": "Content face, presenter energy, needs confidence boosts sometimes"},
+    "kit":     {"name": "Kity", "full": "Kit", "role": "Manchii's wife & idea contributor", "notes": "Creative, boosts team morale, great at boosting Thooma, shares fresh ideas"},
+    "kity":    {"name": "Kity", "full": "Kit", "role": "Manchii's wife & idea contributor", "notes": "Creative, boosts team morale, great at boosting Thooma, shares fresh ideas"},
+}
+
+CORE_TEAM_PROACTIVE_TRIGGERS = [
+    "?", "idea", "what do you think", "thoughts", "suggest", "brainstorm",
+    "samuga", "content", "post", "story", "plan", "strategy", "marketing",
+    "tiktok", "instagram", "facebook", "caption", "script", "video", "reel",
+    "haha", "lol", "😂", "anyone", "guys", "let's", "lets", "what if", "how about"
+]
+
+# ── Rejection humor responses ────────────────────────────────────────────────
+REJECT_RESPONSES = [
+    "Okay okay, deleted. The article didn't make the cut. Just like my invite to your last outing. 💔",
+    "Gone. Rejected. Just like that one pitch Manchii had at 2am. We don't talk about it. 🗑️",
+    "Poof. Vanished. The article felt it too. 😭",
+    "Rejected faster than a loan application. Card deleted. 🚮",
+    "Understood. We move. The article does not. 👋",
+    "That article just got voted off the island. Maldivian style. 🏝️",
+    "Fine fine, I'll delete it. But between us — I thought it was good. Just saying. 🤷",
+    "Deleted! The article is now in a better place. (The bin.) 🗑️✨",
+    "I already knew you'd reject it. I just wanted to see if you'd catch it. You did. Respect. 🫡",
+    "Card deleted. The source is probably crying somewhere. Not my problem. 😌",
+    "Gone with the wind. And the article. Bye bye. 🌬️",
+    "Noted, rejected, deleted. Three words that describe both this article and my weekend plans. 🙂",
+    "You know what, I respect the standards. Card is gone. Moving on. 💪",
+    "Deleted so fast the article didn't even see it coming. Neither did I honestly. 😅",
+    "That one wasn't it. Removed. You're basically my editor brain at this point. 🧠",
+    "Rejected. I'll add it to the list of things that didn't make it. The list is getting long. 📋",
+    "Gone. The article will not be missed. By anyone. Especially not the readers. 🫠",
+    "Okay the bin got a new resident. Hope it's comfortable in there. 🗑️",
+    "Deleted faster than Manchii's sleep schedule. Which is saying something. ⚡",
+    "Fair enough. Some stories aren't worth telling. This was one of them. Card gone. ✂️",
+]
+
+# ── PostgreSQL Database Layer (v6) ────────────────────────────────────────────
+# Railway auto-injects DATABASE_URL when Postgres is in the project.
+# The bot uses Postgres for the article archive + intelligence, but ALWAYS falls
+# back to JSON files if the DB is unavailable, so it never breaks.
+# ── Source Reliability Scoring ────────────────────────────────────────────────
+# Higher = more trusted. Used as a tie-breaker and a scoring boost so a direct
+# Mihaaru/MvCrisis story outranks a Google News scrape of the same topic.
+def track_analytics(cat, is_breaking=False, social_ok=None):
+    global analytics
+    from datetime import timezone as _tz
+    week = (datetime.now(_tz.utc) + timedelta(hours=5)).isocalendar()[1]
+    if analytics["week_start"] != week:
+        analytics = {"posts_by_cat": {}, "breaking_count": 0, "social_success": 0, "social_fail": 0, "week_start": week}
+    if cat != "SOCIAL":
+        analytics["posts_by_cat"][cat] = analytics["posts_by_cat"].get(cat, 0) + 1
+    if is_breaking: analytics["breaking_count"] += 1
+    if social_ok is True: analytics["social_success"] += 1
+    if social_ok is False: analytics["social_fail"] += 1
+
+def remember_post(title, cat, timestamp, is_breaking=False):
+    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+    recent_posts.append({"title": title, "cat": cat, "time": timestamp,
+                          "is_breaking": is_breaking, "date": today})
+    if len(recent_posts) > 50: recent_posts.pop(0)
+    track_analytics(cat)
+    persist_state()
+
+def get_conversation(uid):
+    if uid not in user_conversations: user_conversations[uid] = []
+    return user_conversations[uid]
+
+def add_to_conversation(uid, role, content):
+    conv = get_conversation(uid)
+    conv.append({"role":role,"content":content})
+    if len(conv) > 10: user_conversations[uid] = conv[-10:]
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def get_mvt_hour(): return (utcnow().hour + 5) % 24
+def is_day_mode(): return 6 <= get_mvt_hour() < 22
+
+def is_fresh(entry, hours=24):
+    try:
+        pub = entry.get("published","")
+        if pub:
+            dt = parsedate_to_datetime(pub)
+            if dt.tzinfo: dt = dt.replace(tzinfo=None)
+            return utcnow() - dt < timedelta(hours=hours)
+    except Exception as e: log.debug(f"is_fresh parse: {e}")
+    return True
+
+def can_post_regular():
+    """
+    Returns True only if:
+    1. At least 2 hours have passed since last regular post, AND
+    2. Daily regular post cap (12) hasn't been hit.
+    Breaking news ignores this entirely.
+    """
+    global last_regular_post_time
+    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+
+    # Check daily cap
+    posts_today = sum(1 for p in recent_posts
+                      if p.get("date","") == today and not p.get("is_breaking", False))
+    if posts_today >= DAILY_TG_POST_MAX:
+        log.info(f"📵 Daily post cap reached ({posts_today}/{DAILY_TG_POST_MAX}) — skipping regular post")
+        return False
+
+    # Check time gap
+    if not last_regular_post_time:
+        return True
+    return (utcnow() - last_regular_post_time).total_seconds() >= TELEGRAM_GAP_SECONDS
+
+# ── Social filter — only quality LOCAL/DISASTER/relevant WORLD goes to socials ─
+def allowed_for_social(article):
+    """Only high-value articles go to Facebook/Instagram/X."""
+    cat = article["cat"]
+    # Never post these to social
+    if cat in ["SPORTS", "FOOTBALL", "WEATHER", "TOURISM"]:
+        return False
+    if cat == "WORLD":
+        # Only Maldives-relevant world news
+        text = (article["title"] + " " + article.get("summary","")).lower()
+        mv_terms = ["maldives","indian ocean","south asia","india","china","un ","dollar","oil price","global economy"]
+        return any(t in text for t in mv_terms)
+    # LOCAL and DISASTER always allowed
+    return True
+
+# ── Pending article queue — best article waiting for 90min window ─────────────
+# Instead of posting to social every scan, we store the best article and post
+# it only when the 90min Telegram window opens.
+_pending_article = None  # holds the best unseen article between scans
+
+# ── Social post daily counter (MVT based) ─────────────────────────────────────
+social_post_counts = {"date": None, "count": 0}
+
+def is_day_social():
+    """6AM to 10PM MVT = day mode for socials"""
+    h = mvt_now().hour
+    return 6 <= h < 22
+
+def can_post_social():
+    """Check if social daily limit not reached: 20 posts 6AM-10PM, 5 posts night"""
+    global social_post_counts
+    today = mvt_now().date()
+    if social_post_counts["date"] != today:
+        social_post_counts = {"date": today, "count": 0}
+    limit = 20 if is_day_social() else 3
+    return social_post_counts["count"] < limit
+
+def increment_social_count():
+    global social_post_counts
+    today = mvt_now().date()
+    if social_post_counts["date"] != today:
+        social_post_counts = {"date": today, "count": 0}
+    social_post_counts["count"] += 1
+    persist_state()
+    log.info(f"📊 Social posts today: {social_post_counts['count']} ({'day' if is_day_social() else 'night'} limit: {20 if is_day_social() else 3})")
+# ── Telegram ──────────────────────────────────────────────────────────────────
+def send_to_telegram(buf, caption):
+    """Post a photo to the community channel. Returns message_id (int) or False."""
+    try:
+        if posting_paused():
+            log.warning("🛑 Telegram public post blocked — POSTING_PAUSED=true")
+            return False
+        safe_caption = samuga_public_caption(caption)
+        if not public_text_is_safe(safe_caption):
+            log.error(f"🚫 Telegram blocked unsafe public caption: {str(safe_caption)[:120]}")
+            return False
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+            data={"chat_id": TELEGRAM_CHANNEL_ID, "caption": safe_caption, "parse_mode": "HTML"},
+            files={"photo": ("card.png", buf, "image/png")}, timeout=30)
+        resp.raise_for_status()
+        mid = resp.json().get("result", {}).get("message_id")
+        log.info(f"✅ Posted to Telegram (msg {mid})")
+        return mid or True
+    except Exception as e:
+        log.error(f"Telegram: {e}")
+        return False
+
+def download_telegram_photo(photo_list):
+    """Download the highest quality photo from a Telegram photo array"""
+    try:
+        # Get largest photo (last in list)
+        file_id = photo_list[-1]["file_id"]
+        # Get file path
+        resp = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
+            params={"file_id": file_id}, timeout=10
+        )
+        file_path = resp.json()["result"]["file_path"]
+        # Download the file
+        img_resp = requests.get(
+            f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}",
+            timeout=20
+        )
+        from PIL import Image
+        img = Image.open(io.BytesIO(img_resp.content)).convert("RGB")
+        log.info("✅ Telegram photo downloaded — returning PIL Image for card generation")
+        return img  # generate_card expects PIL Image, not BytesIO
+    except Exception as e:
+        log.error(f"Photo download: {e}")
+        return None
+
+def _make_inline_kb(buttons):
+    """Build Telegram inline_keyboard JSON from list of (text, callback_data) tuples per row."""
+    return {"inline_keyboard": [[{"text": t, "callback_data": c} for t, c in row] for row in buttons]}
+
+def send_photo(chat_id, buf, caption, thread_id=None, reply_markup=None):
+    """Send a photo to any Telegram chat/channel, optionally to a topic thread"""
+    try:
+        buf.seek(0)
+        data = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
+        if thread_id:    data["message_thread_id"] = thread_id
+        if reply_markup: data["reply_markup"] = json.dumps(reply_markup)
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+            data=data,
+            files={"photo": ("card.png", buf, "image/png")},
+            timeout=30
+        )
+        resp.raise_for_status()
+        msg_id = resp.json().get("result", {}).get("message_id")
+        log.info("✅ Photo sent to Telegram")
+        return msg_id
+    except Exception as e:
+        log.error(f"send_photo: {e}")
+        return None
+
+def send_text(chat_id, text, reply_to=None, thread_id=None, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_to:     payload["reply_to_message_id"] = reply_to
+    if thread_id:    payload["message_thread_id"] = thread_id
+    if reply_markup: payload["reply_markup"] = json.dumps(reply_markup)
     try:
         resp = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json=payload, timeout=15)
+        return resp.json().get("result", {}).get("message_id")
+    except Exception as e:
+        log.error(f"Send text: {e}")
+        return None
+
+def edit_message_reply_markup(chat_id, message_id, reply_markup):
+    """Remove or update buttons on a previously sent message."""
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup",
+            json={"chat_id": chat_id, "message_id": message_id,
+                  "reply_markup": json.dumps(reply_markup)},
+            timeout=10)
+    except Exception as e:
+        log.error(f"edit_markup: {e}")
+
+def answer_callback_query(callback_query_id, text="", show_alert=False):
+    """Acknowledge a button tap so Telegram stops showing the loading spinner."""
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": callback_query_id, "text": text, "show_alert": show_alert},
+            timeout=10)
+    except Exception as e:
+        log.error(f"answer_callback: {e}")
+
+_ops_last_alerts = {}
+_ops_watchdog_state = {
+    "source_health_alerts": {},
+    "duplicate_hits_recent": [],   # utc datetimes
+    "manual_post_failures": [],    # utc datetimes
+    "social_queue_stuck_since": None,
+    "last_posted_dv": 0,
+}
+website_banner = {"active": False, "text": "", "image_url": "", "updated_at": None}
+
+def alert_admin(message, dedupe_key=None, cooloff_minutes=20):
+    """Send an operational alert into the Alert thread without spamming duplicates."""
+    try:
+        key = dedupe_key or _caption_match_key(message) or str(hash(message))
+        now = utcnow()
+        last = _ops_last_alerts.get(key)
+        if last and (now - last).total_seconds() < cooloff_minutes * 60:
+            return False
+        _ops_last_alerts[key] = now
+        send_text(CORE_TEAM_CHAT_ID, f"⚠️ <b>Samuga Ops Alert</b>\n\n{message}", thread_id=ALERT_THREAD_ID)
+        return True
+    except Exception as e:
+        log.error(f"alert_admin: {e}")
+        return False
+
+def delete_telegram_message(chat_id, message_id):
+    """Delete a Telegram message when the bot has rights in the chat."""
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage",
+            json={"chat_id": chat_id, "message_id": message_id},
+            timeout=15
+        )
+        data = r.json() if r.ok else {}
+        ok = bool(r.ok and data.get("ok"))
+        if not ok:
+            log.warning(f"deleteMessage failed: {str(data)[:200]}")
+        return ok
+    except Exception as e:
+        log.error(f"delete_telegram_message: {e}")
+        return False
+
+def download_telegram_photo_bytes(photo_list):
+    """Download the highest quality Telegram photo and return raw bytes."""
+    try:
+        if not photo_list:
+            return None
+        file_id = photo_list[-1]["file_id"]
+        resp = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
+            params={"file_id": file_id}, timeout=15
+        )
+        data = resp.json()
+        file_path = data["result"]["file_path"]
+        img_resp = requests.get(
+            f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}",
+            timeout=25
+        )
+        if img_resp.ok and img_resp.content:
+            return img_resp.content
+    except Exception as e:
+        log.error(f"download_telegram_photo_bytes: {e}")
+    return None
+
+def website_article_url(article_id=None, slug=None):
+    """Return the public website URL for an article."""
+    base = (SAMUGA_CAPTION_LINK or "https://samugamedia.com").rstrip("/")
+    if article_id:
+        return f"{base}/article.html?id={article_id}"
+    if slug:
+        return f"{base}/article.html?slug={slug}"
+    return base
+
+def extract_inline_post_to_web_body(text):
+    """Allow admins to send article text + /post to web in the same message."""
+    raw = str(text or "")
+    clean = re.sub(r'@SamugaNewsBot\b', '', raw, flags=re.I)
+    clean = re.sub(r'(?im)^\s*/post\s+to\s+web\s*$', '', clean)
+    clean = re.sub(r'(?im)^\s*/postweb\s*$', '', clean)
+    clean = re.sub(r'(?im)^\s*/posttoweb\s*$', '', clean)
+    clean = re.sub(r'(?im)^\s*/post\s+web\s*$', '', clean)
+    clean = clean.strip()
+    return clean
+
+# ── Gemini Dhivehi Caption ────────────────────────────────────────────────────
+# Model fallback chain — newest first, fall back if quota/deprecated
+GEMINI_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+]
+
+def _gemini_post(prompt, timeout=15):
+    """Try Gemini models in order until one works. Returns text or None."""
+    if not GEMINI_API_KEY:
+        return None
+    for model in GEMINI_MODELS:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+            resp = requests.post(url, json={"contents":[{"parts":[{"text":prompt}]}]}, timeout=timeout)
+            if resp.status_code == 200:
+                text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                log.info(f"[AI] Gemini {model}: OK")
+                return text
+            elif resp.status_code in [429, 503]:
+                log.warning(f"[AI] Gemini {model}: quota/unavailable ({resp.status_code}), trying next")
+                continue
+            else:
+                log.warning(f"[AI] Gemini {model}: HTTP {resp.status_code}")
+                continue
+        except Exception as e:
+            log.warning(f"[AI] Gemini {model}: {e}")
+            continue
+    log.error("[AI] All Gemini models failed")
+    return None
+
+def _strip_telegram_metadata(text):
+    """Remove Telegram forwarding/relay artifacts that leak into scraped DV/EN
+    channel text before it reaches public captions (Instagram/Facebook/X).
+
+    Strips:
+      - forward arrows  -->  and leading/trailing  >  relay markers
+      - Telegram relative timestamps: "8 hour 36 minutes ago",
+        including the Dhivehi filler "ވަރަށް" wedged inside them
+      - @channel mentions and t.me / telegram.me links
+      - "Forwarded from ..." / "via @..." attribution lines
+    """
+    if not text:
+        return text
+    s = str(text)
+
+    # t.me / telegram.me links
+    s = re.sub(r"https?://(?:t\.me|telegram\.me)/\S+", "", s, flags=re.I)
+    # Forwarded-from / via attribution lines
+    s = re.sub(r"(?im)^\s*(?:forwarded\s+from|via)\b.*$", "", s)
+    # @channel mentions
+    s = re.sub(r"(?<!\w)@[A-Za-z0-9_]{4,}", "", s)
+    # Telegram relative timestamps, e.g. "8 hour 36 minutes ago",
+    # "about 2 hours ago", with optional Dhivehi filler words in between.
+    s = re.sub(
+        r"(?i)(?:about\s+)?\d+\s*(?:[^\d\n]{0,12}?)"
+        r"(?:second|minute|min|hour|hr|day|week|month|year)s?"
+        r"(?:\s*[^\d\n]{0,12}?\d+\s*(?:second|minute|min|hour|hr|day|week|month|year)s?)?"
+        r"\s*ago\b",
+        "",
+        s,
+    )
+    # Forward arrows and stray relay markers
+    s = s.replace("-->", "").replace("—>", "").replace("→", "")
+    s = re.sub(r"(?m)^\s*>+\s*", "", s)   # leading quote/relay markers
+    s = re.sub(r"\s*-->\s*", " ", s)
+
+    # Tidy whitespace left behind
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    s = re.sub(r"^\s+|\s+$", "", s)
+    return s
+
+def make_dhivehi_caption(english_text, title):
+    """Convert English/Latin news text to clean Dhivehi Thaana using Gemini."""
+    if not GEMINI_API_KEY:
+        return None
+    english_text = _strip_telegram_metadata(english_text)
+    title = _strip_telegram_metadata(title)
+    prompt = f"""You are a Maldivian news editor for Samuga Media.
+
+Write a short public news caption in proper Dhivehi Thaana script.
+
+Rules:
+- Output ONLY Dhivehi Thaana.
+- 2 to 3 natural sentences.
+- Clean Maldivian news style.
+- Do not add facts that are not in the input.
+- Do not include external source links.
+- Do not leave Latin Thaana/romanized Dhivehi.
+- Brand names can stay in English only if necessary.
+
+Title:
+{title}
+
+Summary:
+{english_text}
+"""
+    result = _gemini_post(prompt)
+    if result and is_dhivehi(result):
+        log.info("✅ Gemini Dhivehi caption done")
+        return _strip_telegram_metadata(strip_source_links(result).strip())
+
+    if result:
+        log.warning("Gemini Dhivehi caption returned non-Thaana text — rejected")
+    return None
+
+# ── Safety + dedup normalization layer ────────────────────────────────────────
+_INTERNAL_NEWS_BLOCKLIST = [
+    "technical issue", "being fixed", "sorry for the trouble", "sorry for the inconvenience",
+    "temporarily unavailable", "maintenance", "test post", "debug", "samuga media is facing",
+    "issue is being fixed", "we are fixing", "service interruption"
+]
+_MARKUP_JUNK_PATTERNS = [
+    r"\.cls-\d", r"fill-rule\s*:", r"evenodd", r"<svg", r"</svg", r"xmlns=",
+    r"viewbox", r"path\s+d=", r"fill:\s*#"
+]
+_signal_key_cache = {}
+
+def gemini_dhivehi_to_english(text):
+    """Translate proper Thaana or mixed Dhivehi text into clean English for scoring/dedup."""
+    if not GEMINI_API_KEY or not text:
+        return None
+    prompt = f"""Translate this Dhivehi news text into clean English.
+
+Rules:
+- Output ONLY English.
+- Do not add new facts.
+- Keep names and places accurate.
+- Clean short newsroom style.
+
+Text:
+{text}
+"""
+    out = _gemini_post(prompt, timeout=18)
+    if out and not is_dhivehi(out):
+        return strip_source_links(out).strip()
+    return None
+
+def contentlab_candidate_is_safe(title="", summary="", source="", lang="en"):
+    """Block internal/system chatter, CSS/SVG junk, and fake newsroom items before Content Lab."""
+    combined = strip_source_links(f"{title}\n{summary}").strip()
+    c_lower = combined.lower()
+    for bad in _INTERNAL_NEWS_BLOCKLIST:
+        if bad in c_lower:
+            return False, f"internal/system text: {bad}"
+    for pat in _MARKUP_JUNK_PATTERNS:
+        if re.search(pat, combined, re.I):
+            return False, f"markup/css junk: {pat}"
+    if combined.startswith(".") and "{" in combined and "}" in combined:
+        return False, "css-like content"
+    # Extremely short Samuga-self lines with no news detail are not news.
+    if source.lower().startswith("samuga") and len(combined.split()) < 8:
+        return False, "samuga internal short text"
+    return True, ""
+
+
+def should_publish_dhivehi_to_website(item=None, approved=False):
+    """
+    Dhivehi must never appear on the website unless a human approved it.
+    For safety, approved Dhivehi website publishing stays OFF unless
+    DHIVEHI_WEBSITE_APPROVED=true is set in Railway.
+    """
+    if not approved:
+        return False
+    return os.environ.get("DHIVEHI_WEBSITE_APPROVED", "false").lower() == "true"
+
+def story_signal_key(title="", summary="", lang="en"):
+    """
+    Normalize a story into a stable English-ish key so Dhivehi/Latin variants
+    of the same story do not keep entering Content Lab.
+    """
+    raw = strip_source_links(" ".join(x for x in [title, summary] if x)).strip()
+    if not raw:
+        return ""
+    cache_key = f"{lang}|{raw[:500]}"
+    if cache_key in _signal_key_cache:
+        return _signal_key_cache[cache_key]
+
+    normalized = raw
+    try:
+        if looks_latin_thaana(raw):
+            en = gemini_latin_thaana_to_english(raw)
+            if en:
+                normalized = en
+        elif (lang == "dv") or is_dhivehi(raw):
+            en = gemini_dhivehi_to_english(raw)
+            if en:
+                normalized = en
+    except Exception as e:
+        log.debug(f"story_signal_key translation: {e}")
+
+    key = _caption_match_key(normalized or raw)
+    _signal_key_cache[cache_key] = key
+    return key
+
+# ── Dhivehi Quality Layer: Latin Thaana → Proper Thaana / English ─────────────
+# (Implemented in db.normalize_article_language_for_public — imported above.)
+
+# ── Auto Poll ─────────────────────────────────────────────────────────────────
+POLL_KEYWORDS = [
+    "government","president","parliament","minister","policy","law","vote","election",
+    "decision","budget","tax","fee","regulation","announce","reform","appointed",
+    "resign","fired","arrested","court","judge","sentence","verdict","accused",
+    "protest","rally","strike","ban","approve","reject","pass","failed"
+]
+
+# Poll daily counter (max 3/day MVT)
+polls_today = {"date": None, "count": 0}
+
+def can_post_poll():
+    global polls_today
+    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+    if polls_today["date"] != today:
+        polls_today = {"date": today, "count": 0}
+    return polls_today["count"] < 3
+
+def increment_poll_count():
+    global polls_today
+    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+    if polls_today["date"] != today:
+        polls_today = {"date": today, "count": 0}
+    polls_today["count"] += 1
+    persist_state()
+    log.info(f"🗳️ Polls today: {polls_today['count']}/3")
+
+def should_create_poll(title, summary, cat):
+    """Check if news warrants a poll (max 3/day)"""
+    if cat not in ["LOCAL", "WORLD"]: return False
+    if not can_post_poll(): return False
+    text = (title + " " + summary).lower()
+    return any(kw in text for kw in POLL_KEYWORDS)
+
+def generate_poll_question(title, rewritten):
+    """Use Claude to generate a relevant poll question"""
+    try:
+        msg = ai.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{"role":"user","content":f"""Based on this news, create a simple Telegram poll.
+
+News: {title}
+Summary: {rewritten}
+
+Return EXACTLY in this format (nothing else):
+QUESTION: [one short poll question in English]
+OPT1: [option 1, max 4 words]
+OPT2: [option 2, max 4 words]
+OPT3: [option 3, max 4 words]
+
+Keep it simple, neutral and relevant to the news."""}]
+        )
+        text = msg.content[0].text.strip()
+        question, options = "", []
+        for line in text.split('\n'):
+            if line.startswith("QUESTION:"): question = line[9:].strip()
+            elif line.startswith("OPT"): options.append(line.split(":",1)[1].strip())
+        return question, options[:3]
+    except Exception as e:
+        log.error(f"Poll generation: {e}")
+        return None, []
+
+def send_poll(question, options):
+    """Send a Telegram poll to the channel"""
+    if not question or len(options) < 2:
+        return
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPoll",
             json={
-                "contents": [{"parts": [{"text": f"{system_prompt}{ctx_str}\n\nUser: {question}"}]}],
-                "generationConfig": {"maxOutputTokens": 200, "temperature": 0.7}
+                "chat_id": TELEGRAM_CHANNEL_ID,
+                "question": f"🗳️ {question}",
+                "options": options,
+                "is_anonymous": True,
             },
             timeout=15
         )
         if resp.status_code == 200:
-            data = resp.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            return f"🤖 *SamugaAI:*\n\n{text}"
-        elif resp.status_code == 429:
-            return "🤖 SamugaAI is a bit busy right now. Please try again in a minute! 🙏"
+            log.info(f"✅ Poll sent: {question[:50]}")
         else:
-            logger.error(f"Gemini error: {resp.status_code} {resp.text[:200]}")
-            return "🤖 Couldn't get an answer right now. Try again or contact @SamugaTravels! 🙏"
+            log.error(f"Poll error: {resp.status_code}")
     except Exception as e:
-        logger.error(f"SamugaAI error: {e}")
-        return "🤖 Something went wrong. Please try again! 🙏"
+        log.error(f"Poll send: {e}")
 
-# ── CANCELLATION ─────────────────────────────────────────────────────────────
-async def cancel_booking(booking_id: int, cancelled_by: str, reason: str = "") -> tuple[dict | None, str]:
-    """
-    Atomically cancel a booking.
-    - Locks the row to prevent double-cancel
-    - Restores seats ONLY if booking was confirmed (no double-add)
-    - Returns (result_dict, message)
-    """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            booking = await conn.fetchrow("""
-                SELECT * FROM bookings WHERE id=$1 FOR UPDATE
-            """, booking_id)
-
-            if not booking:
-                return None, "Booking not found."
-            if booking["status"] == "cancelled":
-                return dict(booking), "already_cancelled"
-
-            old_status = booking["status"]
-
-            await conn.execute("""
-                UPDATE bookings
-                SET status='cancelled', cancelled_at=NOW(),
-                    cancelled_by=$2, cancellation_reason=$3
-                WHERE id=$1
-            """, booking_id, cancelled_by, reason)
-
-            # Restore seats ONLY if was confirmed (prevent double-restore)
-            if old_status == "confirmed":
-                await conn.execute("""
-                    UPDATE schedules
-                    SET available_seats = available_seats + $1
-                    WHERE id=$2
-                """, booking["passenger_count"], booking["schedule_id"])
-
-            schedule = await conn.fetchrow(
-                "SELECT * FROM schedules WHERE id=$1", booking["schedule_id"])
-            operator = await conn.fetchrow(
-                "SELECT * FROM operators WHERE id=$1", booking["operator_id"])
-
-    return {
-        "booking":    dict(booking),
-        "schedule":   dict(schedule)  if schedule  else {},
-        "operator":   dict(operator)  if operator  else {},
-        "old_status": old_status,
-    }, "cancelled"
-
-# ── MONTHLY ANALYTICS ─────────────────────────────────────────────────────────
-async def get_operator_monthly_report(operator_id: int, year: int, month: int) -> tuple[dict, dict | None]:
-    """Pull monthly booking stats for an operator from the DB."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT
-                COUNT(*) FILTER (
-                    WHERE EXTRACT(YEAR FROM travel_date)=$2 AND EXTRACT(MONTH FROM travel_date)=$3
-                ) AS total_bookings,
-                COUNT(*) FILTER (
-                    WHERE status='confirmed' AND EXTRACT(YEAR FROM travel_date)=$2 AND EXTRACT(MONTH FROM travel_date)=$3
-                ) AS confirmed_bookings,
-                COUNT(*) FILTER (
-                    WHERE status='cancelled' AND EXTRACT(YEAR FROM travel_date)=$2 AND EXTRACT(MONTH FROM travel_date)=$3
-                ) AS cancelled_bookings,
-                COUNT(*) FILTER (
-                    WHERE status IN ('pending_payment','pending_confirmation') AND EXTRACT(YEAR FROM travel_date)=$2 AND EXTRACT(MONTH FROM travel_date)=$3
-                ) AS pending_bookings,
-                COALESCE(SUM(passenger_count) FILTER (
-                    WHERE status='confirmed' AND EXTRACT(YEAR FROM travel_date)=$2 AND EXTRACT(MONTH FROM travel_date)=$3
-                ), 0) AS seats_sold,
-                COALESCE(SUM(total_amount) FILTER (
-                    WHERE status='confirmed' AND EXTRACT(YEAR FROM travel_date)=$2 AND EXTRACT(MONTH FROM travel_date)=$3
-                ), 0) AS gross_sales,
-                COALESCE(SUM(total_amount) FILTER (
-                    WHERE status='cancelled' AND EXTRACT(YEAR FROM travel_date)=$2 AND EXTRACT(MONTH FROM travel_date)=$3
-                ), 0) AS cancelled_value,
-                COUNT(*) FILTER (
-                    WHERE status='cancelled' AND cancelled_at IS NOT NULL AND EXTRACT(YEAR FROM cancelled_at)=$2 AND EXTRACT(MONTH FROM cancelled_at)=$3
-                ) AS cancelled_this_month,
-                COALESCE(SUM(total_amount) FILTER (
-                    WHERE refund_status='completed' AND refund_at IS NOT NULL AND EXTRACT(YEAR FROM refund_at)=$2 AND EXTRACT(MONTH FROM refund_at)=$3
-                ), 0) AS refunds_completed,
-                COALESCE(SUM(total_amount) FILTER (
-                    WHERE refund_status='requested'
-                ), 0) AS refunds_pending
-            FROM bookings
-            WHERE operator_id=$1
-        """, operator_id, year, month)
-
-        top_route = await conn.fetchrow("""
-            SELECT s.route_from, s.route_to, COUNT(*) AS trips
-            FROM bookings b
-            JOIN schedules s ON b.schedule_id=s.id
-            WHERE b.operator_id=$1 AND b.status='confirmed'
-              AND EXTRACT(YEAR  FROM b.travel_date)=$2
-              AND EXTRACT(MONTH FROM b.travel_date)=$3
-            GROUP BY s.route_from, s.route_to
-            ORDER BY trips DESC LIMIT 1
-        """, operator_id, year, month)
-
-        # Rating
-        op_row = await conn.fetchrow(
-            "SELECT average_rating, total_reviews FROM operators WHERE id=$1", operator_id)
-
-    return dict(row), dict(top_route) if top_route else None, dict(op_row) if op_row else {}
-
-async def get_operator(telegram_id: int):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM operators WHERE telegram_id=$1", telegram_id)
-    return dict(row) if row else None
-
-def gen_ref():
-    ts = datetime.now().strftime("%y%m%d")
-    rand = ''.join(random.choices(string.digits, k=4))
-    return f"ST-{ts}-{rand}"
-
-# ── CLOUDINARY ────────────────────────────────────────────────────────────────
-async def upload_image(file_bytes: bytes, folder: str, filename: str) -> str:
-    result = cloudinary.uploader.upload(
-        file_bytes, folder=f"samuga_travels/{folder}",
-        public_id=filename, overwrite=True, resource_type="image")
-    return result["secure_url"]
-
-# ── PDF TICKET ────────────────────────────────────────────────────────────────
-SAMUGA_LOGO_URL = "https://res.cloudinary.com/dfhj3clbh/image/upload/samuga_travels/logos/logo_{user_id}"
-
-async def generate_ticket_pdf(booking: dict, operator: dict, schedule: dict) -> bytes:
-    samuga_logo_url = await get_setting("samuga_logo_url", "")
-    from reportlab.platypus import HRFlowable, KeepTogether
-    from reportlab.lib.colors import HexColor
-    from reportlab.pdfgen import canvas as rl_canvas
-
-    buf = io.BytesIO()
-
-    # Color palette — Samuga Travels ocean theme
-    ST_NAVY   = HexColor('#0D2137')   # deep navy
-    ST_BLUE   = HexColor('#1B6CA8')   # samuga blue
-    ST_LIGHT  = HexColor('#E8F4FD')   # very light blue bg
-    ST_ACCENT = HexColor('#00B4D8')   # bright accent
-    ST_WHITE  = HexColor('#FFFFFF')
-    ST_GRAY   = HexColor('#F5F8FA')
-    ST_TEXT   = HexColor('#1A2733')
-    ST_MUTED  = HexColor('#6B8A9E')
-
-    doc = SimpleDocTemplate(buf, pagesize=A4,
-                            rightMargin=15*mm, leftMargin=15*mm,
-                            topMargin=15*mm, bottomMargin=15*mm)
-    styles = getSampleStyleSheet()
-    story = []
-
-    # ── HEADER BAND ──────────────────────────────────────────────────────────
-    from reportlab.platypus import KeepInFrame
-
-    # Samuga Travels logo top-left — fixed width, maintain aspect ratio, no squeeze
-    st_logo_img = None
-    if samuga_logo_url:
-        try:
-            resp = requests.get(samuga_logo_url, timeout=5)
-            img_data = io.BytesIO(resp.content)
-            # Get natural size to preserve aspect ratio
-            from PIL import Image as PILImage
-            pil_img = PILImage.open(io.BytesIO(resp.content))
-            nat_w, nat_h = pil_img.size
-            logo_w = 45*mm
-            logo_h = logo_w * nat_h / nat_w
-            if logo_h > 18*mm:  # cap height
-                logo_h = 18*mm
-                logo_w = logo_h * nat_w / nat_h
-            img_data.seek(0)
-            st_logo_img = RLImage(img_data, width=logo_w, height=logo_h)
-            st_logo_img.hAlign = 'LEFT'
-        except: pass
-
-    # Operator logo top-right
-    op_logo_img = None
-    if operator.get("logo_url"):
-        try:
-            resp_op = requests.get(operator["logo_url"], timeout=5)
-            op_pil = __import__('PIL').Image.open(io.BytesIO(resp_op.content))
-            ow, oh = op_pil.size
-            ol_h = 24*mm
-            ol_w = ol_h * ow / oh
-            if ol_w > 30*mm:
-                ol_w = 30*mm
-                ol_h = ol_w * oh / ow
-            op_logo_img = RLImage(io.BytesIO(resp_op.content), width=ol_w, height=ol_h)
-            op_logo_img.hAlign = 'RIGHT'
-        except: pass
-
-    # Build header cells properly — no nested lists to prevent squeezing
-    from reportlab.platypus import KeepInFrame
-    left_cell_items  = ([st_logo_img] if st_logo_img else
-                        [Paragraph('<font color="#1B6CA8"><b>Samuga Travels</b></font>',
-                         ParagraphStyle('stfb', fontName='Helvetica-Bold', fontSize=11))])
-    right_cell_items = []
-    if op_logo_img:
-        right_cell_items.append(op_logo_img)
-    right_cell_items.append(Paragraph(
-        f'<font color="#0D2137"><b>{operator.get("business_name","")}</b></font>',
-        ParagraphStyle('opn2', fontName='Helvetica-Bold', fontSize=11, alignment=2)))
-    right_cell_items.append(Paragraph(
-        f'<font color="#6B8A9E" size="8">{operator.get("owner_contact","")}</font>',
-        ParagraphStyle('opc2', fontName='Helvetica', fontSize=8, alignment=2)))
-
-    header_table = Table([
-        [KeepInFrame(85*mm, 25*mm, left_cell_items, hAlign='LEFT'),
-         KeepInFrame(85*mm, 25*mm, right_cell_items, hAlign='RIGHT')]
-    ], colWidths=[90*mm, 85*mm])
-    header_table.setStyle(TableStyle([
-        ('VALIGN',      (0,0), (-1,-1), 'MIDDLE'),
-        ('ALIGN',       (0,0), (0,0),   'LEFT'),
-        ('ALIGN',       (1,0), (1,0),   'RIGHT'),
-        ('LEFTPADDING', (0,0), (-1,-1), 0),
-        ('RIGHTPADDING',(0,0), (-1,-1), 0),
-        ('TOPPADDING',  (0,0), (-1,-1), 2),
-        ('BOTTOMPADDING',(0,0),(-1,-1), 2),
-    ]))
-    story.append(header_table)
-    story.append(HRFlowable(width="100%", thickness=2, color=ST_ACCENT, spaceAfter=4*mm))
-
-    # ── TICKET TITLE BAND ────────────────────────────────────────────────────
-    title_data = [["  BOARDING TICKET  ·  " + booking["booking_ref"]]]
-    title_t = Table(title_data, colWidths=[175*mm])
-    title_t.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,-1), ST_NAVY),
-        ('TEXTCOLOR', (0,0), (-1,-1), ST_WHITE),
-        ('FONTNAME', (0,0), (-1,-1), 'Helvetica-Bold'),
-        ('FONTSIZE', (0,0), (-1,-1), 13),
-        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-        ('PADDING', (0,0), (-1,-1), 8),
-        ('TOPPADDING', (0,0), (-1,-1), 6),
-    ]))
-    story.append(title_t)
-    story.append(Spacer(1, 4*mm))
-
-    # ── JOURNEY DETAILS ──────────────────────────────────────────────────────
-    route_str = f"{schedule.get('route_from','')} → {schedule.get('route_to','')}"
-    travel_date = str(booking.get("travel_date",""))
-    dep_time = schedule.get("departure_time","")
-    location = schedule.get("location","Jetty No. 1, Male")
-    boat_name = operator.get("boat_name","N/A")
-
-    # Two-column journey card
-    lbl = ParagraphStyle('lbl', fontName='Helvetica-Bold', fontSize=8, textColor=ST_MUTED)
-    val = ParagraphStyle('val', fontName='Helvetica-Bold', fontSize=11, textColor=ST_TEXT)
-    val_sm = ParagraphStyle('vsm', fontName='Helvetica', fontSize=10, textColor=ST_TEXT)
-
-    journey_data = [
-        [Paragraph("ROUTE", lbl), Paragraph("DATE", lbl),
-         Paragraph("DEPARTURE", lbl), Paragraph("LOCATION", lbl)],
-        [Paragraph(route_str, val), Paragraph(travel_date, val),
-         Paragraph(dep_time, val), Paragraph(location, val_sm)],
-    ]
-    journey_t = Table(journey_data, colWidths=[52*mm, 38*mm, 35*mm, 50*mm])
-    journey_t.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,-1), ST_LIGHT),
-        ('ROWBACKGROUNDS', (0,0), (-1,-1), [ST_GRAY, ST_WHITE]),
-        ('BOX', (0,0), (-1,-1), 1, ST_ACCENT),
-        ('LINEABOVE', (0,1), (-1,1), 1, ST_ACCENT),
-        ('PADDING', (0,0), (-1,-1), 8),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-    ]))
-    story.append(journey_t)
-    story.append(Spacer(1, 3*mm))
-
-    # ── BOAT + PAYMENT ROW ───────────────────────────────────────────────────
-    boat_payment_data = [
-        [Paragraph("VESSEL", lbl), Paragraph("PASSENGERS", lbl), Paragraph("TOTAL PAID", lbl)],
-        [Paragraph(f"🚤 {boat_name}", val_sm),
-         Paragraph(str(booking.get("passenger_count",0)), val),
-         Paragraph(f"MVR {booking.get('total_amount','0')}", val)],
-    ]
-    bp_t = Table(boat_payment_data, colWidths=[65*mm, 50*mm, 60*mm])
-    bp_t.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), ST_BLUE),
-        ('TEXTCOLOR', (0,0), (-1,0), ST_WHITE),
-        ('BACKGROUND', (0,1), (-1,1), ST_WHITE),
-        ('BOX', (0,0), (-1,-1), 1, ST_BLUE),
-        ('PADDING', (0,0), (-1,-1), 8),
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-    ]))
-    story.append(bp_t)
-    story.append(Spacer(1, 4*mm))
-
-    # ── PASSENGER TABLE ──────────────────────────────────────────────────────
-    passengers = booking.get("passengers", [])
-    if isinstance(passengers, str):
-        try: passengers = json.loads(passengers)
-        except: passengers = []
-
-    if passengers:
-        story.append(Paragraph("PASSENGER MANIFEST",
-            ParagraphStyle('pmt', fontName='Helvetica-Bold', fontSize=9,
-                           textColor=ST_NAVY, spaceBefore=2, spaceAfter=3)))
-        pax_data = [[
-            Paragraph("#", ParagraphStyle('ph', fontName='Helvetica-Bold', fontSize=8, textColor=ST_WHITE)),
-            Paragraph("FULL NAME", ParagraphStyle('ph', fontName='Helvetica-Bold', fontSize=8, textColor=ST_WHITE)),
-            Paragraph("ID / PASSPORT", ParagraphStyle('ph', fontName='Helvetica-Bold', fontSize=8, textColor=ST_WHITE)),
-        ]]
-        for i, p in enumerate(passengers, 1):
-            row_bg = ST_LIGHT if i % 2 == 0 else ST_WHITE
-            pax_data.append([
-                Paragraph(str(i), ParagraphStyle('pv', fontName='Helvetica-Bold', fontSize=9, textColor=ST_BLUE)),
-                Paragraph(p.get("name",""), ParagraphStyle('pv2', fontName='Helvetica', fontSize=9, textColor=ST_TEXT)),
-                Paragraph(p.get("id_number",""), ParagraphStyle('pv3', fontName='Helvetica', fontSize=9, textColor=ST_TEXT)),
-            ])
-        pax_t = Table(pax_data, colWidths=[12*mm, 95*mm, 68*mm])
-        pax_t.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), ST_NAVY),
-            ('ROWBACKGROUNDS', (0,1), (-1,-1), [ST_WHITE, ST_LIGHT]),
-            ('BOX', (0,0), (-1,-1), 0.5, ST_BLUE),
-            ('INNERGRID', (0,0), (-1,-1), 0.3, HexColor('#D0E8F5')),
-            ('PADDING', (0,0), (-1,-1), 7),
-            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ]))
-        story.append(pax_t)
-        story.append(Spacer(1, 4*mm))
-
-    # ── QR CODE ──────────────────────────────────────────────────────────────
+# ── Buffer / Social ───────────────────────────────────────────────────────────
+def upload_to_imgbb(img_bytes):
+    if not IMGBB_API_KEY: return None
     try:
-        import qrcode as _qr
-        passengers_list = booking.get("passengers", [])
-        if isinstance(passengers_list, str):
-            try: passengers_list = json.loads(passengers_list)
-            except: passengers_list = []
-        pax_names = ", ".join([p.get("name","") for p in passengers_list])
-        # QR encodes a deep-link to verify via bot — staff scan to verify boarding
-        qr_data = f"https://t.me/SamugaTravelsBot?start=verify_{booking['booking_ref']}"
-        qr_img = _qr.make(qr_data)
-        qr_buf = io.BytesIO()
-        qr_img.save(qr_buf, format="PNG")
-        qr_buf.seek(0)
-        qr_rl = RLImage(qr_buf, width=28*mm, height=28*mm)
+        import base64
+        resp=requests.post("https://api.imgbb.com/1/upload",data={"key":IMGBB_API_KEY,"image":base64.b64encode(img_bytes).decode()},timeout=20)
+        if resp.status_code==200:
+            url=resp.json()["data"]["url"]; log.info(f"✅ imgbb: {url[:50]}"); return url
+    except Exception as e: log.error(f"imgbb: {e}")
+    return None
 
-        # QR + footer text side by side
-        qr_lbl = ParagraphStyle('qrl', fontName='Helvetica', fontSize=6.5, textColor=ST_MUTED, alignment=1)
-        contact_text = (
-            f"<b>Operator:</b> {operator.get('owner_contact','N/A')} &nbsp;|&nbsp; "
-            f"<b>Business:</b> {operator.get('business_name','')} &nbsp;|&nbsp; "
-            f"<b>Questions?</b> Contact your operator or Samuga Travels"
-        )
-        footer_left = [
-            Paragraph(contact_text,
-                ParagraphStyle('ctq', fontName='Helvetica', fontSize=7.5,
-                               textColor=ST_MUTED, spaceAfter=3)),
-            Paragraph(
-                "■ <b>Present this ticket when boarding.</b> This is an official Samuga Travels booking ticket.",
-                ParagraphStyle('f1q', fontName='Helvetica', fontSize=7.5,
-                               textColor=ST_TEXT, spaceAfter=2)),
-            Paragraph(
-                f"<font color='#1B6CA8'><b>Samuga Travels</b></font> · Maldives · "
-                f"Issued {datetime.now().strftime('%d %b %Y %H:%M')} MVT",
-                ParagraphStyle('f2q', fontName='Helvetica', fontSize=7,
-                               textColor=ST_MUTED)),
-        ]
-        footer_right = [
-            qr_rl,
-            Paragraph("Scan to verify", qr_lbl),
-        ]
-        story.append(HRFlowable(width="100%", thickness=1, color=ST_ACCENT, spaceBefore=2, spaceAfter=3*mm))
-        footer_table = Table([[footer_left, footer_right]], colWidths=[140*mm, 35*mm])
-        footer_table.setStyle(TableStyle([
-            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-            ('ALIGN',  (1,0), (1,0),   'CENTER'),
-            ('LEFTPADDING',  (0,0), (-1,-1), 0),
-            ('RIGHTPADDING', (0,0), (-1,-1), 0),
-        ]))
-        story.append(footer_table)
-    except Exception as _qe:
-        logger.error(f"QR code generation: {_qe}")
-        # Fallback footer without QR
-        story.append(HRFlowable(width="100%", thickness=1, color=ST_ACCENT, spaceBefore=2, spaceAfter=3*mm))
-        story.append(Paragraph(
-            f"<b>Operator Contact:</b> {operator.get('owner_contact','N/A')} | "
-            f"<b>Business:</b> {operator.get('business_name','')}",
-            ParagraphStyle('ctf', fontName='Helvetica', fontSize=8,
-                           textColor=ST_MUTED, alignment=TA_CENTER)))
-        story.append(Paragraph(
-            "■ <b>Present this ticket when boarding.</b> This is an official Samuga Travels booking ticket.",
-            ParagraphStyle('f1f', fontName='Helvetica', fontSize=8,
-                           textColor=ST_TEXT, alignment=TA_CENTER)))
+def resolve_url(url):
+    """Follow redirects to get real URL (fixes Google News RSS links)"""
+    if not url: return url
+    try:
+        if "news.google.com" in url or "feedproxy" in url:
+            r = requests.get(url, allow_redirects=True, timeout=10)
+            log.info(f"🔗 Resolved: {r.url[:80]}")
+            return r.url
+    except Exception as e:
+        log.warning(f"URL resolve failed: {e}")
+    return url
 
-    doc.build(story)
-    return buf.getvalue()
-
-# ── KEYBOARDS ─────────────────────────────────────────────────────────────────
-def main_kb(role="customer"):
-    if role == "operator":
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 My Profile",       callback_data="op_profile"),
-             InlineKeyboardButton("🗓️ Add Schedule",     callback_data="op_schedules")],
-            [InlineKeyboardButton("🚤 My Fleet",         callback_data="op_fleet"),
-             InlineKeyboardButton("📦 Pending Bookings", callback_data="op_bookings")],
-            [InlineKeyboardButton("📅 Today's Schedule", callback_data="op_today"),
-             InlineKeyboardButton("📊 Monthly Report",   callback_data="op_monthly_report")],
-            [InlineKeyboardButton("✏️ Edit Info",        callback_data="op_edit"),
-             InlineKeyboardButton("🤖 Ask SamugaAI",    callback_data="op_ai_chat")],
-        ])
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚢 Book a Trip",            callback_data="cx_search"),
-         InlineKeyboardButton("📋 My Bookings",            callback_data="cx_my_bookings")],
-        [InlineKeyboardButton("🤖 Ask SamugaAI",          callback_data="cx_ai_chat")],
-        [InlineKeyboardButton("🤝 Register as Operator",   callback_data="register_operator")],
-    ])
-
-def boat_type_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⛴️ Ferry Service",  callback_data="type_ferry")],
-        [InlineKeyboardButton("🛥️ Private Hire",   callback_data="type_private")],
-    ])
-
-# ── COMMANDS ──────────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    sd = await get_user_state(user.id)
-    role = sd.get("role","customer")
-    if role == "operator":
-        op = await get_operator(user.id)
-        if op and op.get("status") == "approved":
-            role = "operator"
-        else:
-            role = "customer"
-    await update.message.reply_text(
-        f"🌊 *Welcome to Samuga Travels!*\n\n"
-        f"Hi *{user.first_name}*! Book speedboats across the Maldives — fast, easy, trusted.\n\n"
-        f"Just type your route to get started:\n"
-        f"`Male to Thoddoo` · `Thoddoo to Male` · `Male to Maafushi`\n\n"
-        f"Or tap a button below 👇",
-        parse_mode="Markdown",
-        reply_markup=main_kb(role))
-
-async def cmd_verify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Verify a booking — /verify ST-XXXXXX or via QR deep-link /start verify_ST-XXXXXX"""
-    user = update.effective_user
-    args = ctx.args or []
-    ref = None
-    if args and args[0].startswith("verify_"):
-        ref = args[0].replace("verify_", "").strip().upper()
-    elif args:
-        ref = args[0].strip().upper()
-    if not ref:
-        await update.message.reply_text(
-            "🔍 *Ticket Verification*\n\nUsage: `/verify ST-260629-1234`\n\nOr scan the QR code on the ticket.",
-            parse_mode="Markdown")
-        return
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        bk = await conn.fetchrow("""
-            SELECT b.*, o.business_name, o.owner_contact,
-                   s.route_from, s.route_to, s.departure_time
-            FROM bookings b
-            JOIN operators o ON b.operator_id=o.id
-            JOIN schedules s ON b.schedule_id=s.id
-            WHERE b.booking_ref=$1
-        """, ref)
-    if not bk:
-        await update.message.reply_text(
-            f"❌ *Booking Not Found*\n\n`{ref}` does not exist.\n\nCheck the reference and try again.",
-            parse_mode="Markdown")
-        return
-    passengers = bk["passengers"] or "[]"
-    if isinstance(passengers, str):
-        try: passengers = __import__("json").loads(passengers)
-        except: passengers = []
-    status_icons = {"confirmed":"✅","pending_confirmation":"⏳","pending_payment":"💳","cancelled":"❌"}
-    icon = status_icons.get(bk["status"],"❓")
-    boarded = bk.get("boarded_at")
-    pax_list = "\n".join([f"  {i+1}. {p.get('name','')} ({p.get('id_number','')})"
-                           for i,p in enumerate(passengers)])
-    msg = (
-        f"{icon} *Ticket Verification*\n\n"
-        f"📋 Ref: `{bk['booking_ref']}`\n"
-        f"📊 Status: *{bk['status'].upper().replace('_',' ')}*\n"
-        f"🚤 {bk['business_name']}\n"
-        f"📍 {bk['route_from']} → {bk['route_to']}\n"
-        f"📅 {bk['travel_date']} @ {bk['departure_time']}\n"
-        f"👥 Passengers:\n{pax_list}\n"
-        f"💰 MVR {bk['total_amount']}\n"
-    )
-    if boarded:
-        msg += f"\n🛳️ *Already boarded at {str(boarded)[:16]}* — ticket used."
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    elif bk["status"] == "confirmed":
-        msg += "\n✅ *Valid — not yet boarded.*"
-        op = await get_operator(user.id)
-        kb = None
-        if user.id in SUPER_ADMINS or (op and op.get("id") == bk["operator_id"]):
-            date_token = bk["travel_date"].strftime("%Y%m%d") if hasattr(bk["travel_date"], "strftime") else str(bk["travel_date"]).replace("-", "")
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🛳️ Mark as Boarded", callback_data=f"mark_boarded_{bk['id']}")],
-                [InlineKeyboardButton("👥 Open Boarding Manifest", callback_data=f"op_manifest_{bk['schedule_id']}_{date_token}")]
-            ])
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
-    else:
-        msg += f"\n⚠️ Status is *{bk['status']}* — not yet confirmed."
-        await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    sd = await get_user_state(user.id)
-    role = sd.get("role","customer")
-    await set_user_state(user.id, CX_IDLE if role != "operator" else OP_IDLE, {})
-    await update.message.reply_text("❌ Cancelled. Back to main menu.", reply_markup=main_kb(role))
-
-async def cmd_register(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await start_op_reg(update, ctx)
-
-async def cmd_recommend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    args = ctx.args
-    if len(args) < 2:
-        await update.message.reply_text("Usage: /recommend <telegram_id> <review text>")
-        return
-    op_tid = int(args[0])
-    review_text = " ".join(args[1:])
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "UPDATE operators SET is_recommended=TRUE, review_text=$1 WHERE telegram_id=$2 RETURNING business_name, id",
-            review_text, op_tid)
-    if row:
-        await update.message.reply_text(f"✅ *{row['business_name']}* is now Recommended!", parse_mode="Markdown")
-        await ctx.bot.send_message(op_tid,
-            f"🌟 *Congratulations!*\n\nYour business has been marked *Recommended by Samuga Travels!*\n\n💬 _{review_text}_",
-            parse_mode="Markdown")
-
-# ── ADMIN COMMANDS ────────────────────────────────────────────────────────────
-def is_admin(user_id: int, chat_id: int) -> bool:
-    return user_id in SUPER_ADMINS or chat_id == ADMIN_GROUP_ID
-
-async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Main admin dashboard — /admin"""
-    user = update.effective_user
-    if not is_admin(user.id, update.effective_chat.id):
-        await update.message.reply_text("⛔ Admin only.")
-        return
-
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        total_ops     = await conn.fetchval("SELECT COUNT(*) FROM operators WHERE status='approved'")
-        pending_ops   = await conn.fetchval("SELECT COUNT(*) FROM operators WHERE status='pending'")
-        total_bookings= await conn.fetchval("SELECT COUNT(*) FROM bookings")
-        confirmed_bk  = await conn.fetchval("SELECT COUNT(*) FROM bookings WHERE status='confirmed'")
-        total_revenue = await conn.fetchval("SELECT COALESCE(SUM(total_amount),0) FROM bookings WHERE status='confirmed'")
-        total_customers = await conn.fetchval("SELECT COUNT(DISTINCT customer_telegram_id) FROM bookings")
-
-    samuga_logo = await get_setting("samuga_logo_url", "")
-
-    msg = (
-        f"🛠️ *Samuga Travels — Admin Panel*\n\n"
-        f"📊 *Platform Stats:*\n"
-        f"  ✅ Approved Operators: *{total_ops}*\n"
-        f"  ⏳ Pending Review: *{pending_ops}*\n"
-        f"  🎫 Total Bookings: *{total_bookings}* ({confirmed_bk} confirmed)\n"
-        f"  👥 Unique Customers: *{total_customers}*\n"
-        f"  💰 Total Revenue: *MVR {total_revenue:.2f}*\n\n"
-        f"🖼️ Samuga Logo: {'✅ Set' if samuga_logo else '❌ Not set'}\n\n"
-        f"Choose an action below:"
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 Manage Operators",    callback_data="adm_operators"),
-         InlineKeyboardButton("📦 All Bookings",        callback_data="adm_bookings")],
-        [InlineKeyboardButton("📢 Broadcast Message",  callback_data="adm_broadcast"),
-         InlineKeyboardButton("📊 Revenue Report",     callback_data="adm_revenue")],
-        [InlineKeyboardButton("📡 Daily Control Room",  callback_data="adm_control_room")],
-        [InlineKeyboardButton("🖼️ Upload Samuga Logo", callback_data="adm_upload_logo"),
-         InlineKeyboardButton("⚙️ Settings",           callback_data="adm_settings")],
-        [InlineKeyboardButton("🔍 Find Customer",      callback_data="adm_find_customer"),
-         InlineKeyboardButton("🚤 All Schedules",      callback_data="adm_schedules")],
-    ])
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
-
-async def admin_check(query, ctx) -> bool:
-    """Check admin access for callbacks"""
-    user = query.from_user
-    if not is_admin(user.id, query.message.chat.id):
-        await query.answer("⛔ Admin only.", show_alert=True)
+def post_to_buffer(image_url, caption, channel_id, metadata=None):
+    """Post to a single Buffer channel. Returns True on success."""
+    if social_paused():
+        log.warning(f"🛑 Buffer post blocked — {_posting_block_reason()}")
         return False
+    if not BUFFER_TOKEN or not channel_id: return False
+    clean = re.sub(r'<[^>]+>', '', caption)
+    clean = clean.replace('&amp;', '&').replace('&#039;', "'").replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>').strip()
+    if not public_text_is_safe(clean):
+        log.error(f"🚫 Buffer blocked unsafe caption: {clean[:120]}")
+        return False
+
+    query = """
+mutation CreatePost($input: CreatePostInput!) {
+  createPost(input: $input) {
+    ... on PostActionSuccess { post { id text } }
+    ... on MutationError { message }
+  }
+}"""
+
+    post_input = {
+        "text": clean,
+        "channelId": channel_id,
+        "schedulingType": "automatic",
+        "mode": "shareNow",
+        "assets": [{"image": {"url": image_url}}],
+    }
+    if metadata:
+        post_input["metadata"] = metadata
+
+    try:
+        resp = requests.post(
+            "https://api.buffer.com",
+            json={"query": query, "variables": {"input": post_input}},
+            headers={"Authorization": f"Bearer {BUFFER_TOKEN}", "Content-Type": "application/json"},
+            timeout=20
+        )
+        log.info(f"Buffer raw [{channel_id[:8]}]: {resp.status_code} | {resp.text[:400]}")
+        _last_buffer_error["response"] = f"HTTP {resp.status_code}: {resp.text[:300]}"
+        if resp.status_code == 200:
+            data = resp.json()
+            if "errors" in data:
+                log.error(f"Buffer GraphQL error [{channel_id[:8]}]: {data['errors']}")
+                return False
+            result = data.get("data", {}).get("createPost", {})
+            err_msg = result.get("message", "")
+            if err_msg:
+                log.error(f"Buffer mutation error [{channel_id[:8]}]: {err_msg}")
+                return False
+            post_id = result.get("post", {}).get("id", "?")
+            log.info(f"✅ Buffer posted [{channel_id[:8]}] id={post_id}")
+            return True
+        else:
+            log.error(f"Buffer HTTP {resp.status_code}: {resp.text[:300]}")
+    except Exception as e:
+        log.error(f"Buffer exception [{channel_id[:8]}]: {e}")
+    return False
+
+# ── Social posting queue — 10 minute gap between posts ───────────────────────
+# Prevents flooding FB/IG/X when multiple cards are approved at once.
+# Each item: {"img_bytes": bytes, "caption": str, "queued_at": datetime}
+_social_queue = []
+_social_queue_lock = threading.Lock()
+_last_social_post_time = None
+SOCIAL_GAP_SECONDS = 600  # 10 minutes
+
+# Personality messages for queue notifications
+QUEUE_PERSONALITY = [
+    "yea yea it's in the queue. 😮‍💨",
+    "queued. The algorithm likes it spaced out. Unlike Uly's approvals. 😅",
+    "in the queue. Good things take time. 🕐",
+    "queued. You're too bossy today, I need my 10 minutes. 😤",
+    "in the queue. Quality over quantity. 💅",
+    "queued. I'm tired, not lazy. There's a difference. 😴",
+    "queued. Back-to-back posting is so 2022. ⏳",
+    "in the queue. The platforms will thank us. 🙏",
+    "queued. I'm pacing myself unlike some people in this group. 👀",
+    "yea yea, added to queue. I only have two hands. Metaphorically. 🤲",
+]
+
+def _get_queue_msg():
+    import random
+    return random.choice(QUEUE_PERSONALITY)
+
+def _calc_eta_seconds():
+    """How many seconds until the next social post can go out."""
+    if _last_social_post_time is None:
+        return 0
+    elapsed = (utcnow() - _last_social_post_time).total_seconds()
+    return max(0, SOCIAL_GAP_SECONDS - elapsed)
+
+def _social_queue_worker():
+    """
+    Background thread — drains one post every 10 minutes.
+    Each item posts to Telegram community + FB + IG + X in sequence.
+    BREAKING news bypasses this queue entirely and posts immediately.
+    """
+    global _last_social_post_time
+    while True:
+        time.sleep(15)
+        try:
+            with _social_queue_lock:
+                if not _social_queue:
+                    continue
+                now = utcnow()
+                if (_last_social_post_time and
+                        (now - _last_social_post_time).total_seconds() < SOCIAL_GAP_SECONDS):
+                    continue
+                item = _social_queue.pop(0)
+
+            if posting_paused():
+                log.warning("🛑 Social queue holding because POSTING_PAUSED=true")
+                with _social_queue_lock:
+                    _social_queue.insert(0, item)
+                time.sleep(60)
+                continue
+
+            combined_public_text = f"{item.get('title','')}\n{item.get('summary','')}\n{item.get('caption','')}"
+            if not public_text_is_safe(combined_public_text):
+                log.error(f"🚫 Social queue dropped unsafe post: {item.get('key_label','Post')} — {str(item.get('title',''))[:80]}")
+                notify_cid = item.get("notify_chat_id")
+                notify_tid = item.get("notify_thread_id")
+                if notify_cid:
+                    send_text(notify_cid, "🚫 Post blocked by placeholder safety gate before publishing.", thread_id=notify_tid)
+                continue
+
+            _last_social_post_time = utcnow()
+            remaining = len(_social_queue)
+            key_label  = item.get("key_label", "Post")
+            notify_cid = item.get("notify_chat_id")
+            notify_tid = item.get("notify_thread_id")
+            log.info(f"[QUEUE] Posting {key_label} (Telegram + FB+IG+X) — {remaining} remaining")
+
+            # 1. Post to Telegram community (respects daily cap + 2hr gap for regular posts)
+            tg_ok = False
+            if item.get("post_telegram", True):
+                is_breaking_item = item.get("is_breaking", False)
+                if is_breaking_item or can_post_regular():
+                    try:
+                        buf = io.BytesIO(item["img_bytes"])
+                        tg_ok = bool(send_to_telegram(buf, item["caption"]))
+                        if tg_ok and not is_breaking_item:
+                            global last_regular_post_time
+                            last_regular_post_time = utcnow()
+                            persist_state()
+                        log.info(f"[QUEUE] Telegram: {'✅' if tg_ok else '❌'}")
+                        if tg_ok and item.get("article_id"):
+                            try:
+                                if item.get("lang","en") != "dv" or should_publish_dhivehi_to_website(item, approved=True):
+                                    db_publish_article_for_website(
+                                        article_id=item.get("article_id"),
+                                        title=item.get("title",""),
+                                        summary=item.get("summary",""),
+                                        category=item.get("cat","LOCAL"),
+                                        source=item.get("source","Samuga Media"),
+                                        link=item.get("link",""),
+                                        lang=item.get("lang","en"),
+                                        is_breaking=item.get("is_breaking", False)
+                                    )
+                                else:
+                                    log.info(f"🌐 Dhivehi website sync skipped (approval-only policy): {item.get('title','')[:70]}")
+                                if isinstance(tg_ok, int):
+                                    db_set_article_message(item.get("article_id"), tg_ok)
+                                if item.get("title"):
+                                    remember_post(item.get("title"), item.get("cat","LOCAL"),
+                                                  (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M"),
+                                                  item.get("is_breaking", False))
+                            except Exception as e:
+                                log.error(f"[WEBSITE] queue publish sync failed: {e}")
+                    except Exception as e:
+                        log.error(f"[QUEUE] Telegram: {e}")
+                else:
+                    log.info("[QUEUE] Telegram skipped — daily cap or 2hr gap not met")
+                    # Re-queue for later unless it's been waiting too long
+                    age_mins = (utcnow() - item.get("queued_at", utcnow())).total_seconds() / 60
+                    if age_mins < 180:  # give up after 3 hours
+                        with _social_queue_lock:
+                            _social_queue.insert(0, item)  # put back at front
+                        time.sleep(60)  # wait a minute before re-checking
+                        continue
+            else:
+                tg_ok = item.get("tg_ok", False)
+
+            # 2. Post to FB + IG + X
+            results = _post_to_social_now(
+                io.BytesIO(item["img_bytes"]), item["caption"])
+
+            # 3. Send per-platform confirmation
+            tg_icon = "✅" if tg_ok else "❌"
+            fb_icon = "✅" if results.get("Facebook")  else "❌"
+            ig_icon = "✅" if results.get("Instagram") else "❌"
+            x_icon  = "✅" if results.get("Twitter")   else "❌"
+            conf_msg = (f"📤 <b>{key_label}</b> posted\n"
+                        f"Telegram {tg_icon} · FB {fb_icon} · IG {ig_icon} · X {x_icon}")
+            if notify_cid:
+                send_text(notify_cid, conf_msg, thread_id=notify_tid)
+            else:
+                # Auto-post — send to Content Lab so team knows what went out
+                send_text(CORE_TEAM_CHAT_ID, conf_msg, thread_id=CONTENT_LAB_THREAD_ID)
+            try: persist_state()
+            except Exception: pass
+        except Exception as e:
+            log.error(f"[QUEUE] Worker error: {e}")
+
+def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=None,
+                     key_label="Post", tg_ok=True, post_telegram=False,
+                     article_id=None, title="", summary="", cat="LOCAL",
+                     source="Samuga Media", link="", lang="en", is_breaking=False):
+    """
+    Add a card to the 10-minute publish queue.
+    post_telegram=True  → queue will post to Telegram community too (standard flow)
+    post_telegram=False → Telegram was already posted separately (breaking news)
+
+    Website sync fix:
+    If article_id/title are passed, the article is marked as posted for /api/stories
+    immediately when it enters the public publishing queue.
+    """
+    img_bytes = img_buf.getvalue() if hasattr(img_buf, "getvalue") else img_buf
+    if posting_paused():
+        log.warning("🛑 Public queue refused post — POSTING_PAUSED=true")
+        if notify_chat_id:
+            send_text(notify_chat_id, "🛑 Public posting is paused (POSTING_PAUSED=true). Post was not queued.", thread_id=notify_thread_id)
+        return False
+
+    combined_public_text = f"{title}\n{summary}\n{caption}"
+    if not public_text_is_safe(combined_public_text):
+        log.error(f"🚫 Social queue refused unsafe post: {str(title)[:90]}")
+        if notify_chat_id:
+            send_text(notify_chat_id, "🚫 Post blocked by placeholder safety gate. It was not queued.", thread_id=notify_thread_id)
+        return False
+
+    if article_id and (lang != "dv"):
+        try:
+            db_publish_article_for_website(
+                article_id=article_id, title=title, summary=summary, category=cat,
+                source=SAMUGA_PUBLIC_SOURCE, link=SAMUGA_PUBLIC_LINK, lang=lang, is_breaking=is_breaking
+            )
+        except Exception as e:
+            log.error(f"[WEBSITE] publish sync before queue failed: {e}")
+
+    with _social_queue_lock:
+        _social_queue.append({
+            "img_bytes":        img_bytes,
+            "caption":          caption,
+            "queued_at":        utcnow(),
+            "notify_chat_id":   notify_chat_id,
+            "notify_thread_id": notify_thread_id,
+            "key_label":        key_label,
+            "tg_ok":            tg_ok,
+            "post_telegram":    post_telegram,
+            "article_id":       article_id,
+            "title":            title,
+            "summary":          summary,
+            "cat":              cat,
+            "source":           source,
+            "link":             link,
+            "lang":             lang,
+            "is_breaking":      is_breaking,
+        })
+        queue_pos = len(_social_queue)
+
+    # Calculate real ETA
+    eta_secs = _calc_eta_seconds() + (queue_pos - 1) * SOCIAL_GAP_SECONDS
+    eta_min  = max(1, round(eta_secs / 60))
+
+    if notify_chat_id:
+        if eta_secs <= 30:
+            msg = f"📲 {key_label} — {_get_queue_msg()} Posts right away."
+        else:
+            msg = f"📲 {key_label} — {_get_queue_msg()} Posts in ~{eta_min} min."
+        send_text(notify_chat_id, msg, thread_id=notify_thread_id)
+
+    log.info(f"[SOCIAL] Queued pos #{queue_pos}, ETA ~{eta_min}m")
+    try: persist_state()
+    except Exception: pass
+
+# Keep old name as the "post now" internal function
+def _post_to_social_now(img_buf, caption):
+    if social_paused():
+        log.warning(f"🛑 Social post blocked — {_posting_block_reason()}")
+        return {"Facebook": False, "Instagram": False, "Twitter": False}
+    """
+    Post to all social platforms via Buffer (FB + IG + X), with the card image.
+
+    REVERTED TO BUFFER: previously this used the Meta Graph API for FB/IG, which
+    hit a #200 permissions error. Buffer was working perfectly before, so all
+    three platforms now go through Buffer's GraphQL API (image hosted via imgbb).
+    Returns the same {"Facebook","Instagram","Twitter"} dict the queue expects.
+    """
+    results = {"Facebook": False, "Instagram": False, "Twitter": False}
+    if not BUFFER_TOKEN:
+        log.warning("[SOCIAL] no BUFFER_TOKEN, skipping")
+        return results
+    if not can_post_social():
+        log.info("[SOCIAL] Daily limit reached — skipping")
+        return results
+
+    try:
+        img_bytes = img_buf.getvalue() if hasattr(img_buf, "getvalue") else img_buf
+        image_url = upload_to_imgbb(img_bytes)
+        if not image_url:
+            log.error("[SOCIAL] imgbb upload failed, skipping")
+            return results
+
+        # Strip HTML for all social platforms
+        clean = re.sub(r'<[^>]+>', '', caption)
+        clean = clean.replace('&amp;', '&').replace('&#039;', "'").replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>').strip()
+
+        # Public Samuga posts must never expose original source links.
+        # Send viewers to Samuga Community only.
+        clean = _strip_telegram_metadata(clean)
+        clean = strip_source_links(clean)
+        if not public_text_is_safe(clean):
+            log.error(f"🚫 Social post blocked unsafe caption: {clean[:120]}")
+            return results
+        community_link = SAMUGA_CAPTION_LINK
+
+        # FB/IG: full text + Samuga community link only
+        fb_ig = clean
+        if community_link and community_link not in fb_ig:
+            fb_ig = fb_ig + "\n\n" + community_link
+        fb_ig = fb_ig[:2200]
+
+        # Twitter/X: first line + Samuga community link only
+        lines = [l.strip() for l in clean.split('\n') if l.strip()]
+        tw = (lines[0] if lines else clean)[:220]
+        if community_link:
+            tw = tw + "\n\n" + community_link
+        tw = tw[:280]
+
+        for cid, cap, name, meta in [
+            (BUFFER_FB_ID, fb_ig, "Facebook",  {"facebook":  {"type": "post"}}),
+            (BUFFER_IG_ID, fb_ig, "Instagram", {"instagram": {"type": "post", "shouldShareToFeed": True}}),
+            (BUFFER_TW_ID, tw,    "Twitter",   None),
+        ]:
+            if not cid:
+                log.warning(f"[SOCIAL] skipping {name} — no channel ID set")
+                continue
+            results[name] = post_to_buffer(image_url, cap, cid, metadata=meta)
+            time.sleep(2)
+
+        ok_list = [k for k, v in results.items() if v]
+        if ok_list:
+            increment_social_count()
+            track_analytics("SOCIAL", social_ok=True)
+        log.info(f"[SOCIAL] Results: FB={'✅' if results['Facebook'] else '❌'} "
+                 f"IG={'✅' if results['Instagram'] else '❌'} "
+                 f"X={'✅' if results['Twitter'] else '❌'}")
+    except Exception as e:
+        log.error(f"[SOCIAL] _post_to_social_now: {e}")
+    return results
+
+def post_to_social(img_buf, caption):
+    if social_paused():
+        log.warning(f"🛑 Social post blocked — {_posting_block_reason()}")
+        return {"Facebook": False, "Instagram": False, "Twitter": False}
+    if not BUFFER_TOKEN:
+        log.warning("Social: no BUFFER_TOKEN, skipping")
+        return
+    if not can_post_social():
+        limit = 20 if is_day_social() else 3
+        log.info(f"📵 Social limit reached ({30 if is_day_social() else 5} posts {'day' if is_day_social() else 'night'}) — skipping")
+        return
+    try:
+        img_bytes = img_buf.getvalue()
+        image_url = upload_to_imgbb(img_bytes)
+        if not image_url:
+            log.error("Social: imgbb upload failed, skipping")
+            return
+
+        # Strip HTML for all social platforms
+        clean = re.sub(r'<[^>]+>', '', caption)
+        clean = clean.replace('&amp;', '&').replace('&#039;', "'").replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>').strip()
+
+        # Public Samuga posts must never expose original source links.
+        # Send viewers to Samuga Community only.
+        clean = _strip_telegram_metadata(clean)
+        clean = strip_source_links(clean)
+        if not public_text_is_safe(clean):
+            log.error(f"🚫 Social post blocked unsafe caption: {clean[:120]}")
+            return {}
+        community_link = SAMUGA_CAPTION_LINK
+
+        # FB/IG: full text + Samuga community link only
+        fb_ig = clean
+        if community_link and community_link not in fb_ig:
+            fb_ig = fb_ig + "\n\n" + community_link
+        fb_ig = fb_ig[:2200]
+
+        # Twitter/X: first line + Samuga community link only
+        lines = [l.strip() for l in clean.split('\n') if l.strip()]
+        tw = (lines[0] if lines else clean)[:220]
+        if community_link:
+            tw = tw + "\n\n" + community_link
+        tw = tw[:280]
+
+        results = {}
+        for cid, cap, name, meta in [
+            (BUFFER_FB_ID, fb_ig, "Facebook",  {"facebook":  {"type": "post"}}),
+            (BUFFER_IG_ID, fb_ig, "Instagram", {"instagram": {"type": "post", "shouldShareToFeed": True}}),
+            (BUFFER_TW_ID, tw,    "Twitter",   None),
+        ]:
+            if not cid:
+                log.warning(f"Social: skipping {name} — no channel ID set")
+                continue
+            results[name] = post_to_buffer(image_url, cap, cid, metadata=meta)
+            time.sleep(2)
+
+        ok = [k for k, v in results.items() if v]
+        fail = [k for k, v in results.items() if not v]
+        if ok:
+            log.info(f"✅ Social posted to: {', '.join(ok)}")
+            increment_social_count()
+            track_analytics("SOCIAL", social_ok=True)
+        if fail:
+            log.error(f"❌ Social failed for: {', '.join(fail)}")
+        return results  # Return per-platform results so callers can report back
+    except Exception as e:
+        log.error(f"Social: {e}")
+
+# ── Post Article ──────────────────────────────────────────────────────────────
+def _build_card_and_caption(article):
+    """Build the card image + caption for an article. Returns (card_bytes, caption, rewritten, keyword)."""
+    raw_cat = article["cat"]
+    breaking = is_breaking(article["title"], article["summary"], raw_cat)
+    # Resolve to one of the 5 display categories. Breaking overrides everything.
+    if breaking:
+        display_cat = "BREAKING"
+    else:
+        display_cat = canonical_category(raw_cat, article["title"], article.get("summary",""))
+    rewritten, keyword = rewrite_news(_strip_telegram_metadata(article["title"]), _strip_telegram_metadata(article["summary"]), raw_cat)
+    if not public_text_is_safe(rewritten):
+        log.warning(f"🚫 Card rewrite unsafe; using fallback for: {article['title'][:80]}")
+        rewritten = fallback_rewritten_news(article.get("title",""), article.get("summary",""))
+    keyword = safe_image_keyword(keyword, cat=raw_cat)
+    bg = fetch_background_image(keyword, cat=display_cat, title=article["title"])
+    ts = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+    card = generate_card(rewritten, SAMUGA_PUBLIC_SOURCE, ts, display_cat, bg)
+    card_bytes = card.getvalue()
+
+    cat_emoji = {"BREAKING":"🚨","LOCAL":"🇲🇻","POLITICAL":"🏛️","LIFESTYLE":"🌴","SPORTS":"🏅"}.get(display_cat,"📰")
+    breaking_tag = "🚨 <b>BREAKING NEWS</b>\n\n" if breaking else ""
+
+    # Clustering boosts a story's importance internally (more outlets covering it
+    # = bigger story = higher score), but we NEVER credit competitors on the card.
+    # Samuga sees everything, merges it, rewrites it, and posts it as its own.
+    caption = (f"{breaking_tag}{cat_emoji} <b>{article['title']}</b>\n\n"
+               f"{rewritten}\n\n"
+               f"📡 <b>Samuga Media</b> | @samugacommunity")
+    return card_bytes, caption, rewritten, keyword
+
+
+def _publish_now(card_bytes, caption, cat, title, link, is_breaking_flag, allow_social,
+                 rewritten="", summary="", report_to=None, article_id=None):
+    """
+    Post a card to Telegram + socials. Returns (tg_ok, social_results).
+    report_to: optional (chat_id, thread_id) to send a per-platform status report.
+    article_id: if given, the Telegram message_id is stored for later view tracking.
+    """
+    global last_regular_post_time
+    if posting_paused():
+        log.warning(f"🛑 Publish blocked — POSTING_PAUSED=true: {str(title)[:80]}")
+        if report_to:
+            rchat, rthread = report_to
+            send_text(rchat, "🛑 Public posting is paused (POSTING_PAUSED=true). It was not published.", thread_id=rthread)
+        return False, {}
+    buf = io.BytesIO(card_bytes)
+    ts = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+    social_results = {}
+
+    log.info(f"📰 [{'🔴BREAKING' if is_breaking_flag else '🟡REGULAR'}][{cat}] {title[:60]}...")
+    combined_public_text = f"{title}\n{summary}\n{rewritten}\n{caption}"
+    if not public_text_is_safe(combined_public_text):
+        log.error(f"🚫 Publish blocked unsafe public text: {str(title)[:90]}")
+        if report_to:
+            rchat, rthread = report_to
+            send_text(rchat, "🚫 Post blocked by placeholder safety gate. It was not published.", thread_id=rthread)
+        return False, {}
+    buf.seek(0)
+    tg_ok = send_to_telegram(buf, caption)
+
+    if tg_ok:
+        remember_post(title, cat, ts)
+        if article_id:
+            _lang_for_web = ("dv" if is_dhivehi(title + " " + summary) else "en")
+            if _lang_for_web != "dv" or should_publish_dhivehi_to_website(None, approved=True):
+                db_publish_article_for_website(
+                    article_id=article_id, title=title, summary=summary, category=cat,
+                    source=SAMUGA_PUBLIC_SOURCE, link=SAMUGA_PUBLIC_LINK, lang=_lang_for_web,
+                    is_breaking=is_breaking_flag
+                )
+            else:
+                log.info(f"🌐 Dhivehi website publish skipped (approval-only policy): {str(title)[:70]}")
+        if isinstance(tg_ok, int) and article_id:        # Phase 2: store msg id
+            db_set_article_message(article_id, tg_ok)
+        if article_id:                                    # Phase 2.5: store match key for FB/IG
+            db_set_article_matchkey(article_id, title)
+        if not is_breaking_flag:
+            last_regular_post_time = utcnow()
+            persist_state()
+            log.info("🕐 Regular timer reset — next Telegram post in 90min")
+        else:
+            log.info("🔴 Breaking posted!")
+
+    # Social posting — ONLY breaking bypasses the queue
+    if allow_social:
+        social_buf = io.BytesIO(card_bytes)
+        if is_breaking_flag:
+            # BREAKING — blast everywhere immediately, no queue
+            log.info("🔴 Breaking — posting to FB+IG+X immediately (no queue)")
+            social_results = post_to_social(social_buf, caption) or {}
+        else:
+            # Regular — queue handles it. DO NOT call post_to_social here.
+            # The caller (approval handler or auto-expiry) is responsible for queuing.
+            # _publish_now only handles Telegram for non-breaking.
+            pass
+
+    # Poll
+    if tg_ok and should_create_poll(title, summary, cat):
+        log.info("🗳️ Generating poll...")
+        question, options = generate_poll_question(title, rewritten or title)
+        if question and options:
+            time.sleep(3)
+            send_poll(question, options)
+            increment_poll_count()
+
+    # Report per-platform status back to Content Lab
+    if report_to:
+        rchat, rthread = report_to
+        tg_icon  = "✅" if tg_ok else "❌"
+        fb_icon  = "✅" if social_results.get("Facebook")  else ("❌" if "Facebook"  in social_results else "⏭️")
+        ig_icon  = "✅" if social_results.get("Instagram") else ("❌" if "Instagram" in social_results else "⏭️")
+        tw_icon  = "✅" if social_results.get("Twitter")   else ("❌" if "Twitter"   in social_results else "⏭️")
+        status = (
+            f"{tg_icon} Telegram  {fb_icon} Facebook  {ig_icon} Instagram  {tw_icon} Twitter"
+        )
+        if tg_ok:
+            msg = f"✅ <b>{title[:70]}</b>\n\n📡 {status}"
+        else:
+            msg = (f"⚠️ <b>Post had issues</b>\n\n"
+                   f"📡 {status}\n\n"
+                   f"Telegram failed — card not posted to community.")
+        # Show retry tip if anything failed
+        has_failure = not tg_ok or any(v is False for v in social_results.values())
+        if has_failure:
+            msg += "\n\n💡 <i>Telegram failed? The article may have expired. Create a manual card instead.</i>"
+        send_text(rchat, msg, thread_id=rthread)
+
+    return tg_ok, social_results
+
+
+def _send_approval_card(key, item, force=False):
+    """Send a card preview to Content Lab with approve/reject buttons, rate-limited."""
+    safe_ok, safe_reason = contentlab_candidate_is_safe(
+        title=item.get("title",""),
+        summary=item.get("dv_text") or item.get("caption") or item.get("summary",""),
+        source=item.get("source",""),
+        lang=item.get("lang","en"),
+    )
+    if not safe_ok:
+        approval_queue.pop(key, None)
+        persist_state()
+        log.warning(f"🧱 Approval preview blocked and removed: {key} — {safe_reason}")
+        return False
+    if item.get("_content_lab_suppressed"):
+        log.info(f"🧯 Content Lab suppressed for {key}")
+        return False
+    if item.get("_content_lab_sent") and not force:
+        return False
+    # No drip throttle — cards go to Content Lab immediately when ready
+    # The hourly CARD GENERATION budget (6/hr) is the gating, not Content Lab sending
+    cat = item["cat"]
+    lang_tag = "🇲🇻 Dhivehi" if item["lang"] == "dv" else "🇬🇧 English"
+    brk = "🚨 BREAKING " if item["is_breaking"] else ""
+    cat_emoji = {"BREAKING":"🚨","LOCAL":"🇲🇻","POLITICAL":"🏛️","LIFESTYLE":"🌴","SPORTS":"🏅","FOOTBALL":"⚽","WORLD":"🌍","DISASTER":"🚨","WEATHER":"🌤️","TOURISM":"✈️"}.get(cat,"📰")
+    # KEY first and BIG so stacked cards are instantly identifiable
+    header = (
+        f"🔑 <b>{key.upper()}</b>  •  {cat_emoji} {cat}\n"
+        f"{brk}<b>{lang_tag} Card — Review Needed</b>\n\n"
+        f"<b>📰 {item['title']}</b>\n\n"
+    )
+    if item["lang"] == "dv" and item.get("dv_text"):
+        header += f"<b>Bot wrote:</b>\n{item['dv_text']}\n\n"
+    footer = (
+        f"✅ <code>/approved {key}</code>\n"
+    )
+    if item["lang"] == "dv":
+        footer += f"✏️ <code>/approved {key} [corrected dhivehi text]</code>\n"
+    footer += f"❌ <code>/reject {key}</code>\n\n"
+    # Tell the team the auto-post / expiry behaviour
+    if item["lang"] == "en":
+        if item.get("is_breaking") and item.get("_held_for_confidence"):
+            footer += "<i>⏰ Breaking (held for review) — auto-posts in 15 min if no action</i>"
+        elif item.get("is_breaking"):
+            footer += "<i>⏰ Breaking — auto-posts in 15 min if no action</i>"
+        else:
+            footer += "<i>⏰ Auto-posts in 45 min if not reviewed</i>"
+    else:
+        # Dhivehi NEVER auto-posts — team must approve every single one
+        footer += "<i>⏰ Expires in 2h if not approved — Dhivehi never auto-posts</i>"
+    msg = header + footer
+
+    # ── Inline buttons — one tap approve/reject ──────────────────────────────
+    if item["lang"] == "dv":
+        buttons = [
+            [("✅ Approve DV", f"approve:{key}"), ("❌ Reject", f"reject:{key}")],
+            [("✏️ Edit & Approve", f"edit_approve:{key}")]
+        ]
+    else:
+        buttons = [
+            [("✅ Approve", f"approve:{key}"), ("❌ Reject", f"reject:{key}")]
+        ]
+    kb = _make_inline_kb(buttons)
+
+    # If we have a finished card image, send it as a photo with the caption
+    msg_id = None
+    if item.get("card_bytes"):
+        buf = io.BytesIO(item["card_bytes"])
+        msg_id = send_photo(CORE_TEAM_CHAT_ID, buf, msg,
+                            thread_id=CONTENT_LAB_THREAD_ID, reply_markup=kb)
+    else:
+        msg_id = send_text(CORE_TEAM_CHAT_ID, msg,
+                           thread_id=CONTENT_LAB_THREAD_ID, reply_markup=kb)
+
+    # Store message_id so we can remove buttons after action
+    if msg_id:
+        item["_lab_message_id"] = msg_id
+
+    _mark_content_lab_sent(item)
+    log.info(f"📨 Approval card sent to Content Lab: {key} ({item['lang']})")
     return True
 
-async def cmd_urgent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Operator sends urgent review request"""
-    user = update.effective_user
-    op = await get_operator(user.id)
-    if not op:
-        await update.message.reply_text("⚠️ You don't have a pending application.")
-        return
-    if op["status"] == "approved":
-        await update.message.reply_text("✅ Your account is already approved!")
-        return
-    if op["status"] == "rejected":
-        await update.message.reply_text("❌ Your application was rejected. Contact @SamugaTravels.")
-        return
 
-    # Notify admin group with urgent flag
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT id FROM operators WHERE telegram_id=$1", user.id)
-    op_id = row["id"] if row else 0
+def post_article(article, seen, social_only=False, allow_social=True):
+    """
+    New v5 flow:
+      - English BREAKING → publish instantly (1 at a time, no approval)
+      - Everything else (English regular + ALL Dhivehi) → queue for Content Lab approval
+    Marks article as seen immediately so it isn't re-queued every scan.
+    """
+    cat = article["cat"]
+    breaking = is_breaking(article["title"], article["summary"], cat)
+    is_dv = article.get("lang") == "dv"
 
-    urgent_msg = (
-        f"🚨 *URGENT REVIEW REQUEST*\n\n"
-        f"👤 @{user.username or user.first_name} (`{user.id}`)\n"
-        f"🏢 *{op['business_name']}*\n"
-        f"🛥️ {op['boat_name']}\n\n"
-        f"⚡ Operator is requesting urgent approval."
+    # Hard safety wall before Content Lab / cards / website.
+    safe_ok, safe_reason = contentlab_candidate_is_safe(
+        title=article.get("title",""),
+        summary=article.get("summary",""),
+        source=article.get("source",""),
+        lang=article.get("lang","en"),
     )
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve Now", callback_data=f"approve_op_{op_id}"),
-        InlineKeyboardButton("❌ Reject", callback_data=f"reject_op_{op_id}")
-    ]])
+    if not safe_ok:
+        seen.add(article["id"]); save_seen(seen)
+        db_record_article(article, score=0,
+                          reliability=source_reliability(article.get("source","")),
+                          status="filtered", is_breaking=False)
+        log.warning(f"🧱 Blocked unsafe story before queue: {safe_reason} — {article['title'][:90]}")
+        return False
+
+    dedup_title = story_signal_key(article.get("title",""), article.get("summary",""), article.get("lang","en"))
+    article["_dedup_title"] = dedup_title or article.get("title","")
+
+    # Mark seen now so the same article isn't re-processed on the next scan
+    seen.add(article["id"]); save_seen(seen)
+
+    # Archive every article we process (DB no-op if Postgres unavailable)
+    db_record_article(article, score=score_article(article),
+                      reliability=source_reliability(article.get("source","")),
+                      status="seen", is_breaking=breaking)
+
+    # ── Story clustering — track which sources report this event ──
+    cluster_size, cluster_sources = register_in_cluster(article["_dedup_title"], article.get("source",""))
+
+    # ── Duplicate story check — skip if same event already posted/queued/rejected ──
+    if is_duplicate_story(article["_dedup_title"]):
+        note_duplicate_skip()
+        log.info(f"⏭️ Skipping duplicate ({cluster_size} sources): {article['title'][:55]}")
+        db_mark_status(article["id"], "duplicate")
+        return False
+    # Record this normalized title so later similar stories are caught
+    remember_story_title(article["_dedup_title"])
+    # Stash cluster info on the article so the card can show "X sources reporting"
+    article["_cluster_size"] = cluster_size
+    article["_cluster_sources"] = cluster_sources
+
+    # ── STORY INTELLIGENCE — attach this article to a story thread ──
     try:
-        await ctx.bot.send_message(ADMIN_GROUP_ID, urgent_msg, parse_mode="Markdown",
-                                   message_thread_id=ADMIN_THREAD_ID, reply_markup=kb)
-        await update.message.reply_text(
-            "🚨 *Urgent request sent!*\n\n"
-            "Our team has been notified and will review your application as soon as possible.\n\n"
-            "Thank you for your patience! 🙏",
-            parse_mode="Markdown")
+        story_id, is_new_story, update_num = find_or_create_story(
+            article["title"], cat, article["id"],
+            article.get("summary", ""), article.get("source", ""), article.get("link", "")
+        )
+        article["_story_id"] = story_id
+        article["_story_update_num"] = update_num
+        article["_story_is_new"] = is_new_story
+        # If this is an update to an existing developing story, notify core team
+        if story_id and not is_new_story and update_num >= 2:
+            log.info(f"📚 This is update #{update_num} to Story #{story_id}")
     except Exception as e:
-        logger.error(f"Urgent notify error: {e}")
-        await update.message.reply_text("⚠️ Could not send request. Please contact @SamugaTravels directly.")
+        log.debug(f"Story attach: {e}")
 
-async def cmd_delete_my_data(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Allow operators/customers to request data deletion"""
-    user = update.effective_user
-    op = await get_operator(user.id)
-    await update.message.reply_text(
-        "🗑️ *Data Deletion Request*\n\n"
-        "To delete your data from Samuga Travels, contact us directly:\n\n"
-        "📩 @SamugaTravels\n\n"
-        "We will remove:\n"
-        "• Your operator profile and documents\n"
-        "• Your booking history\n"
-        "• Your uploaded photos and ID\n\n"
-        "_Note: Confirmed booking records may be retained for up to 90 days for legal compliance._\n\n"
-        "⚠️ This action is irreversible.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("📩 Contact @SamugaTravels", url="https://t.me/SamugaTravels")
-        ]]))
+    # ── Confidence gate — high-priority but unconfirmed news gets held ──
+    priority = score_article(article)
+    confidence, conf_reasons = confidence_score(article)
+    article["_priority"] = priority
+    article["_confidence"] = confidence
+    hold, hold_reason = should_hold_for_review(priority, confidence, breaking)
 
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Check application status"""
-    user = update.effective_user
-    op = await get_operator(user.id)
-    if not op:
-        await update.message.reply_text(
-            "📋 You don't have an operator application.\n\nTap below to register!",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🤝 Register as Operator", callback_data="register_operator")
-            ]]))
-        return
-    status_map = {
-        "pending":  ("⏳", "Under Review", "Our team is reviewing your application."),
-        "approved": ("✅", "Approved", "Your account is active. Use /start to manage."),
-        "rejected": ("❌", "Rejected", "Contact @SamugaTravels for more info.")
-    }
-    icon, label, note = status_map.get(op["status"], ("❓","Unknown",""))
-    rec = "🌟 *Recommended by Samuga Travels*\n" if op.get("is_recommended") else ""
-    await update.message.reply_text(
-        f"{icon} *Application Status: {label}*\n\n"
-        f"🏢 {op['business_name']}\n"
-        f"🛥️ {op['boat_name']}\n"
-        f"{rec}"
-        f"\n_{note}_\n\n"
-        f"{'Type /urgent if you need urgent review.' if op['status'] == 'pending' else ''}",
-        parse_mode="Markdown")
-
-async def cmd_findcustomer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Find customer by booking ref or telegram ID"""
-    user = update.effective_user
-    if not is_admin(user.id, update.effective_chat.id):
-        await update.message.reply_text("⛔ Admin only.")
-        return
-    args = ctx.args
-    if not args:
-        await update.message.reply_text("Usage: `/findcustomer ST-260629-0389` or `/findcustomer 123456789`", parse_mode="Markdown")
-        return
-    query_str = args[0].strip()
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        if query_str.startswith("ST-"):
-            bk = await conn.fetchrow("""
-                SELECT b.*, o.business_name FROM bookings b
-                JOIN operators o ON b.operator_id=o.id
-                WHERE b.booking_ref=$1
-            """, query_str)
-        else:
+    # ── English BREAKING: publish instantly UNLESS confidence too low ──
+    if breaking and not is_dv:
+        if hold:
+            # Don't auto-post — queue for review with a warning instead
+            log.info(f"🛑 Breaking held for review: {hold_reason} — {article['title'][:50]}")
             try:
-                tg_id = int(query_str)
-                bk = await conn.fetchrow("""
-                    SELECT b.*, o.business_name FROM bookings b
-                    JOIN operators o ON b.operator_id=o.id
-                    WHERE b.customer_telegram_id=$1 ORDER BY b.created_at DESC LIMIT 1
-                """, tg_id)
-            except ValueError:
-                await update.message.reply_text("⚠️ Invalid format. Use booking ref or Telegram ID.")
-                return
-    if not bk:
-        await update.message.reply_text("❌ No booking found.")
-        return
-    icons = {"pending_payment":"⏳","pending_confirmation":"🔄","confirmed":"✅","cancelled":"❌"}
-    ic = icons.get(bk["status"],"❓")
-    msg = (
-        f"🔍 *Booking Found:*\n\n"
-        f"{ic} `{bk['booking_ref']}`\n"
-        f"👤 Customer: {bk['customer_name'] or 'N/A'}\n"
-        f"🆔 Telegram ID: `{bk['customer_telegram_id']}`\n"
-        f"🚤 Operator: {bk['business_name']}\n"
-        f"📅 {bk['travel_date']} | 💰 MVR {bk['total_amount']}\n"
-        f"📊 Status: *{bk['status'].upper()}*\n"
-        f"🕐 Created: {str(bk['created_at'])[:16]}"
-    )
-    btns = [[InlineKeyboardButton("✉️ Message Customer", callback_data=f"msg_customer_{bk['customer_telegram_id']}")]]
-    if bk["status"] == "pending_confirmation":
-        btns.append([InlineKeyboardButton("✅ Force Confirm", callback_data=f"confirm_booking_{bk['id']}")])
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
-
-async def cmd_ops(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """List all approved operators"""
-    user = update.effective_user
-    if user.id not in SUPER_ADMINS and update.effective_chat.id != ADMIN_GROUP_ID:
-        return
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        ops = await conn.fetch("SELECT id, business_name, boat_name, status, telegram_id FROM operators ORDER BY status, business_name")
-    if not ops:
-        await update.message.reply_text("No operators.")
-        return
-    msg = "📋 *All Operators:*\n\n"
-
-    for op in ops:
-        icon = {"pending":"⏳","approved":"✅","rejected":"❌"}.get(op["status"],"❓")
-        msg += f"{icon} `{op['id']}` *{op['business_name']}* — {op['boat_name']}\n"
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-# ── OPERATOR REGISTRATION ─────────────────────────────────────────────────────
-async def start_op_reg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = query.from_user if query else update.effective_user
-    msg  = query.message   if query else update.message
-
-    existing = await get_operator(user.id)
-    if existing:
-        s = existing.get("status")
-        if s == "approved":
-            await set_user_state(user.id, OP_IDLE, {}, role="operator")
-            await msg.reply_text("✅ You're already a verified operator! Use /start to manage.")
-            return
-        elif s == "pending":
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🚨 Request Urgent Review", callback_data=f"urgent_review_{existing['id']}")
-            ]])
-            await msg.reply_text(
-                "⏳ *Your application is under review.*\n\n"
-                "Our team will notify you once approved.\n\n"
-                "Need it urgently? Tap the button below to flag your application:",
-                parse_mode="Markdown", reply_markup=kb)
-            return
-        elif s == "rejected":
-            # Allow re-registration after rejection
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                await conn.execute("DELETE FROM operators WHERE telegram_id=$1", user.id)
-            # Fall through to registration below
-
-    await set_user_state(user.id, OP_AWAIT_BUSINESS_NAME, {}, role="operator_pending")
-    await msg.reply_text(
-        "🚤 *Operator Registration — Samuga Travels*\n\n"
-        "*Step 1:* What is your *business/company name*?\n\n_Example: Thoddoo Express Travels_",
-        parse_mode="Markdown")
-
-# ── MESSAGE HANDLER ───────────────────────────────────────────────────────────
-async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    sd   = await get_user_state(user.id)
-    state= sd.get("state", CX_IDLE)
-    temp = sd.get("temp_data", {}) or {}
-    text = (update.message.text or "").strip()
-
-    # ── REFUND FLOW ──────────────────────────────────────────────────────────
-    if state == CX_AWAIT_REFUND_ACCOUNT:
-        if is_cancel(text):
-            await set_user_state(user.id, CX_IDLE, {})
-            await update.message.reply_text(
-                "❌ Refund request cancelled.\n\n"
-                "You can still contact the operator directly to arrange your refund.",
-                reply_markup=main_kb("customer"))
-            return
-        # Parse account number + name
-        parts = text.strip().split(" ", 1)
-        if len(parts) < 2 or not parts[0].strip().isdigit():
-            await update.message.reply_text(
-                "⚠️ Please enter your *account number and name* in one line:\n\n"
-                "_Example:_ `7770001234567 Ahmed Ali`\n\n"
-                "Or type `cancel` to skip.",
-                parse_mode="Markdown")
-            return
-        account_number = parts[0].strip()
-        account_name   = parts[1].strip()
-        bk_id   = temp.get("refund_booking_id")
-        bk_ref  = temp.get("refund_booking_ref", "")
-        amount  = temp.get("refund_amount", "0")
-        op_tg   = temp.get("op_tg_id")
-        op_name = temp.get("op_name","")
-        op_cont = temp.get("op_contact","")
-
-        # Save refund account to DB
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                UPDATE bookings SET refund_account=$1, refund_account_name=$2, refund_status='requested'
-                WHERE id=$3
-            """, account_number, account_name, bk_id)
-
-        await set_user_state(user.id, CX_IDLE, {})
-
-        # Notify customer
-        await update.message.reply_text(
-            f"✅ *Refund Requested!*\n\n"
-            f"📋 Booking: `{bk_ref}`\n"
-            f"💰 Amount: *MVR {amount}*\n"
-            f"🏦 Account: `{account_number}` — {account_name}\n\n"
-            f"The operator has been notified and will process your refund.\n"
-            f"You will receive a confirmation with the transfer slip once done.\n\n"
-            f"📞 Operator: *{op_name}* | {op_cont}\n\n"
-            f"_Refunds are typically processed within 1-3 business days._",
-            parse_mode="Markdown",
-            reply_markup=main_kb("customer"))
-
-        # Notify operator with refund request + customer account details
-        if op_tg:
-            try:
-                await ctx.bot.send_message(int(op_tg),
-                    f"💸 *Refund Request*\n\n"
-                    f"📋 Booking: `{bk_ref}`\n"
-                    f"💰 Amount to refund: *MVR {amount}*\n\n"
-                    f"*Customer bank account:*\n"
-                    f"🏦 Account: `{account_number}`\n"
-                    f"👤 Name: {account_name}\n\n"
-                    f"Please transfer MVR {amount} to this account and upload the transfer slip below.\n"
-                    f"The customer will receive the slip automatically. 🙏",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("📤 Upload Refund Slip", callback_data=f"upload_refund_{bk_id}")
-                    ]]))
+                card_bytes, caption, rewritten, keyword = _build_card_and_caption(article)
+                key = store_pending_approval(
+                    card_bytes, caption, article["title"], article["link"], cat=cat, lang="en",
+                    dv_text=None, keyword=keyword, source=article.get("source","LOCAL"),
+                    is_breaking=True, allow_social=allow_social,
+                    dedup_title=article.get("_dedup_title"), summary=article.get("summary","")
+                )
+                if not key:
+                    return False
+                approval_queue[key]["rewritten"] = rewritten
+                approval_queue[key]["summary"] = article.get("summary","")
+                approval_queue[key]["article_id"] = article["id"]
+                approval_queue[key]["_priority"] = article.get("_priority", priority)
+                approval_queue[key]["_confidence"] = confidence
+                try:
+                    db_publish_article_for_website(
+                        article_id=article["id"], title=article["title"],
+                        summary=samuga_public_summary(article.get("title", ""), article.get("summary", ""), rewritten), category=cat,
+                        source=SAMUGA_PUBLIC_SOURCE,
+                        link=SAMUGA_PUBLIC_LINK, lang="en",
+                        score=article.get("_priority", 0),
+                        reliability=source_reliability(article.get("source", "")),
+                        is_breaking=True
+                    )
+                    log.info(f"🌐 Website published held EN breaking story: {article['title'][:60]}")
+                except Exception as e:
+                    log.error(f"[WEBSITE] held breaking publish failed: {e}")
+                approval_queue[key]["_cluster_size"] = article.get("_cluster_size", 1)
+                approval_queue[key]["_confidence"] = confidence
+                approval_queue[key]["_hold_reason"] = hold_reason
+                approval_queue[key]["_content_lab_suppressed"] = True
+                db_mark_status(article["id"], "queued")
+                approval_queue[key]["_held_for_confidence"] = False
+                approval_queue[key]["_alert_only"] = True
+                # Low-confidence breaking goes to Alert thread only — not Content Lab.
+                send_text(CORE_TEAM_CHAT_ID,
+                    f"⚠️ <b>BREAKING held for review</b>\n{hold_reason}\n\n"
+                    f"<b>{article['title'][:90]}</b>\n"
+                    f"Source: {article.get('source','?')} · Confidence: {confidence}%\n\n"
+                    f"Approve with <code>/approved {key}</code> if verified.\n"
+                    f"<i>Not sent to Content Lab to prevent flooding.</i>",
+                    thread_id=ALERT_THREAD_ID)
             except Exception as e:
-                logger.error(f"Refund notify operator: {e}")
-        return
-
-    # ── ADMIN MESSAGE STATES ─────────────────────────────────────────────────
-    if state == "admin_await_sub_fee":
-        fee = parse_price(text)
-        if not fee or fee <= 0:
-            await update.message.reply_text("⚠️ Enter valid amount e.g. `500`", parse_mode="Markdown")
-            return
-        await set_setting("subscription_fee", str(int(fee)))
-        await set_user_state(user.id, CX_IDLE, {})
-        await update.message.reply_text(
-            f"✅ Subscription fee set to *MVR {int(fee)}/month*", parse_mode="Markdown")
-        return
-
-    elif state == "admin_await_sub_accounts":
-        import json as _j
-        lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
-        accounts = []
-        for line in lines:
-            parts = line.split(" ", 2)
-            if len(parts) >= 2:
-                accounts.append({
-                    "bank": parts[0].upper(),
-                    "number": parts[1],
-                    "name": parts[2] if len(parts) > 2 else ""
-                })
-        if not accounts:
-            await update.message.reply_text("⚠️ Couldn't read accounts. Try:\n`BML 7770001234 Samuga Travels`", parse_mode="Markdown")
-            return
-        await set_setting("subscription_accounts", _j.dumps(accounts))
-        await set_user_state(user.id, CX_IDLE, {})
-        lines_out = "\n".join([f"🏦 {a['bank']}: {a['number']} — {a['name']}" for a in accounts])
-        await update.message.reply_text(
-            f"✅ *Payment accounts saved!*\n\n{lines_out}\n\n"
-            f"Operators will see these when paying their subscription.",
-            parse_mode="Markdown")
-        return
-
-    elif state == ADMIN_AWAIT_BROADCAST:
-        if is_cancel(text):
-            await set_user_state(user.id, CX_IDLE, {})
-            await update.message.reply_text("❌ Broadcast cancelled.")
-            return
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            operators = await conn.fetch("SELECT telegram_id, business_name FROM operators WHERE status='approved'")
-        sent = 0
-        failed = 0
-        for op in operators:
+                log.error(f"Breaking hold queue: {e}")
+            return False
+        # Confidence OK — publish instantly as normal
+        card_bytes, caption, rewritten, keyword = _build_card_and_caption(article)
+        tg_ok, _social = _publish_now(card_bytes, caption, cat, article["title"], article["link"],
+                            is_breaking_flag=True, allow_social=allow_social,
+                            rewritten=rewritten, summary=article.get("summary",""),
+                            article_id=article["id"])
+        db_mark_status(article["id"], "posted" if tg_ok else "seen", posted=bool(tg_ok))
+        # Send reference copy to Content Lab (for team awareness, no action needed)
+        if tg_ok:
             try:
-                await ctx.bot.send_message(op["telegram_id"],
-                    f"📢 *Message from Samuga Travels:*\n\n{text}",
-                    parse_mode="Markdown")
-                sent += 1
-            except Exception:
-                failed += 1
-        await set_user_state(user.id, CX_IDLE, {})
-        await update.message.reply_text(
-            f"📢 *Broadcast Complete!*\n\n✅ Sent: {sent}\n❌ Failed: {failed}",
-            parse_mode="Markdown")
-        return
+                send_text(CORE_TEAM_CHAT_ID,
+                    f"🚨 <b>BREAKING posted automatically</b>\n"
+                    f"📰 {article['title'][:100]}\n"
+                    f"Source: {article.get('source','?')} · Score: {score_article(article)}\n"
+                    f"<i>Already posted to Telegram + socials. This is for reference only.</i>",
+                    thread_id=CONTENT_LAB_THREAD_ID)
+            except Exception: pass
 
-    elif state == ADMIN_AWAIT_REVIEW_TEXT:
-        op_id = (sd.get("temp_data") or {}).get("review_op_id")
-        if op_id and not is_cancel(text):
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    "UPDATE operators SET is_recommended=TRUE, review_text=$1 WHERE id=$2 RETURNING telegram_id, business_name",
-                    text, op_id)
-            if row:
-                await ctx.bot.send_message(row["telegram_id"],
-                    f"🌟 *Congratulations!*\n\nYour business is now *Recommended by Samuga Travels!*\n\n💬 _{text}_",
-                    parse_mode="Markdown")
-                await update.message.reply_text(f"🌟 *{row['business_name']}* is now Recommended!", parse_mode="Markdown")
-        await set_user_state(user.id, CX_IDLE, {})
-        return
-
-    # ── SAMUGAAI CHAT STATES ─────────────────────────────────────────────────
-    if state in [CX_AI_CHAT, OP_AI_CHAT]:
-        if is_cancel(text):
-            role = sd.get("role","customer")
-            op = await get_operator(user.id)
-            back_state = OP_IDLE if (op and op.get("status") == "approved") else CX_IDLE
-            await set_user_state(user.id, back_state, {})
-            await update.message.reply_text(
-                "👋 Left SamugaAI. Back to main menu!",
-                reply_markup=main_kb("operator" if (op and op.get("status") == "approved") else "customer"))
-            return
-        allowed, remaining = await _ai_check_limit(user.id)
-        if not allowed:
-            await update.message.reply_text(
-                "🤖 You've used your 10 free SamugaAI questions for today.\n\n"
-                "Come back tomorrow for more! 🙏",
-                parse_mode="Markdown")
-            return
-        await _ai_increment(user.id)
-        thinking = await update.message.reply_text("🤖 _SamugaAI is thinking..._", parse_mode="Markdown")
-        role = "operator" if state == OP_AI_CHAT else "customer"
-        op = await get_operator(user.id)
-        ctx_data = {"operator_name": op.get("business_name") if op else None}
-        answer = await ask_samuga_ai(text, role, ctx_data)
-        try:
-            await ctx.bot.delete_message(user.id, thinking.message_id)
-        except: pass
-        await update.message.reply_text(
-            answer + f"\n\n_({remaining-1} questions left today)_",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ End Chat", callback_data="ai_end_chat")
-            ]]))
-        return
-
-    # ── GLOBAL CANCEL CHECK ──────────────────────────────────────────────────
-    if is_cancel(text) and state not in [CX_IDLE, OP_IDLE]:
-        role = sd.get("role","customer")
-        if role == "operator":
-            op = await get_operator(user.id)
-            role = "operator" if (op and op.get("status")=="approved") else "customer"
-        await set_user_state(user.id, CX_IDLE if role != "operator" else OP_IDLE, {})
-        await update.message.reply_text(
-            "❌ Cancelled. Back to main menu.",
-            reply_markup=main_kb(role))
-        return
-
-    # ── OPERATOR REG FLOW ─────────────────────────────────────────────────────
-    if state == OP_AWAIT_BUSINESS_NAME:
-        await set_user_state(user.id, OP_AWAIT_BOAT_NAME, {**temp, "business_name": text})
-        await update.message.reply_text(
-            "✅ Got it!\n\n*Step 2:* What is your *boat name*?\n\n_Example: Ocean Star_",
-            parse_mode="Markdown")
-
-    elif state == OP_AWAIT_BOAT_NAME:
-        await set_user_state(user.id, OP_AWAIT_SEATS, {**temp, "boat_name": text})
-        await update.message.reply_text(
-            "✅ Got it!\n\n*Step 3:* How many *seats* does your boat have?\n\n_Enter a number, e.g. 20_",
-            parse_mode="Markdown")
-
-    elif state == OP_AWAIT_SEATS:
-        seat_num = parse_number(text)
-        if not seat_num or seat_num < 1:
-            await update.message.reply_text("⚠️ Please enter a valid number e.g. `20`", parse_mode="Markdown")
-            return
-        await set_user_state(user.id, OP_AWAIT_TYPE, {**temp, "seat_count": seat_num})
-        await update.message.reply_text(
-            "✅ Got it!\n\n*Step 4:* What type of service?",
-            parse_mode="Markdown", reply_markup=boat_type_kb())
-    elif state == OP_AWAIT_ROUTES:
-        stops = [s.strip() for s in text.split(",") if s.strip()]
-        if len(stops) < 2:
-            await update.message.reply_text(
-                "⚠️ Enter at least 2 stops separated by commas.\n\n"
-                "_Example: `Male, Dhigurah, Thoddoo, Dhagethi`_",
-                parse_mode="Markdown")
-            return
-        route_display = " → ".join(stops)
-        await set_user_state(user.id, OP_AWAIT_OWNER_NAME, {**temp, "routes": stops, "route_display": route_display})
-        await update.message.reply_text(
-            f"✅ Route saved!\n\n📍 *{route_display}*\n\n*Step 6:* What is the *owner's full name*?",
-            parse_mode="Markdown")
-
-    elif state == OP_AWAIT_OWNER_NAME:
-        await set_user_state(user.id, OP_AWAIT_OWNER_CONTACT, {**temp, "owner_name": text})
-        await update.message.reply_text(
-            "✅ Got it!\n\n*Step 7:* Owner's *contact number*?\n\n_Example: 7771234_",
-            parse_mode="Markdown")
-
-    elif state == OP_AWAIT_OWNER_CONTACT:
-        await set_user_state(user.id, OP_AWAIT_OWNER_ID_PHOTO, {**temp, "owner_contact": text})
-        await update.message.reply_text(
-            "✅ Got it!\n\n*Step 8:* Please upload a *photo of the owner's ID card or passport*.\n\n"
-            "🔒 *Privacy Notice:* Your ID is used only for operator verification by Samuga Travels admin. "
-            "It will not be shown publicly or shared with other operators. Only Samuga Travels admin can use it for verification.\n\n"
-            "_This is required by Samuga Travels to ensure all operators are legitimate._",
-            parse_mode="Markdown")
-
-    elif state == OP_AWAIT_BML_ACCOUNT:
-        parts = text.strip().split(" ", 1)
-        acct_num = parts[0].strip()
-        acct_name = parts[1].strip() if len(parts) > 1 else ""
-        bml_entry = f"{acct_num}|{acct_name}" if acct_name else acct_num
-        await set_user_state(user.id, OP_AWAIT_MIB_ACCOUNT, {**temp, "bml_account": bml_entry})
-        await update.message.reply_text(
-            "✅ *BML account saved!*\n\n"
-            "Do you also have an *MIB (Maldives Islamic Bank)* account?\n\n"
-            "_Enter number and account name e.g:_\n`90101480050561001 Samuga Travels`\n\n"
-            "_Or type_ *skip* _if not._",
-            parse_mode="Markdown")
-
-    elif state == OP_AWAIT_MIB_ACCOUNT:
-        if is_skip(text):
-            mib_entry = ""
-        else:
-            parts = text.strip().split(" ", 1)
-            acct_num = parts[0].strip()
-            acct_name = parts[1].strip() if len(parts) > 1 else ""
-            mib_entry = f"{acct_num}|{acct_name}" if acct_name else acct_num
-        final_temp = {**temp, "mib_account": mib_entry}
-        op_id = await save_operator(user, final_temp)
-        await notify_admin_new_op(ctx, user, final_temp, op_id=op_id)
-        await set_user_state(user.id, OP_REGISTERED, {})
-        await update.message.reply_text(
-            "🎉 *Registration Complete!*\n\n"
-            "Your application has been submitted to Samuga Travels for review.\n\n"
-            "⏳ We\'ll verify your details and notify you here within 24 hours. Thank you! 🌊",
-            parse_mode="Markdown")
-
-    # ── SCHEDULE CHANGE HANDLERS ─────────────────────────────────────────────────
-    elif state == OP_AWAIT_CHANGE_NOTE:
-        t2 = temp or {}
-        change_type = t2.get("change_type")
-        sched_id = t2.get("change_sched_id")
-        from datetime import timedelta as _td4
-        tomorrow = datetime.now().date() + _td4(days=1)
-        pool = await get_pool()
-
-        if change_type == "time":
-            new_time_val = parse_time_24hr(text.strip())
-            if not new_time_val:
-                await update.message.reply_text(
-                    "⚠️ Use 24-hour format e.g. `16:00` or `06:45`",
-                    parse_mode="Markdown")
-                return
-            async with pool.acquire() as conn:
-                await conn.execute("""
-                    INSERT INTO schedule_changes (schedule_id, change_date, new_time, note)
-                    VALUES ($1,$2,$3,'Time changed by operator')
-                    ON CONFLICT DO NOTHING
-                """, sched_id, tomorrow, new_time_val)
-                sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
-                bookings = await conn.fetch("""
-                    SELECT customer_telegram_id, booking_ref FROM bookings
-                    WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
-                """, sched_id, tomorrow)
-            await set_user_state(user.id, OP_IDLE, {})
-            await update.message.reply_text(
-                f"✅ Departure time updated to *{new_time_val}* for tomorrow.",
-                parse_mode="Markdown", reply_markup=main_kb("operator"))
-            for bk in bookings:
+        # ── Auto-generate Dhivehi version for breaking news ──────────────────
+        # Sent to Content Lab for review. If nobody acts in 2 hours, posts automatically.
+        if tg_ok and GEMINI_API_KEY:
+            def _auto_dv_breaking(_title=article["title"], _rewritten=rewritten,
+                                  _link=article["link"], _cat=cat, _kw=keyword,
+                                  _source=article.get("source","LOCAL"), _aid=article["id"]):
                 try:
-                    await ctx.bot.send_message(bk["customer_telegram_id"],
-                        f"⏰ *Schedule Update*\n\nYour booking `{bk['booking_ref']}` has a time change:\n\n"
-                        f"New departure time: *{new_time_val}*\n"
-                        f"📌 {sched.get('location','Jetty No. 1, Male')}\n\nSorry for any inconvenience! 🙏",
-                        parse_mode="Markdown")
-                except: pass
+                    dv_text = make_dhivehi_caption(_rewritten, _title)
+                    if not dv_text:
+                        return
+                    key = store_pending_approval(
+                        None, None, _title, _link, cat=_cat, lang="dv",
+                        dv_text=dv_text, keyword=_kw, source=_source,
+                        is_breaking=True, allow_social=True,
+                        dedup_title=story_signal_key(_title, _rewritten, "dv"),
+                        summary=article.get("summary","")
+                    )
+                    if not key:
+                        return
+                    approval_queue[key]["article_id"] = f"{_aid}_dv"
+                    approval_queue[key]["_auto_post_breaking"] = False  # DV never auto-posts
+                    approval_queue[key]["summary"] = article.get("summary","")
+                    # Pre-fetch bg
+                    bg = fetch_background_image(_kw, cat=_cat, title=_title)
+                    if key in approval_queue:
+                        approval_queue[key]["_bg_image"] = bg
+                    _send_approval_card(key, approval_queue[key])
+                    # Notify Content Lab
+                    send_text(CORE_TEAM_CHAT_ID,
+                        f"🇲🇻 <b>Dhivehi version ready</b> — <code>{key}</code>\n"
+                        f"<i>{_title[:80]}</i>\n\n"
+                        f"Approve, edit or reject within 2 hours.\n"
+                        f"If no action taken — <b>posts automatically at 2h mark.</b>\n\n"
+                        f"/approved {key} · /approved {key} [corrected text] · /reject {key}",
+                        thread_id=CONTENT_LAB_THREAD_ID)
+                    log.info(f"🇲🇻 Breaking Dhivehi version queued: {key}")
+                except Exception as e:
+                    log.debug(f"Auto-DV breaking: {e}")
+            threading.Thread(target=_auto_dv_breaking, daemon=True).start()
 
-        elif change_type == "route":
-            stops = [s.strip().title() for s in text.split(",") if s.strip()]
-            if len(stops) < 2:
-                await update.message.reply_text("⚠️ Enter at least 2 stops e.g. `Male, Gulhi, Maafushi`", parse_mode="Markdown")
-                return
-            route_display = " → ".join(stops)
-            import json as _j
-            async with pool.acquire() as conn:
-                await conn.execute("""
-                    INSERT INTO schedule_changes (schedule_id, change_date, note)
-                    VALUES ($1,$2,$3)
-                    ON CONFLICT DO NOTHING
-                """, sched_id, tomorrow, f"Route changed: {route_display}")
-                bookings = await conn.fetch("""
-                    SELECT customer_telegram_id, booking_ref FROM bookings
-                    WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
-                """, sched_id, tomorrow)
-            await set_user_state(user.id, OP_IDLE, {})
-            await update.message.reply_text(
-                f"✅ Route updated to *{route_display}* for tomorrow.",
-                parse_mode="Markdown", reply_markup=main_kb("operator"))
-            for bk in bookings:
-                try:
-                    await ctx.bot.send_message(bk["customer_telegram_id"],
-                        f"🗺️ *Route Update*\n\nYour booking `{bk['booking_ref']}` route has changed:\n\n"
-                        f"New route: *{route_display}*\n\nSorry for any inconvenience! 🙏",
-                        parse_mode="Markdown")
-                except: pass
+        return bool(tg_ok)
 
-    # ── BULK SCHEDULE SETUP FLOW ─────────────────────────────────────────────────
-    elif state == OP_BULK_LOCATION:
-        import re as _re2
-        # Accept "Male to Airport to Thoddoo" format — one or multiple routes per line
-        lines_raw = [l.strip() for l in text.strip().split("\n") if l.strip()]
-        # Parse each line as a route with stops separated by "to"
-        all_route_lines = []
-        for line in lines_raw:
-            stops_in_line = [s.strip().title() for s in _re2.split(r"\bto\b", line, flags=_re2.IGNORECASE) if s.strip()]
-            if len(stops_in_line) >= 2:
-                all_route_lines.append(stops_in_line)
-        if not all_route_lines:
-            await update.message.reply_text(
-                "⚠️ Couldn\'t read routes. Try:\n\n"
-                "`Male to Airport to Thoddoo`\n"
-                "`Thoddoo to Airport to Male`",
-                parse_mode="Markdown")
-            return
-        # Use all unique stops from first route as the stop list
-        all_stops = all_route_lines[0]
-        route_display = "\n".join([" → ".join(r) for r in all_route_lines])
-        await set_user_state(user.id, OP_BULK_SATHU_DEPS,
-                             {**temp, "bulk_stops": all_stops,
-                              "bulk_routes": all_route_lines,
-                              "bulk_route": route_display})
-        await update.message.reply_text(
-            f"✅ Routes saved!\n📍 {route_display}\n\n"
-            f"*Step 2:* What is your *departure location/jetty*?\n\n"
-            f"_Example: Jetty No. 1, Male_",
-            parse_mode="Markdown")
-
-    elif state == OP_BULK_SATHU_DEPS:
-        # First message after route — might be location or departures
-        if not temp.get("bulk_location"):
-            # This is the location step
-            location = text.strip()
-            await set_user_state(user.id, OP_BULK_SATHU_DEPS,
-                                 {**temp, "bulk_location": location})
-            stops = temp.get("bulk_stops", [])
-            route_display = temp.get("bulk_route", "")
-            stops = temp.get("bulk_stops", [])
-            bulk_routes = temp.get("bulk_routes", [[stops[0], stops[-1]], [stops[-1], stops[0]]])
-            # Build example using full route strings
-            def route_str(r): return " to ".join(r)
-            example_lines = []
-            example_lines.append(f"10:15 {route_str(bulk_routes[0])}")
-            example_lines.append(f"16:00 {route_str(bulk_routes[0])}")
-            if len(bulk_routes) > 1:
-                example_lines.append(f"06:45 {route_str(bulk_routes[1])}")
-                example_lines.append(f"13:00 {route_str(bulk_routes[1])}")
-            example = "\n".join(example_lines)
-            await update.message.reply_text(
-                f"✅ Location: *{location}*\n\n"
-                f"*Step 3:* Enter your *Saturday–Thursday departures*\n"
-                f"_One per line: TIME then full route_\n\n"
-                f"_Example:_\n`{example}`\n\n"
-                f"_24hr or 12hr time both work!_",
-                parse_mode="Markdown")
-            return
-        # This is the Sat-Thu departures
-        deps = parse_bulk_departures(text)
-        if not deps:
-            await update.message.reply_text(
-                "⚠️ Couldn't read departures. Use format:\n"
-                "`10:15 Male to Thoddoo`\n"
-                "`06:45 Thoddoo to Male`",
-                parse_mode="Markdown")
-            return
-        await set_user_state(user.id, OP_BULK_FRI_DEPS,
-                             {**temp, "bulk_sathu": deps})
-        await update.message.reply_text(
-            f"✅ Got *{len(deps)} Sat–Thu departures!*\n\n"
-            f"*Step 4:* Do your *Friday departures differ*?\n\n"
-            f"• Type your Friday departures if different\n"
-            f"• Type `same` if Friday is the same\n"
-            f"• Type `skip` if you don't operate on Fridays",
-            parse_mode="Markdown")
-
-    elif state == OP_BULK_FRI_DEPS:
-        if not temp.get("bulk_price"):
-            # This is Friday deps step
-            fri_deps = None
-            if is_skip(text):
-                fri_deps = []
-            elif text.strip().lower() == "same":
-                fri_deps = temp.get("bulk_sathu", [])
-            else:
-                fri_deps = parse_bulk_departures(text)
-                if fri_deps is None:
-                    await update.message.reply_text(
-                        "⚠️ Couldn't read Friday departures.\n"
-                        "Type `same`, `skip`, or list times like:\n`10:00 Male to Thoddoo`",
-                        parse_mode="Markdown")
-                    return
-            await set_user_state(user.id, OP_BULK_PRICE,
-                                 {**temp, "bulk_fri": fri_deps})
-            fri_msg = f"{len(fri_deps)} Friday departures" if fri_deps else "No Friday service"
-            await update.message.reply_text(
-                f"✅ *{fri_msg}*\n\n"
-                f"*Step 5:* What is the *price per seat* (MVR)?\n\n"
-                f"_Example: 535_",
-                parse_mode="Markdown")
-            return
-
-    elif state == OP_BULK_PRICE:
-        price = parse_price(text)
-        if not price or price <= 0:
-            await update.message.reply_text("⚠️ Enter valid price e.g. `535`", parse_mode="Markdown")
-            return
-        await set_user_state(user.id, OP_BULK_SEATS, {**temp, "bulk_price": price})
-        await update.message.reply_text(
-            f"✅ Price: *MVR {price}/seat*\n\n"
-            f"*Step 6:* How many *seats per departure*?\n\n"
-            f"_Example: 18_",
-            parse_mode="Markdown")
-
-    elif state == OP_BULK_SEATS:
-        seats = parse_number(text)
-        if not seats or seats < 1:
-            await update.message.reply_text("⚠️ Enter valid number e.g. `18`", parse_mode="Markdown")
-            return
-        # Build all schedules
-        op = await get_operator(user.id)
-        stops       = temp.get("bulk_stops", [])
-        location    = temp.get("bulk_location", "Jetty No. 1, Male")
-        price       = temp.get("bulk_price", 0)
-        sathu_deps  = temp.get("bulk_sathu", [])
-        fri_deps    = temp.get("bulk_fri", [])
-        import json as _j
-
-        pool = await get_pool()
-        created = 0
-        async with pool.acquire() as conn:
-            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS sched_stops TEXT DEFAULT '[]'")
-            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS location TEXT DEFAULT 'Jetty No. 1, Male'")
-            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS run_days TEXT DEFAULT 'daily'")
-            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS boat_name TEXT")
-            for dep in sathu_deps:
-                dep_stops = dep.get("stops", [dep["from"], dep["to"]])
-                await conn.execute("""
-                    INSERT INTO schedules (operator_id, route_from, route_to, departure_time,
-                                           price_per_seat, total_seats, available_seats,
-                                           sched_stops, location, run_days)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'sat-thu')
-                """, op["id"], dep["from"], dep["to"], dep["time"],
-                    price, seats, seats, _j.dumps(dep_stops), location)
-                created += 1
-            for dep in fri_deps:
-                dep_stops = dep.get("stops", [dep["from"], dep["to"]])
-                await conn.execute("""
-                    INSERT INTO schedules (operator_id, route_from, route_to, departure_time,
-                                           price_per_seat, total_seats, available_seats,
-                                           sched_stops, location, run_days)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'fri')
-                """, op["id"], dep["from"], dep["to"], dep["time"],
-                    price, seats, seats, _j.dumps(dep_stops), location)
-                created += 1
-
-        await set_user_state(user.id, OP_IDLE, {})
-
-        # Build summary with full route per line
-        route_display = temp.get("bulk_route","")
-        sathu_lines = "\n".join([f"  ⏰ {d['time']} — {d.get('full_route', d['from']+' → '+d['to'])}" for d in sathu_deps])
-        fri_lines   = "\n".join([f"  ⏰ {d['time']} — {d.get('full_route', d['from']+' → '+d['to'])}" for d in fri_deps]) if fri_deps else "  _No Friday service_"
-
-        await update.message.reply_text(
-            f"🎉 *{created} Schedules Created!*\n\n"
-            f"📍 Route: *{route_display}*\n"
-            f"📌 Location: *{location}*\n"
-            f"💰 Price: *MVR {price}/seat*\n"
-            f"💺 Seats: *{seats} per departure*\n\n"
-            f"*Sat–Thu ({len(sathu_deps)} departures):*\n{sathu_lines}\n\n"
-            f"*Friday ({len(fri_deps)} departures):*\n{fri_lines}\n\n"
-            f"✅ All schedules are now live for customers!",
-            parse_mode="Markdown", reply_markup=main_kb("operator"))
-
-    # ── FLEET / BOAT ADD FLOW ────────────────────────────────────────────────────
-    elif state == OP_AWAIT_BOAT_ADD_NAME:
-        boat_name = text.strip()
-        await set_user_state(user.id, OP_AWAIT_BOAT_ADD_CAPACITY, {**temp, "new_boat_name": boat_name})
-        await update.message.reply_text(
-            f"🚤 *{boat_name}*\n\nHow many passengers can this boat carry?",
-            parse_mode="Markdown")
-
-    elif state == OP_AWAIT_BOAT_ADD_CAPACITY:
-        capacity = parse_number(text)
-        if not capacity or capacity < 1:
-            await update.message.reply_text("⚠️ Enter a valid number e.g. `20`", parse_mode="Markdown")
-            return
-        op = await get_operator(user.id)
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO boats (operator_id, boat_name, capacity) VALUES ($1,$2,$3)",
-                op["id"], temp.get("new_boat_name"), capacity)
-            boats = await conn.fetch("SELECT * FROM boats WHERE operator_id=$1 AND status='active'", op["id"])
-        await set_user_state(user.id, OP_IDLE, {})
-        fleet_list = "\n".join([f"  🚤 {b['boat_name']} ({b['capacity']} seats)" for b in boats])
-        await update.message.reply_text(
-            f"✅ *{temp.get('new_boat_name')}* added to your fleet!\n\n"
-            f"*Your Fleet:*\n{fleet_list}",
-            parse_mode="Markdown", reply_markup=main_kb("operator"))
-
-    # ── SCHEDULE FLOW ─────────────────────────────────────────────────────────
-    elif state == OP_AWAIT_SCHEDULE_ROUTE:
-        stops = [s.strip().title() for s in text.split(",") if s.strip()]
-        if len(stops) < 2:
-            # Also support "Male to Thoddoo" format as 2-stop
-            parts = [p.strip().title() for p in text.split("to", 1)]
-            if len(parts) == 2 and parts[0] and parts[1]:
-                stops = parts
-            else:
-                await update.message.reply_text(
-                    "⚠️ Enter stops comma-separated or use 'from to destination'\n\n"
-                    "_Single route: `Male, Thoddoo`_\n"
-                    "_Multi-stop: `Male, Dhigurah, Thoddoo, Dhagethi`_",
-                    parse_mode="Markdown")
-                return
-        route_display = " → ".join(stops)
-        sched_from = stops[0]
-        sched_to = stops[-1]
-        await set_user_state(user.id, OP_AWAIT_SCHEDULE_TIME,
-                             {**temp, "sched_from": sched_from, "sched_to": sched_to,
-                              "sched_stops": stops, "route_display": route_display})
-        await update.message.reply_text(
-            f"✅ Route saved!\n\n📍 *{route_display}*\n\nWhat is the *departure time*? *(24hr format)*\n\n_Example: `16:00` or `06:45`_",
-            parse_mode="Markdown")
-
-    elif state == OP_AWAIT_SCHEDULE_TIME:
-        parsed_time = parse_time_24hr(text)
-        if not parsed_time:
-            await update.message.reply_text(
-                "⚠️ Please use *24-hour format*\n\n"
-                "_Examples:_\n`16:00` not `4:00PM`\n`06:45` not `6:45am`\n`10:15`",
-                parse_mode="Markdown")
-            return
-        await set_user_state(user.id, OP_AWAIT_SCHEDULE_PRICE, {**temp, "sched_time": parsed_time})
-        await update.message.reply_text(
-            "✅ Time saved!\n\nWhat is the *price per seat* (MVR)?",
-            parse_mode="Markdown")
-
-    elif state == OP_AWAIT_SCHEDULE_PRICE:
-        price = parse_price(text)
-        if price is None or price <= 0:
-            await update.message.reply_text("⚠️ Enter a valid price e.g. `535` or `535MVR`", parse_mode="Markdown")
-            return
-        await set_user_state(user.id, OP_AWAIT_SCHEDULE_SEATS, {**temp, "sched_price": price})
-        await update.message.reply_text("✅ Price saved!\n\nHow many *available seats* for this schedule?",
-                                        parse_mode="Markdown")
-
-    elif state == OP_AWAIT_SCHEDULE_SEATS:
-        seats = parse_number(text)
-        if not seats or seats < 1:
-            await update.message.reply_text("⚠️ Enter a valid number e.g. `18`", parse_mode="Markdown")
-            return
-        sd2 = await get_user_state(user.id)
-        t2  = sd2.get("temp_data", {}) or {}
-        op  = await get_operator(user.id)
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            import json as _ji
-            await conn.execute("""
-                ALTER TABLE schedules ADD COLUMN IF NOT EXISTS sched_stops TEXT DEFAULT '[]'
-            """)
-            await conn.execute("""
-                INSERT INTO schedules (operator_id, route_from, route_to, departure_time,
-                                       price_per_seat, total_seats, available_seats, sched_stops)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-            """, op["id"], t2.get("sched_from"), t2.get("sched_to"),
-                t2.get("sched_time"), t2.get("sched_price"), seats, seats,
-                _ji.dumps(t2.get("sched_stops", [])))
-        # Ask for location next
-        await set_user_state(user.id, OP_AWAIT_SCHEDULE_LOCATION,
-                             {**t2, "sched_seats": seats})
-        await update.message.reply_text(
-            f"✅ {seats} seats saved!\n\n"
-            f"📍 *What is the departure location/jetty?*\n\n"
-            f"_Example: Jetty No. 1, Male_ or _Thoddoo Jetty_",
-            parse_mode="Markdown")
-
-    elif state == OP_AWAIT_SCHEDULE_LOCATION:
-        location = text.strip() or "Jetty No. 1, Male"
-        await set_user_state(user.id, OP_AWAIT_SCHEDULE_DAYS, {**temp, "sched_location": location})
-        await update.message.reply_text(
-            f"✅ Location: *{location}*\n\n"
-            f"📅 *Which days does this schedule run?*\n\n"
-            f"_Type one of:_\n"
-            f"• `daily` — Every day\n"
-            f"• `sat-thu` — Saturday to Thursday\n"
-            f"• `fri` — Fridays only\n"
-            f"• `weekdays` — Sunday to Thursday\n"
-            f"• `weekend` — Friday & Saturday",
-            parse_mode="Markdown")
-
-    elif state == OP_AWAIT_SCHEDULE_DAYS:
-        days_input = text.strip().lower()
-        valid_days = ["daily","sat-thu","fri","weekdays","weekend","sun-thu","everyday"]
-        run_days = days_input if days_input in valid_days else "daily"
-        t2 = temp
-        op = await get_operator(user.id)
-        # Get operator's boats
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            boats_list = await conn.fetch("SELECT * FROM boats WHERE operator_id=$1 AND status='active'", op["id"])
-        if boats_list:
-            # Let operator pick which boat runs this schedule
-            boat_buttons = [[InlineKeyboardButton(f"🚤 {b['boat_name']} ({b['capacity']} seats)",
-                callback_data=f"sched_boat_{b['id']}_{b['boat_name']}")] for b in boats_list]
-            boat_buttons.append([InlineKeyboardButton("➕ Use Default (no specific boat)", callback_data="sched_boat_0_default")])
-            # Save days in state first
-            import json as _j
-            await set_user_state(user.id, OP_AWAIT_SCHEDULE_DAYS,
-                                 {**t2, "sched_location": t2.get("sched_location","Jetty No. 1, Male"),
-                                  "run_days": run_days, "awaiting_boat_select": True})
-            await update.message.reply_text(
-                f"✅ Days: *{run_days}*\n\n🚤 *Which boat runs this schedule?*",
-                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(boat_buttons))
-        else:
-            # No boats added yet — save directly
-            import json as _j
-            seats = t2.get("sched_seats", t2.get("sched_price",0))
-            async with pool.acquire() as conn:
-                await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS sched_stops TEXT DEFAULT '[]'")
-                await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS location TEXT DEFAULT 'Jetty No. 1, Male'")
-                await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS run_days TEXT DEFAULT 'daily'")
-                await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS boat_name TEXT")
-                await conn.execute("""
-                    INSERT INTO schedules (operator_id, route_from, route_to, departure_time,
-                                           price_per_seat, total_seats, available_seats,
-                                           sched_stops, location, run_days)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-                """, op["id"], t2.get("sched_from"), t2.get("sched_to"),
-                    t2.get("sched_time"), t2.get("sched_price"),
-                    t2.get("sched_seats",0), t2.get("sched_seats",0),
-                    _j.dumps(t2.get("sched_stops",[])),
-                    t2.get("sched_location","Jetty No. 1, Male"), run_days)
-            await set_user_state(user.id, OP_IDLE, {})
-            await update.message.reply_text(
-                f"✅ *Schedule Added!*\n\n"
-                f"📍 {t2.get('sched_from')} → {t2.get('sched_to')}\n"
-                f"⏰ {t2.get('sched_time')} | 📅 {run_days}\n"
-                f"📌 {t2.get('sched_location','Jetty No. 1, Male')}\n"
-                f"💰 MVR {t2.get('sched_price')}/seat | 👥 {t2.get('sched_seats',0)} seats\n\n"
-                f"💡 Tip: Add your boats with the *🚤 My Fleet* button!",
-                parse_mode="Markdown", reply_markup=main_kb("operator"))
-
-    # ── CUSTOMER FLOW ─────────────────────────────────────────────────────────
-    elif state == CX_AWAIT_DATE:
-        travel_date = parse_date_flexible(text)
-        if not travel_date:
-            await update.message.reply_text(
-                "⚠️ Couldn\'t read that date 😅\n\nTry formats like:\n`30-06-2026` or `30/06/2026`",
-                parse_mode="Markdown")
-            return
-        if travel_date < datetime.now().date():
-            await update.message.reply_text("⚠️ Date cannot be in the past.")
-            return
-
-        route_from = temp.get("route_from","")
-        route_to   = temp.get("route_to","")
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT s.*, s.sched_stops, o.id as operator_id, o.business_name, o.boat_name, o.logo_url,
-                       o.is_recommended, o.average_rating, o.total_reviews, o.owner_contact,
-                       o.review_text, o.bml_account, o.payment_accounts, o.telegram_id as op_telegram_id
-                FROM schedules s
-                JOIN operators o ON s.operator_id = o.id
-                WHERE LOWER(s.route_from) LIKE $1 AND LOWER(s.route_to) LIKE $2
-                  AND o.status='approved' AND s.is_active=TRUE AND s.available_seats>0
-                  AND COALESCE(o.subscription_status,'trial') != 'expired'
-                  AND (
-                    s.run_days = 'daily' OR s.run_days IS NULL
-                    OR (s.run_days = 'fri'     AND EXTRACT(DOW FROM $3::date) = 5)
-                    OR (s.run_days = 'sat-thu' AND EXTRACT(DOW FROM $3::date) != 5)
-                    OR (s.run_days = 'weekdays' AND EXTRACT(DOW FROM $3::date) BETWEEN 0 AND 4)
-                    OR (s.run_days = 'weekend'  AND EXTRACT(DOW FROM $3::date) IN (5,6))
-                    OR (s.run_days = 'sun-thu'  AND EXTRACT(DOW FROM $3::date) BETWEEN 0 AND 4)
-                    OR (s.run_days = 'everyday')
-                  )
-                ORDER BY o.is_recommended DESC, s.departure_time ASC
-            """, f"%{route_from.lower()}%", f"%{route_to.lower()}%", travel_date)
-
-        if not rows:
-            await update.message.reply_text(
-                f"😔 No boats found for *{route_from} → {route_to}* on *{text}*.\n\nTry a different date or route.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔍 Search Again", callback_data="cx_search")]]))
-            await set_user_state(user.id, CX_IDLE, {})
-            return
-
-        schedules = [dict(r) for r in rows]
-        # Store only IDs in state to avoid temp_data size limit; cache full data in context
-        sched_ids = [s["id"] for s in schedules]
-        ctx.user_data["schedules_cache"] = schedules
-        await set_user_state(user.id, CX_AWAIT_PASSENGER_COUNT,
-                             {**temp, "travel_date": str(travel_date), "sched_ids": sched_ids})
-
-        # Sort options row
-        sort_key = temp.get("sort_by", "recommended")
-        if sort_key == "earliest":
-            schedules = sorted(schedules, key=lambda x: x["departure_time"])
-        elif sort_key == "cheapest":
-            schedules = sorted(schedules, key=lambda x: float(x["price_per_seat"] or 0))
-        elif sort_key == "seats":
-            schedules = sorted(schedules, key=lambda x: x["available_seats"], reverse=True)
-        else:  # recommended (default)
-            schedules = sorted(schedules, key=lambda x: (not x.get("is_recommended"), x["departure_time"]))
-
-        sort_labels = {"recommended":"⭐ Rec","earliest":"⏰ Early","cheapest":"💰 Cheap","seats":"💺 Seats"}
-        sort_row = [
-            InlineKeyboardButton(f"{'✓ ' if sort_key==k else ''}{v}",
-                callback_data=f"srt_{k}")   # short callback — max 64 chars safe
-            for k, v in sort_labels.items()
-        ]
-
-        msg = f"🚢 *Available Boats — {route_from} → {route_to}*\n📅 *{text}*\n\n"
-        buttons = [sort_row]
-        for i, s in enumerate(schedules):
-            rating_val = float(s.get("average_rating") or 0)
-            stars = "⭐" * int(rating_val) if rating_val else "No ratings yet"
-            rec = "✨ *Recommended by Samuga Travels*\n" if s.get("is_recommended") else ""
-            # Build stops line for multi-stop ferries
-            import json as _j
-            try:
-                stops_list = _j.loads(s.get("sched_stops") or "[]")
-                if stops_list and len(stops_list) > 2:
-                    stops_line = "🛑 " + " → ".join(stops_list) + "\n"
-                else:
-                    stops_line = ""
-            except Exception:
-                stops_line = ""
-            # Trust score line
-            total_reviews = s.get("total_reviews", 0) or 0
-            rating_val = float(s.get("average_rating") or 0)
-            if total_reviews >= 20:
-                trust = "🏆 Top Rated"
-            elif total_reviews >= 5:
-                trust = "✅ Verified"
-            elif total_reviews >= 1:
-                trust = "🆕 New Operator"
-            else:
-                trust = "🆕 New"
-
-            # Completed bookings count
-            msg += (
-                f"{'─'*30}\n"
-                f"🚤 *{s['business_name']}* — _{s['boat_name']}_\n"
-                f"{rec}"
-                f"📍 {s['route_from']} → {s['route_to']}\n"
-                f"{stops_line}"
-                f"⏰ Departure: *{s['departure_time']}*\n"
-                f"💺 Available: *{s['available_seats']} seats* | 💰 *MVR {s['price_per_seat']}/seat*\n"
-                f"{trust} · ⭐ {rating_val:.1f} ({total_reviews} reviews)\n"
-            )
-            if s.get("review_text"):
-                msg += f"💬 _{s['review_text']}_\n"
-            msg += "\n"
-            buttons.append([InlineKeyboardButton(
-                f"Book — {s['business_name']} ({s['departure_time']})",
-                callback_data=f"book_sched_{i}")])
-
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
-
-    elif state == CX_AWAIT_CONTACT:
-        parts = text.split(",", 1)
-        if len(parts) != 2:
-            await update.message.reply_text("⚠️ Format: `Full Name, Phone Number`\n\nExample: `Ahmed Ali, 7771234`", parse_mode="Markdown")
-            return
-        cx_name = parts[0].strip()
-        cx_phone = parts[1].strip()
-        await set_user_state(user.id, CX_AWAIT_PASSENGER_COUNT, {**temp, "cx_name": cx_name, "cx_phone": cx_phone})
-        await update.message.reply_text(
-            f"✅ *{cx_name}* saved!\n\n"
-            f"If this contact is wrong, tap *Edit contact*.\n"
-            f"If it is correct, just type the number of seats and continue.\n\n"
-            f"💺 How many seats would you like to book?\n_(Max 10, available: {temp.get('sel_seats',0)})_",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✏️ Edit contact", callback_data="cx_edit_contact")],
-                [InlineKeyboardButton("📅 Change date / boat", callback_data="cx_edit_trip")]
-            ]))
-
-    elif state == CX_AWAIT_PASSENGER_COUNT:
-        count = parse_number(text)
-        if not count or count < 1:
-            await update.message.reply_text("⚠️ Enter a valid number e.g. `2`", parse_mode="Markdown")
-            return
-        if count > 10:
-            await update.message.reply_text("⚠️ Maximum 10 seats per booking.")
-            return
-        if count > int(temp.get("sel_seats", 0)):
-            await update.message.reply_text(f"⚠️ Only *{temp.get('sel_seats')} seats* available.", parse_mode="Markdown")
-            return
-        # Build example format based on count
-        cx_name = temp.get("cx_name", "You")
-        # Build example with booker's name as passenger 1
-        example_lines = []
-        example_lines.append(f"1. {cx_name}, (your ID/passport number)")
-        for i in range(1, count):
-            example_lines.append(f"{i+1}. Full Name, ID/Passport Number")
-        example_str = "\n".join(example_lines)
-
-        await set_user_state(user.id, CX_COLLECTING_PASSENGERS,
-                             {**temp, "passenger_count": count, "passengers_collected": [], "current_passenger": 1})
-        await update.message.reply_text(
-            f"👥 *Passenger count: {count}*\n\n"
-            f"If this number is wrong, tap *Edit passenger count*.\n"
-            f"If it is correct, just send the passenger details and continue.\n\n"
-            f"*Enter all {count} passenger(s) at once:*\n\n"
-            f"_One per line — Name, ID or Passport Number_\n\n"
-            f"_Example:_\n`{example_str}`\n\n"
-            f"📌 ID card for Maldivians, Passport number for foreigners\n\n"
-            f"Send all {count} in one message 👇",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✏️ Edit passenger count", callback_data="cx_edit_pax_count")
-            ]]))
-
-    elif state == CX_COLLECTING_PASSENGERS:
-        sd2 = await get_user_state(user.id)
-        t2  = sd2.get("temp_data", {}) or {}
-        total = t2.get("passenger_count", 1)
-
-        # Parse all passengers from one message — one per line
-        # Strip leading numbers like "1. Ahmed" or "1) Ahmed"
-        import re as _re
-        lines_raw = [_re.sub(r"^\d+[.)\-\s]+", "", l.strip()) for l in text.strip().split("\n") if l.strip()]
-        passengers = []
-        errors = []
-        for i, line in enumerate(lines_raw):
-            parsed = parse_name_id(line)
-            if parsed:
-                passengers.append({"name": parsed[0], "id_number": parsed[1]})
-            else:
-                errors.append(f"Line {i+1}: couldn\'t read `{line}`")
-
-        if errors or len(passengers) != total:
-            example = "\n".join([f"{i+1}. Ahmed Ali, A12345{i}" for i in range(total)])
-            err_msg = "\n".join(errors) if errors else ""
-            await update.message.reply_text(
-                f"⚠️ Need exactly *{total} passenger(s)*, one per line.\n\n"
-                f"{err_msg}\n\n"
-                f"_Example for {total} passenger(s):_\n`{example}`\n\n"
-                f"If the passenger count was a mistake, tap *Edit passenger count*. Otherwise send the correct list again.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✏️ Edit passenger count", callback_data="cx_edit_pax_count")
-                ]]))
-            return
-
-        if True:  # always show summary now
-            t2["passengers_collected"] = passengers
-            # fall through to summary below
-            pass
-        if False:
-            pass
-        else:
-            sd3 = await get_user_state(user.id)
-            t3  = sd3.get("temp_data", {}) or {}
-            t3["passengers_collected"] = passengers
-            total_amt = float(t3.get("sel_price", 0)) * total
-            pax_lines = "\n".join([f"  {i+1}. {p.get('name','N/A')} ({p.get('id_number','N/A')})" for i,p in enumerate(passengers)])
-            import json as _json
-            pay_str = ""
-            try:
-                accounts = _json.loads(t3.get("sel_payment_accounts") or "[]")
-                if accounts:
-                    for acc in accounts:
-                        pay_str += f"🏦 *{acc['bank']}:* `{acc['number']}`"
-                        if acc.get("name"): pay_str += f" — {acc['name']}"
-                        pay_str += "\n"
-                else:
-                    pay_str = f"🏦 *BML:* `{t3.get('sel_bml','N/A')}`\n"
-            except Exception:
-                pay_str = f"🏦 *BML:* `{t3.get('sel_bml','N/A')}`\n"
-
-            summary = (
-                f"📝 *Booking Summary*\n\n"
-                f"👤 *Booker:* {t3.get('cx_name','N/A')} | 📞 {t3.get('cx_phone','N/A')}\n"
-                f"🚤 *Operator:* {t3.get('sel_business')}\n"
-                f"🛥️ *Boat:* {t3.get('sel_boat')}\n"
-                f"📍 *Route:* {t3.get('route_from')} → {t3.get('route_to')}\n"
-                f"📅 *Date:* {t3.get('travel_date')}\n"
-                f"⏰ *Departure:* {t3.get('sel_time')}\n"
-                f"👥 *Passengers ({total}):*\n{pax_lines}\n\n"
-                f"💰 *Total:* MVR {total_amt:.2f}\n\n"
-                f"{'─'*30}\n"
-                f"💳 *Payment Details:*\n\n"
-                f"{pay_str}"
-                f"💰 Amount: *MVR {total_amt:.2f}*\n\n"
-                f"⚠️ *Cancellation / Refund Policy*\n\n"
-                f"Please double-check your *route, date, time, passenger details, account number,* and *account name* before transfer.\n\n"
-                f"If you send money to the wrong bank/account, this is not refundable by Samuga Travels or the operator. You must contact your bank.\n\n"
-                f"Refunds/cancellations for valid payments depend on the operator's policy and trip timing.\n\n"
-                f"👉 If everything is correct, transfer and *upload your payment screenshot here.*\n\n"
-                f"Need to fix something? Use the edit buttons below before paying."
-            )
-            await set_user_state(user.id, CX_AWAIT_PAYMENT_SLIP,
-                                 {**t3, "total_amount": str(total_amt), "passengers_collected": passengers})
-            await update.message.reply_text(
-                summary,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✏️ Edit contact", callback_data="cx_edit_contact"),
-                     InlineKeyboardButton("✏️ Edit passengers", callback_data="cx_edit_pax_details")],
-                    [InlineKeyboardButton("✏️ Edit passenger count", callback_data="cx_edit_pax_count")],
-                    [InlineKeyboardButton("📅 Change date / boat", callback_data="cx_edit_trip")]
-                ]))
-
-    else:
-        # Default — route search from text
-        if " to " in text.lower():
-            parts = text.lower().split(" to ", 1)
-            rf = parts[0].strip().title()
-            rt = parts[1].strip().title()
-            await set_user_state(user.id, CX_AWAIT_DATE, {"route_from": rf, "route_to": rt})
-            from datetime import timedelta
-            today = datetime.now().date()
-            dates = [today + timedelta(days=i) for i in range(4)]
-            date_buttons = [[InlineKeyboardButton(
-                f"{'Today' if i==0 else 'Tomorrow' if i==1 else d.strftime('%a %d %b')}",
-                callback_data=f"date_select_{d.strftime('%d-%m-%Y')}"
-            )] for i, d in enumerate(dates)]
-            await update.message.reply_text(
-                f"🔍 *{rf} → {rt}*\n\n📅 Select your *travel date* or type manually:\n_(DD-MM-YYYY or DD/MM/YYYY)_",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(date_buttons))
-            return   # ← don't fall through to else block!
-        else:
-            sd2 = await get_user_state(user.id)
-            role = sd2.get("role","customer")
-            if role == "operator":
-                op = await get_operator(user.id)
-                role = "operator" if (op and op.get("status")=="approved") else "customer"
-            # Show available routes as suggestions
-            try:
-                pool2 = await get_pool()
-                async with pool2.acquire() as conn2:
-                    avail = await conn2.fetch("""
-                        SELECT DISTINCT s.route_from, s.route_to
-                        FROM schedules s JOIN operators o ON s.operator_id=o.id
-                        WHERE o.status='approved' AND s.is_active=TRUE AND s.available_seats>0
-                        AND COALESCE(o.subscription_status,'trial') != 'expired'
-                        ORDER BY s.route_from LIMIT 6
-                    """)
-                if avail:
-                    route_list = "\n".join([f"  `{r['route_from']} to {r['route_to']}`" for r in avail])
-                    await update.message.reply_text(
-                        f"👋 Just type your route to search!\n\n"
-                        f"*Available routes:*\n{route_list}\n\n"
-                        f"_Or type any route you need_ 👇",
-                        parse_mode="Markdown", reply_markup=main_kb(role))
-                else:
-                    await update.message.reply_text(
-                        "👋 Type a route like *Male to Thoddoo* to search for boats!",
-                        parse_mode="Markdown", reply_markup=main_kb(role))
-            except Exception:
-                await update.message.reply_text(
-                    "👋 Type a route like *Male to Thoddoo* to search for boats!",
-                    parse_mode="Markdown", reply_markup=main_kb(role))
-
-# ── PHOTO HANDLER ─────────────────────────────────────────────────────────────
-async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    sd   = await get_user_state(user.id)
-    state= sd.get("state", CX_IDLE)
-    temp = sd.get("temp_data", {}) or {}
-
-    photo = update.message.photo[-1]
-    f = await ctx.bot.get_file(photo.file_id)
-    file_bytes = bytes(await f.download_as_bytearray())
-
-    if state == OP_AWAIT_LOGO:
-        await update.message.reply_text("⏳ Uploading logo...")
-        url = await upload_image(file_bytes, "logos", f"logo_{user.id}")
-        await set_user_state(user.id, OP_AWAIT_ROUTES, {**temp, "logo_url": url})
-        await update.message.reply_text(
-            "✅ Logo uploaded!\n\n*Step 5:* Enter your *route with all stops in order*\n\n"
-            "_For a ferry with multiple stops:_\n"
-            "`Male, Dhigurah, Thoddoo, Dhagethi`\n\n"
-            "_For a direct route:_\n"
-            "`Male, Thoddoo`\n\n"
-            "_Separate each stop with a comma in travel order._",
-            parse_mode="Markdown")
-
-    elif state == OP_AWAIT_OWNER_ID_PHOTO:
-        await update.message.reply_text("⏳ Uploading ID securely to Samuga Travels storage...")
-        url = await upload_image(file_bytes, "private/id_photos", f"id_{user.id}")
-        await set_user_state(user.id, OP_AWAIT_BML_ACCOUNT, {**temp, "owner_id_photo_url": url})
-        await update.message.reply_text(
-            "✅ ID uploaded!\n\n*Final step:* Your *BML bank account number and account name*?\n\n"
-            "_Format: AccountNumber AccountName_\n_Example: 7770000234231 Samuga Art_",
-            parse_mode="Markdown")
-
-    elif state == CX_AWAIT_PAYMENT_SLIP:
-        await update.message.reply_text("⏳ Processing your payment slip...")
-        sd2 = await get_user_state(user.id)
-        t2  = sd2.get("temp_data", {}) or {}
-        op_contact_fb = t2.get("sel_op_contact","") or ""
-        op_name_fb    = t2.get("sel_business","") or "the operator"
-        booking_id = None
-        ref = None
-
-        # STEP 1: Save booking (critical)
+    # ── Dhivehi cards: generate Dhivehi text, queue for approval (card built on approval) ──
+    if is_dv:
         try:
-            ref = gen_ref()
-            url = await upload_image(file_bytes, "private/payment_slips", f"slip_{ref}")
-            from datetime import date as _date
-            travel_date_raw = t2.get("travel_date","")
-            try:
-                if isinstance(travel_date_raw, str) and travel_date_raw:
-                    travel_date_val = datetime.strptime(travel_date_raw, "%Y-%m-%d").date()
-                else:
-                    travel_date_val = _date.today()
-            except Exception:
-                travel_date_val = _date.today()
-            operator_id  = int(t2.get("sel_operator_id") or 0) or None
-            schedule_id  = int(t2.get("sel_schedule_id") or 0) or None
-            pax_count    = int(t2.get("passenger_count") or 1)
-            total_amount = float(t2.get("total_amount") or 0)
-            customer_name = f"{t2.get('cx_name','')} | {t2.get('cx_phone','')}"
-            passengers_json = json.dumps(t2.get("passengers_collected",[]))
-            logger.info(f"Booking insert: ref={ref} op={operator_id} sched={schedule_id} date={travel_date_val} pax={pax_count} amt={total_amount}")
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                row = await conn.fetchrow("""
-                    INSERT INTO bookings (booking_ref, customer_telegram_id, customer_name, operator_id, schedule_id,
-                                          travel_date, passenger_count, passengers, total_amount,
-                                          payment_slip_url, status)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending_confirmation')
-                    RETURNING id
-                """, ref, user.id, customer_name, operator_id, schedule_id,
-                    travel_date_val, pax_count, passengers_json, total_amount, url)
-            booking_id = row["id"]
-            logger.info(f"✅ Booking {ref} saved with id={booking_id}")
+            rewritten, keyword = rewrite_news(_strip_telegram_metadata(article["title"]), _strip_telegram_metadata(article["summary"]), cat)
+            dv_text = make_dhivehi_caption(rewritten, article["title"])
+            if not dv_text:
+                log.warning(f"Dhivehi caption failed for: {article['title'][:50]}")
+                return False
+            key = store_pending_approval(
+                None, None, article["title"], article["link"], cat=cat, lang="dv",
+                dv_text=dv_text, keyword=keyword, source=article.get("source","LOCAL"),
+                is_breaking=breaking, allow_social=allow_social,
+                dedup_title=article.get("_dedup_title"), summary=article.get("summary","")
+            )
+            if not key:
+                return False
+            approval_queue[key]["article_id"] = article["id"]
+            approval_queue[key]["_priority"] = article.get("_priority", priority)
+            approval_queue[key]["_confidence"] = confidence
+            approval_queue[key]["_cluster_size"] = article.get("_cluster_size", 1)
+            approval_queue[key]["_trend_theme"] = article.get("_trend_theme", "")
+            approval_queue[key]["summary"] = article.get("summary", "")
+            # Pre-fetch background in background thread so card builds instantly on approval
+            def _prefetch_bg(_key=key, _kw=keyword, _title=article["title"], _cat=cat):
+                try:
+                    bg = fetch_background_image(_kw, cat=_cat, title=_title)
+                    if _key in approval_queue:
+                        approval_queue[_key]["_bg_image"] = bg
+                except Exception: pass
+            threading.Thread(target=_prefetch_bg, daemon=True).start()
+            _send_approval_card(key, approval_queue[key])
+            db_mark_status(article["id"], "queued")
+            return True
         except Exception as e:
-            logger.error(f"❌ Payment slip booking save error: {e}", exc_info=True)
+            log.error(f"Dhivehi approval queue: {e}")
+            return False
+
+    # ── English regular: build card, queue for approval ──
+    try:
+        card_bytes, caption, rewritten, keyword = _build_card_and_caption(article)
+        key = store_pending_approval(
+            card_bytes, caption, article["title"], article["link"], cat=cat, lang="en",
+            dv_text=None, keyword=keyword, source=article.get("source","LOCAL"),
+            is_breaking=breaking, allow_social=allow_social,
+            dedup_title=article.get("_dedup_title"), summary=article.get("summary","")
+        )
+        if not key:
+            return False
+        # Stash rewritten + summary for poll generation on approval
+        approval_queue[key]["rewritten"] = rewritten
+        approval_queue[key]["summary"] = article.get("summary","")
+        approval_queue[key]["article_id"] = article["id"]
+        approval_queue[key]["_priority"] = article.get("_priority", priority)
+        approval_queue[key]["_confidence"] = confidence
+
+        # Website-first publishing: every English story selected by the bot
+        # goes to the website immediately, even while Telegram/socials wait for
+        # approval or the queue. Dhivehi stays private until approved/posted.
+        try:
+            db_publish_article_for_website(
+                article_id=article["id"],
+                title=article["title"],
+                summary=samuga_public_summary(article.get("title", ""), article.get("summary", ""), rewritten),
+                category=cat,
+                source=SAMUGA_PUBLIC_SOURCE,
+                link=SAMUGA_PUBLIC_LINK,
+                lang="en",
+                score=article.get("_priority", 0),
+                reliability=source_reliability(article.get("source", "")),
+                is_breaking=breaking
+            )
+            log.info(f"🌐 Website published EN story immediately: {article['title'][:60]}")
+        except Exception as e:
+            log.error(f"[WEBSITE] EN immediate publish failed: {e}")
+
+        approval_queue[key]["_cluster_size"] = article.get("_cluster_size", 1)
+        approval_queue[key]["_trend_theme"] = article.get("_trend_theme", "")
+        _send_approval_card(key, approval_queue[key])
+        db_mark_status(article["id"], "queued")
+
+        # ── Auto-generate Dhivehi version in background ──────────────────────
+        # Every English article also gets a Dhivehi card queued for approval.
+        # Runs in a thread so it doesn't delay the English card.
+        if GEMINI_API_KEY:
+            def _auto_dv(_rewritten=rewritten, _title=article["title"],
+                         _link=article["link"], _cat=cat, _keyword=keyword,
+                         _source=article.get("source","LOCAL"), _aid=article["id"],
+                         _summary=article.get("summary", "")):
+                try:
+                    dv_text = make_dhivehi_caption(_rewritten, _title)
+                    if not dv_text:
+                        log.debug(f"[AI] Auto-Dhivehi: Gemini returned nothing for {_title[:40]}")
+                        return
+                    dv_key = store_pending_approval(
+                        None, None, _title, _link, cat=_cat, lang="dv",
+                        dv_text=dv_text, keyword=_keyword, source=_source,
+                        is_breaking=breaking, allow_social=allow_social,
+                        dedup_title=story_signal_key(_title, _rewritten, "dv"), summary=_summary
+                    )
+                    if not dv_key:
+                        return
+                    approval_queue[dv_key]["article_id"] = f"{_aid}_dv"
+                    approval_queue[dv_key]["_priority"] = 0
+                    approval_queue[dv_key]["summary"] = _summary
+                    _send_approval_card(dv_key, approval_queue[dv_key])
+                    log.info(f"[AI] Auto-Dhivehi queued: {_title[:50]}")
+                except Exception as e:
+                    log.debug(f"[AI] Auto-Dhivehi: {e}")
+            threading.Thread(target=_auto_dv, daemon=True).start()
+
+        return True
+    except Exception as e:
+        log.error(f"English approval queue: {e}")
+        return False
+
+
+# ── Run Job ───────────────────────────────────────────────────────────────────
+def run_job(social_only=False, breaking_only=False):
+    """
+    Every 15-min scan:
+      - Breaking news: posts immediately to all platforms (no queue, no limit)
+      - Breaking low-confidence: goes to Alert, auto-posts in 30 min if no action
+      - Regular English: max 2-3 best per HOUR go to Content Lab - bot picks, not all
+      - Regular Dhivehi: max 2-3 best per HOUR go to Content Lab
+      - Total Content Lab cards: max 6 per hour (3 EN + 3 DV)
+      - Breaking is completely separate - never counts toward hourly budget
+    """
+    global daily_sports_count, daily_world_count, daily_tourism_count, _pending_article
+    h = get_mvt_hour()
+    log.info(f"🕐 MVT {h:02d}:xx | {'DAY' if is_day_mode() else 'NIGHT'}")
+    seen = load_seen()
+    articles = fetch_news()
+
+    fresh = [a for a in articles if a["id"] not in seen]
+    if not fresh:
+        log.info("No fresh articles."); return
+
+    # Pre-build clusters for corroboration scoring
+    for a in fresh:
+        size, srcs = register_in_cluster(a["title"], a.get("source",""))
+        a["_cluster_size"] = size
+        a["_cluster_sources"] = srcs
+
+    fresh.sort(key=score_article, reverse=True)
+
+    breaking_articles = [a for a in fresh if is_breaking(a["title"], a.get("summary",""), a["cat"])]
+    regular_articles  = [] if breaking_only else [a for a in fresh if not is_breaking(a["title"], a.get("summary",""), a["cat"])]
+
+    if breaking_only and not breaking_articles:
+        log.info("🌙 Night mode: no breaking news found"); return
+
+    log.info(f"🔴 {len(breaking_articles)} breaking | 🟡 {len(regular_articles)} regular")
+
+    # ── 1. BREAKING — fires immediately, no budget, no throttle ─────────────
+    if breaking_articles:
+        a = breaking_articles[0]
+        log.info(f"🔴 BREAKING: {a['title'][:60]}")
+        post_article(a, seen, social_only=False, allow_social=True)
+
+    if breaking_only:
+        return
+
+    # ── 2. PROGRESSIVE SCORING FUNNEL ────────────────────────────────────────
+    # Each 15-min scan: score all fresh articles → funnel down to 1-2 winners
+    # No hard quota cut — exceptional articles always get through
+    # Hour safety cap: HOURLY_CARD_CAP (10) so Railway doesn't get spammed
+
+    now_mvt = utcnow() + timedelta(hours=5)
+    hour_start = now_mvt.replace(minute=0, second=0, microsecond=0)
+    hour_start_utc = hour_start - timedelta(hours=5)
+
+    # Count cards already created this hour (across both languages)
+    cards_this_hour = sum(1 for v in approval_queue.values()
+                          if v.get("created_at", utcnow()) >= hour_start_utc)
+
+    if cards_this_hour >= HOURLY_CARD_CAP:
+        log.info(f"📵 Hourly safety cap hit ({cards_this_hour}/{HOURLY_CARD_CAP}) — skipping scan")
+        return
+
+    scan_slots = HOURLY_CARD_CAP - cards_this_hour  # remaining capacity this hour
+
+    def progressive_funnel(articles, label=""):
+        """
+        Progressive scoring funnel:
+        Score all → keep top 50% → score again → keep top 50% → repeat
+        until 1-3 articles remain. Returns ordered list of winners.
+        This mirrors how a senior editor thinks — first cut obvious low quality,
+        then keep re-evaluating until the best stories surface naturally.
+        """
+        if not articles:
+            return []
+
+        # First: attach scores to all articles (sort by recency bonus too)
+        scored = []
+        for a in articles:
+            s = score_article(a)
+            # Freshness bonus: articles from this scan get +10 so newest rises faster
+            pub = a.get("published")
+            if pub:
+                try:
+                    age_mins = (utcnow() - pub).total_seconds() / 60
+                    if age_mins < 30:
+                        s += 15   # very fresh — just posted
+                    elif age_mins < 60:
+                        s += 8    # fresh — within the hour
+                except Exception:
+                    pass
+            a["_funnel_score"] = s
+            scored.append(a)
+
+        # Cut anything below minimum threshold immediately
+        scored = [a for a in scored if a["_funnel_score"] >= FUNNEL_MIN_SCORE]
+        if not scored:
+            log.info(f"[FUNNEL] {label}: all articles below min score {FUNNEL_MIN_SCORE}")
+            return []
+
+        scored.sort(key=lambda a: a["_funnel_score"], reverse=True)
+        log.info(f"[FUNNEL] {label}: {len(articles)} → {len(scored)} after min score cut")
+
+        # Progressive halving passes
+        pool = scored
+        pass_num = 0
+        while len(pool) > 3:
+            pass_num += 1
+            # Re-score with latest context (cluster size may have grown)
+            for a in pool:
+                a["_funnel_score"] = score_article(a)
+            pool.sort(key=lambda a: a["_funnel_score"], reverse=True)
+            keep = max(1, int(len(pool) * FUNNEL_KEEP_RATIO))
+            prev = len(pool)
+            pool = pool[:keep]
+            log.info(f"[FUNNEL] {label} pass {pass_num}: {prev} → {len(pool)}")
+
+        # Final sort — highest score first
+        pool.sort(key=lambda a: a["_funnel_score"], reverse=True)
+
+        if len(pool) == 0:
+            return []
+
+        # Decide how many cards this scan gets:
+        # Normally 1. If top article scores 180+ AND second also high → 2.
+        top_score = pool[0]["_funnel_score"]
+        if top_score >= CONTENT_LAB_HIGH_SCORE and len(pool) >= 2 and pool[1]["_funnel_score"] >= CONTENT_LAB_HIGH_SCORE:
+            winners = pool[:2]
+            log.info(f"[FUNNEL] {label}: 2 winners (both scored {pool[0]['_funnel_score']} + {pool[1]['_funnel_score']})")
+        else:
+            winners = pool[:1]
+            log.info(f"[FUNNEL] {label}: 1 winner (score {top_score}) — {'2nd scored too low' if len(pool) >= 2 else 'only 1 article'}")
+
+        return winners
+
+    # Run funnel separately for EN and DV
+    en_regular = [a for a in regular_articles if a.get("lang", "en") == "en"]
+    dv_regular  = [a for a in regular_articles if a.get("lang") == "dv"]
+
+    en_winners = progressive_funnel(en_regular, label="EN") if en_regular else []
+    dv_winners = progressive_funnel(dv_regular, label="DV") if dv_regular else []
+
+    all_winners = en_winners + dv_winners
+    log.info(f"[FUNNEL] Final: {len(en_winners)} EN + {len(dv_winners)} DV winners this scan "
+             f"| {cards_this_hour}/{HOURLY_CARD_CAP} cards used this hour")
+
+    if not all_winners:
+        log.info("📭 No articles passed the funnel this scan")
+        return
+
+    # Re-use existing budget variables for downstream compatibility
+    en_budget = len(en_winners)
+    dv_budget = len(dv_winners)
+
+    # ── 2a. Dhivehi — funnel winners only ────────────────────────────────────
+    dv_sent = 0
+    for a in dv_winners:
+        if not is_duplicate_story(a["title"]):
+            log.info(f"🇲🇻 DV winner (score {a.get('_funnel_score',0)}): {a['title'][:55]}")
+            post_article(a, seen, social_only=False, allow_social=False)
+            dv_sent += 1
+        else:
+            note_duplicate_skip()
+    if dv_sent:
+        log.info(f"🇲🇻 {dv_sent} Dhivehi card(s) → Content Lab")
+
+    # ── 2b. English — funnel winners only ────────────────────────────────────
+    if not can_post_regular():
+        secs_left = int(TELEGRAM_GAP_SECONDS - (utcnow() - last_regular_post_time).total_seconds())
+        log.info(f"⏳ Telegram 2hr gap active — {secs_left//60}m left (but Content Lab still gets cards)")
+
+    en_sent = 0
+    for a in en_winners:
+        cat = a["cat"]
+        text_lower = (a["title"] + " " + a.get("summary","")).lower()
+
+        # Sports: Maldives national team only, max 1/day
+        if cat in ["SPORTS", "FOOTBALL"]:
+            mv_sports = ["maldives","dhivehi","raajje","national team","team maldives"]
+            if not any(kw in text_lower for kw in mv_sports):
+                log.info(f"⏭️ EN winner filtered (non-MV sports): {a['title'][:50]}")
+                continue
+            if not can_post_cat_today(daily_sports_count, 1):
+                log.info(f"⏭️ EN winner filtered (sports daily cap): {a['title'][:50]}")
+                continue
+
+        # World: Maldives-relevant only, max 2/day
+        elif cat == "WORLD":
+            mv_world = ["maldives","indian ocean","south asia","india","china",
+                        "un ","dollar","oil","global economy"]
+            if not any(kw in text_lower for kw in mv_world):
+                log.info(f"⏭️ EN winner filtered (non-MV world): {a['title'][:50]}")
+                continue
+            if not can_post_cat_today(daily_world_count, 2):
+                continue
+
+        # Tourism: max 2/day
+        elif cat == "TOURISM":
+            if not can_post_cat_today(daily_tourism_count, 2):
+                continue
+
+        if not is_duplicate_story(a["title"]):
+            log.info(f"🟡 EN winner (score {a.get('_funnel_score',0)}) → Content Lab: {a['title'][:55]}")
+            post_article(a, seen, social_only=False, allow_social=True)
+            en_sent += 1
+        else:
+            note_duplicate_skip()
+
+    if en_sent:
+        log.info(f"📰 {en_sent} English card(s) sent to Content Lab")
+
+    log.info(f"✅ run_job done — {en_sent} EN + {dv_sent} DV sent to Content Lab this run")
+
+# Sources scanned in the fast breaking-news check (5 min cycle)
+BREAKING_SOURCES = [
+    {"url": "https://sunonline.mv/feed",              "cat": "LOCAL", "lang": "dv"},
+    {"url": "https://psmnews.mv/en/feed",             "cat": "LOCAL", "lang": "en"},
+    # visitmaldives removed from breaking sources — tourism is never breaking news
+    {"url": "https://maldivesvoice.com/feed",         "cat": "LOCAL", "lang": "en"},
+    {"url": "https://english.sun.mv/feed",            "cat": "LOCAL", "lang": "en"},
+    {"url": "https://edition.mv/feed",                "cat": "LOCAL", "lang": "en"},
+    {"url": "https://mihaaru.com/rss",                "cat": "LOCAL", "lang": "dv"},
+    {"url": "https://avas.mv/feed",                   "cat": "LOCAL", "lang": "dv"},
+]
+
+def fetch_breaking_sources():
+    """Fetch only the priority breaking-news sources (used by 5-min fast check)."""
+    articles, seen_titles = [], set()
+    # MvCrisis always first
+    for a in fetch_mvcrisis():
+        if a["title"] not in seen_titles:
+            seen_titles.add(a["title"])
+            articles.append(a)
+    for fc in BREAKING_SOURCES:
+        try:
+            feed = feedparser.parse(fc["url"])
+            for entry in feed.entries[:5]:
+                title   = entry.get("title", "")
+                summary = entry.get("summary", title)
+                if fc["lang"] == "dv":
+                    title   = gemini_translate(title)
+                    summary = gemini_translate(summary[:300])
+                key = title.lower()[:50]
+                if key in seen_titles or not is_fresh(entry): continue
+                seen_titles.add(key)
+                articles.append({
+                    "id":      hashlib.md5(entry.get("link", title).encode()).hexdigest(),
+                    "title":   title,
+                    "summary": summary,
+                    "link":    entry.get("link", ""),
+                    "cat":     fc["cat"],
+                    "lang":    fc["lang"],
+                    "source":  entry.get("source", {}).get("title", fc["cat"]),
+                })
+        except Exception as e:
+            log.error(f"Breaking source feed error ({fc['url']}): {e}")
+    return articles
+
+def breaking_news_check():
+    """Fast check every 5 min — priority sources only, no Telegram throttle"""
+    try:
+        seen = load_seen()
+        articles = fetch_breaking_sources()
+        for a in articles:
+            if a["id"] in seen: continue
+            if a["cat"] not in ["LOCAL", "DISASTER"]: continue
+            if not is_breaking(a["title"], a.get("summary",""), a["cat"]): continue
+            # Score for Maldives relevance
+            if score_article(a) < 60: continue
+            log.info(f"🔴 BREAKING FAST: {a['title'][:60]}")
+            post_article(a, seen, social_only=False, allow_social=True)
+            break  # one at a time
+    except Exception as e:
+        log.error(f"Breaking check: {e}")
+
+def scheduled_check():
+    h=get_mvt_hour()
+    if not is_day_mode():
+        log.info(f"🌙 Night mode (MVT {h:02d}:xx) — breaking news only")
+        run_job(breaking_only=True); return
+    run_job()
+
+# ── Morning Brief (7AM MVT) ───────────────────────────────────────────────────
+def send_morning_brief():
+    log.info("🌅 Morning brief...")
+    try:
+        headlines=get_local_headlines()
+        if not headlines: return
+        # Inject actual MVT date so Claude never hallucinates it
+        from datetime import timezone, timedelta
+        mvt = datetime.now(timezone.utc) + timedelta(hours=5)
+        today_str = mvt.strftime("%A, %d %B %Y")
+        prompt = f"""Create a warm "Good Morning Maldives 🌅" news brief for @samugacommunity.
+Today's date is {today_str} (Maldives Time). Use this exact date in your greeting.
+Headlines: {chr(10).join(headlines[:8])}
+- Friendly greeting mentioning today's date exactly as given above
+- Top 3-5 stories in 1 sentence each with emoji  
+- Upbeat closing
+- Max 180 words, English"""
+        msg=ai.messages.create(model="claude-haiku-4-5-20251001",max_tokens=400,messages=[{"role":"user","content":prompt}])
+        brief=msg.content[0].text.strip()
+        caption=f"🌅 <b>Good Morning Maldives!</b>\n\n{brief}\n\n📡 <b>Samuga Media</b> | @samugacommunity"
+        send_text(TELEGRAM_CHANNEL_ID, caption)
+        log.info("✅ Morning brief sent!")
+    except Exception as e: log.error(f"Morning brief: {e}")
+
+# ── Tip/Story CTA ────────────────────────────────────────────────────────────
+def send_tip_cta():
+    """Send story tip CTA to Telegram channel (8:30AM and 8:30PM MVT)"""
+    msg = (
+        "🚨 <b>Have a story, tip, or news update?</b>\n\n"
+        "Share it with Samuga Media privately and anonymously.\n"
+        "🔒 Your identity stays confidential. 📩 Message us: @Samuga_Media\n\n"
+        "Your voice matters. The people's media starts with you. 💙"
+    )
+    send_text(TELEGRAM_CHANNEL_ID, msg)
+    log.info("📣 Tip CTA sent")
+
+def night_queue_review():
+    """
+    Runs at 11PM MVT (after night summary).
+    If social queue has pending items, sends list to Content Lab.
+    Team decides what to post or delete.
+    Queue then resets fresh for next day.
+    """
+    with _social_queue_lock:
+        pending = list(_social_queue)
+
+    if not pending:
+        log.info("[NIGHT] Social queue already empty — no review needed")
+        return
+
+    log.info(f"[NIGHT] {len(pending)} pending social queue item(s) — sending review to Content Lab")
+
+    lines = [
+        "🌙 <b>NIGHT QUEUE REVIEW</b>",
+        f"<i>It's 11PM MVT. {len(pending)} post(s) are still queued and won't auto-post tonight.</i>",
+        "<i>Review each item and decide: force post now or delete.</i>\n"
+    ]
+
+    for i, item in enumerate(pending, 1):
+        title = item.get("title", item.get("caption", "?"))[:70]
+        cat   = item.get("cat", "LOCAL")
+        lang  = item.get("lang", "en").upper()
+        queued = item.get("queued_at")
+        age = ""
+        if queued:
             try:
-                op_id_fb = int(t2.get("sel_operator_id") or 0) or None
-                if op_id_fb:
-                    pool2 = await get_pool()
-                    async with pool2.acquire() as conn2:
-                        opr = await conn2.fetchrow(
-                            "SELECT business_name, owner_contact FROM operators WHERE id=$1", op_id_fb)
-                    if opr:
-                        op_name_fb = opr["business_name"]
-                        op_contact_fb = opr["owner_contact"]
+                mins = int((utcnow() - queued).total_seconds() / 60)
+                age = f" — queued {mins}min ago"
             except Exception:
                 pass
-            contact_line = ""
-            kb_btns = []
-            if op_contact_fb:
-                contact_line = (
-                    f"\n\n📞 *Contact the operator directly:*\n"
-                    f"🚤 {op_name_fb}\n📱 {op_contact_fb}")
-                tgh = op_contact_fb.replace('+','').replace(' ','')
-                kb_btns.append([InlineKeyboardButton("📞 Contact Operator", url=f"https://t.me/{tgh}")])
-            kb_btns.append([InlineKeyboardButton("📩 Contact Samuga Travels", url="https://t.me/SamugaTravels")])
-            await update.message.reply_text(
-                f"⚠️ *Booking Save Issue*\n\n"
-                f"Your payment went through but we had trouble saving automatically.{contact_line}\n\n"
-                f"Please send your slip directly to the operator and they will confirm manually. 🙏",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(kb_btns))
-            return
-
-        # STEP 2: Confirm to customer
-        await set_user_state(user.id, CX_BOOKING_COMPLETE, {"booking_ref": ref, "booking_id": booking_id})
-        await update.message.reply_text(
-            f"✅ *Payment slip received!*\n\n"
-            f"📋 Booking Ref: `{ref}`\n\n"
-            f"Your booking is being reviewed by the operator. "
-            f"You will receive your confirmed ticket within *5-10 minutes*. "
-            f"Please do not resend your slip - we have received it!",
-            parse_mode="Markdown")
-
-        # STEP 3: Notify operator (best-effort)
-        try:
-            op_tg_raw = t2.get("sel_op_tg", 0)
-            op_id_raw = t2.get("sel_operator_id")
-            logger.info(f"STEP3 notify: booking_id={booking_id} sel_op_tg={op_tg_raw} sel_operator_id={op_id_raw}")
-            sel = {
-                "operator_id": int(op_id_raw or 0) or None,
-                "id": int(t2.get("sel_schedule_id") or 0) or None,
-                "departure_time": t2.get("sel_time",""),
-                "op_telegram_id": int(op_tg_raw) if op_tg_raw else None,
-            }
-            await notify_operator_payment(ctx, booking_id, sel, t2, ref, user, photo.file_id)
-        except Exception as e:
-            logger.error(f"❌ Operator notify error (booking still saved): {e}", exc_info=True)
-
-
-
-    elif state == OP_AWAIT_SUB_SLIP:
-        op_id = (temp or {}).get("sub_operator_id")
-        amount = (temp or {}).get("sub_amount", "500")
-        if not op_id:
-            await update.message.reply_text("⚠️ Session expired. Try again from My Subscription.")
-            return
-        await update.message.reply_text("⏳ Uploading payment slip...")
-        slip_url = await upload_image(file_bytes, "subscription_slips", f"sub_{op_id}_{int(datetime.now().timestamp())}")
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            sub_row = await conn.fetchrow("""
-                INSERT INTO subscriptions (operator_id, plan, status, payment_slip_url, payment_amount)
-                VALUES ($1, 'monthly', 'pending', $2, $3)
-                RETURNING id
-            """, op_id, slip_url, float(amount))
-            op_row = await conn.fetchrow("SELECT business_name, telegram_id FROM operators WHERE id=$1", op_id)
-        sub_id = sub_row["id"]
-        await set_user_state(user.id, OP_IDLE, {})
-        await update.message.reply_text(
-            f"✅ *Payment slip received!*\n\n"
-            f"Our team will verify and activate your subscription within a few hours. 🙏",
-            parse_mode="Markdown")
-        # Notify admin
-        try:
-            await ctx.bot.send_photo(ADMIN_GROUP_ID,
-                photo=photo.file_id,
-                caption=(
-                    f"💳 *Subscription Payment*\n\n"
-                    f"🏢 *{op_row['business_name']}*\n"
-                    f"💰 Amount: MVR {amount}\n\n"
-                    f"Approve to activate 30 days."
-                ),
-                parse_mode="Markdown",
-                message_thread_id=ADMIN_THREAD_ID,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Approve — Activate 30 Days", callback_data=f"sub_approve_{sub_id}")],
-                    [InlineKeyboardButton("❌ Reject Payment", callback_data=f"sub_reject_{sub_id}")]
-                ]))
-        except Exception as e:
-            logger.error(f"Sub admin notify error: {e}")
-
-    elif state == OP_AWAIT_REFUND_SLIP:
-        op = await get_operator(user.id)
-        if not op:
-            await update.message.reply_text("⚠️ Operator account required.")
-            return
-        await update.message.reply_text("⏳ Uploading refund slip...")
-        slip_url = await upload_image(file_bytes, "private/refund_slips",
-                                      f"refund_{temp.get('refund_booking_id','0')}_{int(datetime.now().timestamp())}")
-
-        bk_id         = temp.get("refund_booking_id")
-        bk_ref        = temp.get("refund_booking_ref","")
-        amount        = temp.get("refund_amount","0")
-        account_num   = temp.get("refund_account","")
-        account_name  = temp.get("refund_account_name","")
-        customer_tg   = temp.get("customer_tg_id")
-        op_name       = temp.get("op_name","")
-        op_contact    = temp.get("op_contact","")
-
-        # Update booking
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                UPDATE bookings
-                SET refund_slip_url=$1, refund_status='completed', refund_at=NOW()
-                WHERE id=$2
-            """, slip_url, bk_id)
-
-        await set_user_state(user.id, OP_IDLE, {})
-
-        # Notify operator — done
-        await update.message.reply_text(
-            f"✅ *Refund Slip Sent!*\n\n"
-            f"📋 Booking: `{bk_ref}`\n"
-            f"💰 MVR {amount} → {account_name}\n\n"
-            f"The customer has been notified with the slip.",
-            parse_mode="Markdown",
-            reply_markup=main_kb("operator"))
-
-        # Send slip + confirmation to customer
-        if customer_tg:
-            try:
-                await ctx.bot.send_photo(
-                    int(customer_tg),
-                    photo=photo.file_id,
-                    caption=(
-                        f"✅ *Refund Processed!*\n\n"
-                        f"📋 Booking: `{bk_ref}`\n"
-                        f"💰 Amount: *MVR {amount}*\n"
-                        f"🏦 To: `{account_num}` — {account_name}\n\n"
-                        f"Your refund has been transferred. Please allow 1-2 business days for it to appear.\n\n"
-                        f"📞 *Operator Contact:*\n"
-                        f"🚤 {op_name}\n"
-                        f"📱 {op_contact}\n\n"
-                        f"Thank you for using Samuga Travels! 🌊"
-                    ),
-                    parse_mode="Markdown")
-            except Exception as e:
-                logger.error(f"Refund slip send to customer: {e}")
-
-    elif state == ADMIN_AWAIT_LOGO:
-        if not is_admin(user.id, update.effective_chat.id):
-            await update.message.reply_text("⛔ Admin only.")
-            return
-        await update.message.reply_text("⏳ Uploading Samuga Travels logo...")
-        url = await upload_image(file_bytes, "branding", "samuga_travels_logo")
-        await set_setting("samuga_logo_url", url)
-        await set_user_state(user.id, CX_IDLE, {})
-        await update.message.reply_text(
-            f"✅ *Samuga Travels logo updated!*\n\n"
-            f"It will now appear on every ticket. 🎫\n\n"
-            f"URL: `{url}`",
-            parse_mode="Markdown")
-
-    else:
-        # Allow cancel via text — but if they sent a photo we just guide them
-        await update.message.reply_text(
-            "⚠️ Wasn't expecting an image right now.\n\n"
-            "Type `cancel` to go back to the main menu, or /start to restart.",
-            parse_mode="Markdown")
-
-# ── CALLBACK HANDLER ──────────────────────────────────────────────────────────
-async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    data = query.data
-    sd   = await get_user_state(user.id)
-    temp = sd.get("temp_data", {}) or {}
-
-    if data == "register_operator":
-        await start_op_reg(update, ctx)
-
-    elif data.startswith("verify_ticket_"):
-        bk_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            bk = await conn.fetchrow("SELECT booking_ref FROM bookings WHERE id=$1", bk_id)
-        if bk:
-            ctx.args = [f"verify_{bk['booking_ref']}"]
-            await cmd_verify(update, ctx)
-
-    elif data == "cx_edit_contact":
-        # Let customer correct booker name/phone without restarting.
-        if sd.get("state") not in [CX_AWAIT_PASSENGER_COUNT, CX_COLLECTING_PASSENGERS, CX_AWAIT_PAYMENT_SLIP, CX_AWAIT_CONTACT]:
-            await query.answer("This booking step is no longer active.", show_alert=True)
-            return
-        await set_user_state(user.id, CX_AWAIT_CONTACT, temp)
-        await query.message.reply_text(
-            "✏️ *Edit contact details*\n\n"
-            "Enter *Full Name* and *Phone Number* again:\n\n"
-            "_Format: Ahmed Ali, 7771234_",
-            parse_mode="Markdown")
-
-    elif data == "cx_edit_trip":
-        # Let customer change date/boat while keeping the route search.
-        if sd.get("state") not in [CX_AWAIT_CONTACT, CX_AWAIT_PASSENGER_COUNT, CX_COLLECTING_PASSENGERS, CX_AWAIT_PAYMENT_SLIP, CX_AWAIT_DATE]:
-            await query.answer("This booking step is no longer active.", show_alert=True)
-            return
-        route_from = temp.get("route_from", "")
-        route_to = temp.get("route_to", "")
-        if not route_from or not route_to:
-            await query.message.reply_text(
-                "🔍 Please type your route again, for example:\n`Male to Thoddoo`",
-                parse_mode="Markdown")
-            await set_user_state(user.id, CX_IDLE, {})
-            return
-        from datetime import timedelta
-        today = datetime.now().date()
-        dates = [today + timedelta(days=i) for i in range(4)]
-        date_buttons = [[InlineKeyboardButton(
-            f"{'Today' if i==0 else 'Tomorrow' if i==1 else d.strftime('%a %d %b')}",
-            callback_data=f"date_select_{d.strftime('%d-%m-%Y')}"
-        )] for i, d in enumerate(dates)]
-        await set_user_state(user.id, CX_AWAIT_DATE, temp)
-        await query.message.reply_text(
-            f"📅 *Change date / boat*\n\n"
-            f"Route: *{route_from} → {route_to}*\n\n"
-            f"Select a new travel date, or type manually:\n_(DD-MM-YYYY or DD/MM/YYYY)_",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(date_buttons))
-
-    elif data == "cx_edit_pax_details":
-        # Let customer resend passenger names/IDs without changing count.
-        if sd.get("state") not in [CX_COLLECTING_PASSENGERS, CX_AWAIT_PAYMENT_SLIP]:
-            await query.answer("This booking step is no longer active.", show_alert=True)
-            return
-        total = int(temp.get("passenger_count", 1) or 1)
-        cx_name = temp.get("cx_name", "You")
-        example_lines = [f"1. {cx_name}, (your ID/passport number)"]
-        for i in range(1, total):
-            example_lines.append(f"{i+1}. Full Name, ID/Passport Number")
-        example_str = "\n".join(example_lines)
-        await set_user_state(user.id, CX_COLLECTING_PASSENGERS, {**temp, "passengers_collected": []})
-        await query.message.reply_text(
-            f"✏️ *Edit passenger details*\n\n"
-            f"Passenger count: *{total}*\n\n"
-            f"Send all {total} passenger(s) again, one per line:\n\n"
-            f"_Example:_\n`{example_str}`",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✏️ Edit passenger count", callback_data="cx_edit_pax_count")
-            ]]))
-
-    elif data == "cx_edit_pax_count":
-        # Customer may have typed the wrong number of seats/passengers.
-        # Let them correct it without restarting the whole booking flow.
-        if sd.get("state") not in [CX_COLLECTING_PASSENGERS, CX_AWAIT_PASSENGER_COUNT]:
-            await query.answer("This step is no longer active.", show_alert=True)
-            return
-        await set_user_state(user.id, CX_AWAIT_PASSENGER_COUNT, {**temp, "passengers_collected": []})
-        await query.message.reply_text(
-            f"✏️ *Edit passenger count*\n\n"
-            f"How many seats/passengers do you want to book?\n"
-            f"_Max 10, available: {temp.get('sel_seats', 0)}_\n\n"
-            f"Example: `1`",
-            parse_mode="Markdown")
-
-    elif data.startswith("cx_cancel_booking_"):
-        bk_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            bk = await conn.fetchrow("""
-                SELECT b.*, s.departure_time, s.route_from, s.route_to,
-                       o.telegram_id as op_tg_id, o.business_name as op_name,
-                       o.owner_contact as op_contact
-                FROM bookings b
-                JOIN schedules s ON b.schedule_id=s.id
-                JOIN operators o ON b.operator_id=o.id
-                WHERE b.id=$1 AND b.customer_telegram_id=$2
-            """, bk_id, user.id)
-        if not bk:
-            await query.answer("Booking not found.", show_alert=True)
-            return
-        if bk["status"] == "cancelled":
-            await query.answer("This booking is already cancelled.", show_alert=True)
-            return
-
-        # ── Check 24hr rule ──────────────────────────────────────────────────
-        from datetime import timedelta as _td24
-        now = datetime.now()
-        # Combine travel_date + departure_time to get departure datetime
-        try:
-            dep_str = f"{bk['travel_date']} {bk['departure_time']}"
-            dep_dt  = datetime.strptime(dep_str, "%Y-%m-%d %H:%M")
-        except Exception:
-            dep_dt = None
-
-        hours_until = ((dep_dt - now).total_seconds() / 3600) if dep_dt else 999
-
-        if hours_until <= 0:
-            # Already departed
-            await query.message.reply_text(
-                f"⚠️ *Cannot Cancel*\n\n"
-                f"This trip has already departed.\n\n"
-                f"For any issues, contact the operator directly:\n"
-                f"📞 {bk['op_contact']}\n"
-                f"🚤 {bk['op_name']}",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📞 Contact Operator",
-                        url=f"https://t.me/{bk['op_contact'].replace('+','').replace(' ','')}")
-                ]]))
-            return
-
-        elif hours_until < 24:
-            # Less than 24 hours — no automatic refund, must contact operator
-            await query.message.reply_text(
-                f"⚠️ *Less Than 24 Hours Before Departure*\n\n"
-                f"Your trip departs in *{int(hours_until)}h {int((hours_until%1)*60)}min*.\n\n"
-                f"Per Samuga Travels policy:\n"
-                f"• Cancellations within 24hrs of departure require contacting the operator directly\n"
-                f"• Refunds are at the operator's discretion\n\n"
-                f"*Contact your operator:*\n"
-                f"🚤 {bk['op_name']}\n"
-                f"📞 {bk['op_contact']}\n\n"
-                f"_If the operator agrees to a refund, they will process it directly._",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📞 Contact Operator",
-                        url=f"https://t.me/{bk['op_contact'].replace('+','').replace(' ','')}")],
-                    [InlineKeyboardButton("🔙 Keep Booking", callback_data="cx_my_bookings")]
-                ]))
-            return
-
-        else:
-            # More than 24 hours — eligible for cancellation + refund
-            was_confirmed = bk["status"] == "confirmed"
-            refund_note = (
-                f"\n\n💰 *Refund Eligible*\n"
-                f"Since you paid MVR {bk['total_amount']}, you can request a refund after cancelling."
-                if was_confirmed else ""
-            )
-            await query.message.reply_text(
-                f"❌ *Cancel Booking?*\n\n"
-                f"📋 Ref: `{bk['booking_ref']}`\n"
-                f"📍 {bk['route_from']} → {bk['route_to']}\n"
-                f"📅 {bk['travel_date']} @ {bk['departure_time']}\n"
-                f"💰 MVR {bk['total_amount']}"
-                f"{refund_note}\n\n"
-                f"⏰ Departure in *{int(hours_until)}hrs* — eligible for cancellation.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Cancel & Request Refund" if was_confirmed else "✅ Yes, Cancel",
-                        callback_data=f"confirm_cancel_{bk_id}"),
-                     InlineKeyboardButton("🔙 Keep Booking", callback_data="cx_my_bookings")]
-                ]))
-
-    elif data.startswith("confirm_cancel_"):
-        bk_id = int(data.split("_")[-1])
-
-        # Check this booking belongs to the user
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            ownership = await conn.fetchrow(
-                "SELECT id FROM bookings WHERE id=$1 AND customer_telegram_id=$2",
-                bk_id, user.id)
-        if not ownership:
-            await query.answer("⛔ Not your booking.", show_alert=True)
-            return
-
-        # Use atomic cancel_booking function
-        result, msg_code = await cancel_booking(
-            bk_id,
-            cancelled_by=f"customer_{user.id}",
-            reason="Customer requested cancellation"
-        )
-
-        if msg_code == "already_cancelled":
-            await query.answer("This booking was already cancelled.", show_alert=True)
-            return
-        if not result:
-            await query.answer("Booking not found.", show_alert=True)
-            return
-
-        bk       = result["booking"]
-        schedule = result["schedule"]
-        operator = result["operator"]
-        was_confirmed = result["old_status"] == "confirmed"
-
-        # Notify operator
-        if operator.get("telegram_id"):
-            seats_note = "\n💺 Seats have been automatically added back." if was_confirmed else ""
-            try:
-                await ctx.bot.send_message(operator["telegram_id"],
-                    f"❌ *Booking Cancelled by Customer*\n\n"
-                    f"📋 Ref: `{bk['booking_ref']}`\n"
-                    f"📍 Route: {schedule.get('route_from','')} → {schedule.get('route_to','')}\n"
-                    f"📅 Date: {bk['travel_date']}\n"
-                    f"👥 Passengers: {bk['passenger_count']}\n"
-                    f"💰 Amount: MVR {bk['total_amount']}{seats_note}",
-                    parse_mode="Markdown")
-            except Exception as e:
-                logger.error(f"Cancel notify operator: {e}")
-
-        if was_confirmed:
-            # Store booking id in user state so refund flow can use it
-            await set_user_state(user.id, CX_AWAIT_REFUND_ACCOUNT,
-                                 {"refund_booking_id": bk_id, "refund_booking_ref": bk["booking_ref"],
-                                  "refund_amount": str(bk["total_amount"]),
-                                  "op_tg_id": result["operator"].get("telegram_id",""),
-                                  "op_name":  result["operator"].get("business_name",""),
-                                  "op_contact": result["operator"].get("owner_contact","")})
-            await query.edit_message_text(
-                f"✅ Booking `{bk['booking_ref']}` cancelled.\n\n"
-                f"💰 *Refund: MVR {bk['total_amount']}*\n\n"
-                f"Please enter your *bank account number and account name* to receive your refund:\n\n"
-                f"_Format: `7770001234567 Ahmed Ali`_\n"
-                f"_(BML or MIB account number followed by account name)_",
-                parse_mode="Markdown")
-        else:
-            await query.edit_message_text(
-                f"✅ Booking `{bk['booking_ref']}` cancelled successfully.",
-                parse_mode="Markdown")
-
-    elif data.startswith("report_issue_"):
-        bk_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            bk = await conn.fetchrow("SELECT booking_ref FROM bookings WHERE id=$1", bk_id)
-        ref = bk["booking_ref"] if bk else "N/A"
-        await query.message.reply_text(
-            f"⚠️ *Report an Issue*\n\n"
-            f"Booking: `{ref}`\n\n"
-            f"Please contact Samuga Travels directly with your booking reference:\n\n"
-            f"📩 @SamugaTravels\n\n"
-            f"We will investigate and respond within 24 hours.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📩 Contact @SamugaTravels", url="https://t.me/SamugaTravels")
-            ]]))
-
-    elif data == "cx_search":
-        await set_user_state(user.id, CX_IDLE, {})
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            ar = await conn.fetch("""
-                SELECT DISTINCT s.route_from, s.route_to
-                FROM schedules s JOIN operators o ON s.operator_id=o.id
-                WHERE o.status='approved' AND s.is_active=TRUE AND s.available_seats>0
-                AND COALESCE(o.subscription_status,'trial') != 'expired'
-                ORDER BY s.route_from, s.route_to LIMIT 8
-            """)
-        if ar:
-            rlines = "\n".join([f"  `{r['route_from']} to {r['route_to']}`" for r in ar])
-            msg = f"🔍 *Search for Boats*\n\n*Available routes right now:*\n{rlines}\n\n_Just type your route below_ 👇"
-        else:
-            msg = "🔍 *Search for Boats*\n\nType your route — example:\n`Male to Thoddoo`\n`Thoddoo to Male`\n`Male to Maafushi`\n\n_Just type naturally_ 👇"
-        await query.message.reply_text(msg, parse_mode="Markdown")
-
-    elif data.startswith("srt_"):
-        # Sort preference — re-run the last search with new sort
-        sort_key = data.replace("srt_", "")
-        sd2 = await get_user_state(user.id)
-        t2 = sd2.get("temp_data", {}) or {}
-        # Store sort preference and re-trigger search with cached schedules
-        schedules = ctx.user_data.get("schedules_cache", [])
-        if not schedules:
-            await query.answer("Session expired — please search again.", show_alert=True)
-            return
-        await set_user_state(user.id, sd2.get("state", CX_IDLE), {**t2, "sort_by": sort_key})
-        await query.answer(f"Sorted!")
-        # Rebuild the message with new sort
-        route_from = t2.get("route_from","")
-        route_to   = t2.get("route_to","")
-        travel_date = t2.get("travel_date","")
-        sort_labels = {"recommended":"⭐ Rec","earliest":"⏰ Early","cheapest":"💰 Cheap","seats":"💺 Seats"}
-
-        if sort_key == "earliest":
-            schedules = sorted(schedules, key=lambda x: x["departure_time"])
-        elif sort_key == "cheapest":
-            schedules = sorted(schedules, key=lambda x: float(x["price_per_seat"] or 0))
-        elif sort_key == "seats":
-            schedules = sorted(schedules, key=lambda x: x["available_seats"], reverse=True)
-        else:
-            schedules = sorted(schedules, key=lambda x: (not x.get("is_recommended"), x["departure_time"]))
-
-        ctx.user_data["schedules_cache"] = schedules
-        sort_row = [
-            InlineKeyboardButton(f"{'✓ ' if sort_key==k else ''}{v}", callback_data=f"srt_{k}")
-            for k, v in sort_labels.items()
-        ]
-        import json as _j2
-        msg = f"🚢 *Available Boats — {route_from} → {route_to}*\n📅 *{travel_date}*\n\n"
-        buttons = [sort_row]
-        for i, s in enumerate(schedules):
-            rating_val = float(s.get("average_rating") or 0)
-            rec = "✨ *Recommended*\n" if s.get("is_recommended") else ""
-            total_reviews = s.get("total_reviews", 0) or 0
-            trust = "🏆 Top Rated" if total_reviews >= 20 else ("✅ Verified" if total_reviews >= 5 else "🆕 New")
-            try:
-                stops_list = _j2.loads(s.get("sched_stops") or "[]")
-                stops_line = "🛑 " + " → ".join(stops_list) + "\n" if stops_list and len(stops_list) > 2 else ""
-            except: stops_line = ""
-            msg += (
-                f"{'─'*28}\n"
-                f"🚤 *{s['business_name']}* — _{s['boat_name']}_\n"
-                f"{rec}"
-                f"📍 {s['route_from']} → {s['route_to']}\n"
-                f"{stops_line}"
-                f"⏰ *{s['departure_time']}* | 💺 {s['available_seats']} seats | 💰 MVR {s['price_per_seat']}/seat\n"
-                f"{trust} · ⭐ {rating_val:.1f} ({total_reviews} reviews)\n\n"
-            )
-            buttons.append([InlineKeyboardButton(
-                f"Book — {s['business_name']} ({s['departure_time']})",
-                callback_data=f"book_sched_{i}")])
-        try:
-            await query.edit_message_text(msg[:4000], parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(buttons))
-        except Exception:
-            await query.message.reply_text(msg[:4000], parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(buttons))
-
-    elif data.startswith("date_select_"):
-        selected_date_str = data.replace("date_select_", "")
-        # Inject as if user typed the date
-        sd2 = await get_user_state(user.id)
-        t2 = sd2.get("temp_data", {}) or {}
-        # Fake a message with this date into the state handler
-        travel_date = datetime.strptime(selected_date_str, "%d-%m-%Y").date()
-        route_from = t2.get("route_from","")
-        route_to   = t2.get("route_to","")
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT s.*, s.sched_stops, o.id as operator_id, o.business_name, o.boat_name, o.logo_url,
-                       o.is_recommended, o.average_rating, o.total_reviews, o.owner_contact,
-                       o.review_text, o.bml_account, o.payment_accounts, o.telegram_id as op_telegram_id
-                FROM schedules s
-                JOIN operators o ON s.operator_id = o.id
-                WHERE LOWER(s.route_from) LIKE $1 AND LOWER(s.route_to) LIKE $2
-                  AND o.status='approved' AND s.is_active=TRUE AND s.available_seats>0
-                  AND COALESCE(o.subscription_status,'trial') != 'expired'
-                  AND (
-                    s.run_days = 'daily' OR s.run_days IS NULL
-                    OR (s.run_days = 'fri'     AND EXTRACT(DOW FROM $3::date) = 5)
-                    OR (s.run_days = 'sat-thu' AND EXTRACT(DOW FROM $3::date) != 5)
-                    OR (s.run_days = 'weekdays' AND EXTRACT(DOW FROM $3::date) BETWEEN 0 AND 4)
-                    OR (s.run_days = 'weekend'  AND EXTRACT(DOW FROM $3::date) IN (5,6))
-                    OR (s.run_days = 'sun-thu'  AND EXTRACT(DOW FROM $3::date) BETWEEN 0 AND 4)
-                    OR (s.run_days = 'everyday')
-                  )
-                ORDER BY o.is_recommended DESC, s.departure_time ASC
-            """, f"%{route_from.lower()}%", f"%{route_to.lower()}%", travel_date)
-        if not rows:
-            await query.message.reply_text(
-                f"😔 No boats for *{route_from} → {route_to}* on *{selected_date_str}*. Try another date.",
-                parse_mode="Markdown")
-            return
-        schedules = [dict(r) for r in rows]
-        ctx.user_data["schedules_cache"] = schedules
-        sched_ids = [s["id"] for s in schedules]
-        await set_user_state(user.id, CX_AWAIT_PASSENGER_COUNT,
-                             {**t2, "travel_date": str(travel_date), "sched_ids": sched_ids})
-        import json as _j
-        msg = f"🚢 *Available Boats — {route_from} → {route_to}*\n📅 *{selected_date_str}*\n\n"
-        buttons = []
-        for i, s in enumerate(schedules):
-            rating_val = float(s.get("average_rating") or 0)
-            stars = "⭐" * int(rating_val) if rating_val else "No ratings yet"
-            rec = "✨ *Recommended by Samuga Travels*\n" if s.get("is_recommended") else ""
-            try:
-                stops_list = _j.loads(s.get("sched_stops") or "[]")
-                stops_line = "🛑 " + " → ".join(stops_list) + "\n" if stops_list and len(stops_list) > 2 else ""
-            except: stops_line = ""
-            msg += (
-                f"{'─'*30}\n"
-                f"🚤 *{s['business_name']}* — _{s['boat_name']}_\n"
-                f"{rec}"
-                f"📍 {s['route_from']} → {s['route_to']}\n"
-                f"{stops_line}"
-                f"⏰ *{s['departure_time']}*\n"
-                f"💺 {s['available_seats']} seats | 💰 MVR {s['price_per_seat']}/seat\n"
-                f"⭐ {stars}\n\n"
-            )
-            buttons.append([InlineKeyboardButton(
-                f"Book — {s['business_name']} ({s['departure_time']})",
-                callback_data=f"book_sched_{i}")])
-        await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
-
-    elif data == "cx_my_bookings":
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT b.*, o.business_name, o.owner_contact FROM bookings b
-                JOIN operators o ON b.operator_id = o.id
-                WHERE b.customer_telegram_id=$1 ORDER BY b.created_at DESC LIMIT 5
-            """, user.id)
-        if not rows:
-            await query.message.reply_text("📋 No bookings yet.\n\nSearch for boats to make your first booking! 🚤")
-            return
-        icons = {"pending_payment":"⏳","pending_confirmation":"🔄","confirmed":"✅","cancelled":"❌"}
-        for b in rows:
-            ic = icons.get(b["status"],"❓")
-            msg = (
-                f"{ic} `{b['booking_ref']}`\n"
-                f"🚤 {b['business_name']}\n"
-                f"📅 {b['travel_date']} | 💰 MVR {b['total_amount']}\n"
-                f"📊 {b['status'].upper().replace('_',' ')}"
-            )
-            btns = []
-            if b["status"] == "confirmed":
-                btns.append([InlineKeyboardButton("🔍 Verify Ticket",
-                    callback_data=f"verify_ticket_{b['id']}")])
-                btns.append([
-                    InlineKeyboardButton("📞 Contact Operator",
-                        url=f"https://t.me/{b['owner_contact'].replace('+','')}"),
-                    InlineKeyboardButton("⚠️ Report Issue",
-                        callback_data=f"report_issue_{b['id']}")
-                ])
-            elif b["status"] == "pending_confirmation":
-                btns.append([InlineKeyboardButton("❌ Cancel Request",
-                    callback_data=f"cx_cancel_booking_{b['id']}")])
-            await query.message.reply_text(msg, parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(btns) if btns else None)
-
-    elif data.startswith("book_sched_"):
-        idx = int(data.split("_")[-1])
-        schedules = ctx.user_data.get("schedules_cache", [])
-        if not schedules:
-            await query.message.reply_text("⚠️ Session expired. Please search again.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔍 Search Again", callback_data="cx_search")]]))
-            return
-        if idx >= len(schedules):
-            await query.message.reply_text("⚠️ Invalid selection.")
-            return
-        sel = schedules[idx]
-        # Store flat keys to avoid large JSON in temp_data
-        await set_user_state(user.id, CX_AWAIT_CONTACT, {
-            **temp,
-            "sel_operator_id": sel.get("operator_id"),
-            "sel_schedule_id": sel.get("id"),
-            "sel_business": sel.get("business_name"),
-            "sel_boat": sel.get("boat_name"),
-            "sel_time": sel.get("departure_time"),
-            "sel_price": str(sel.get("price_per_seat", 0)),
-            "sel_seats": int(sel.get("available_seats", 0)),
-            "sel_bml": sel.get("bml_account", ""),
-            "sel_payment_accounts": sel.get("payment_accounts", "[]"),
-            "sel_op_tg": sel.get("op_telegram_id", 0),
-            "sel_op_contact": sel.get("owner_contact", ""),
-            "route_from": temp.get("route_from", ""),
-            "route_to": temp.get("route_to", ""),
-            "travel_date": temp.get("travel_date", ""),
-        })
-        await query.message.reply_text(
-            f"✅ *{sel['business_name']}* selected!\n\n"
-            f"📍 {temp.get('route_from')} → {temp.get('route_to')}\n"
-            f"⏰ {sel['departure_time']} | 💺 {sel['available_seats']} seats\n\n"
-            f"If this trip/boat is wrong, tap *Change date / boat*.\n"
-            f"If it is correct, enter your contact details and continue.\n\n"
-            f"👤 *Your contact details:*\nEnter *Full Name* and *Phone Number*:\n\n_Format: Ahmed Ali, 7771234_",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📅 Change date / boat", callback_data="cx_edit_trip")
-            ]]))
-
-    elif data.startswith("type_"):
-        boat_type = data.split("_")[1]
-        await set_user_state(user.id, OP_AWAIT_LOGO, {**temp, "boat_type": boat_type})
-        await query.message.reply_text(
-            f"✅ *{'Ferry' if boat_type=='ferry' else 'Private Hire'}* selected!\n\n"
-            f"*Step 5:* Please upload your *boat/company logo*.",
-            parse_mode="Markdown")
-
-    elif data.startswith("approve_op_"):
-        op_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "UPDATE operators SET status='approved' WHERE id=$1 RETURNING telegram_id, business_name", op_id)
-        if row:
-            await set_user_state(row["telegram_id"], OP_IDLE, {}, role="operator")
-            # Start 2-month free trial
-            await create_trial(op_id)
-            from datetime import timedelta
-            trial_end = (datetime.now() + timedelta(days=60)).strftime("%d %b %Y")
-            await ctx.bot.send_message(row["telegram_id"],
-                f"🎉 *Congratulations! You're approved!*\n\n"
-                f"*{row['business_name']}* is now live on Samuga Travels!\n\n"
-                f"🎁 *Free Trial: 2 Months*\n"
-                f"Your free trial runs until *{trial_end}* — no payment needed now.\n\n"
-                f"✅ *Welcome to Samuga Travels Operator Panel*\n\n"
-                f"1. Add your schedules\n"
-                f"2. Check pending bookings\n"
-                f"3. Confirm payment only after checking your bank/account\n"
-                f"4. Use Today's Schedule for passengers\n"
-                f"5. Scan ticket QR or mark boarded\n"
-                f"6. Check Monthly Report for earnings\n\n"
-                f"After the free trial, a small monthly fee of *MVR 500* keeps you listed.\n"
-                f"Need help? Contact @SamugaTravels\n\n"
-                f"Use /start to add your schedules and start receiving bookings! 🌊",
-                parse_mode="Markdown")
-            await query.edit_message_text(
-                f"✅ Operator *{row['business_name']}* approved! 2-month trial started.",
-                parse_mode="Markdown")
-
-    elif data.startswith("reject_op_"):
-        op_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "UPDATE operators SET status='rejected' WHERE id=$1 RETURNING telegram_id, business_name", op_id)
-        if row:
-            await ctx.bot.send_message(row["telegram_id"],
-                f"❌ Your application for *{row['business_name']}* was not approved.\nContact @SamugaTravels for info.",
-                parse_mode="Markdown")
-            await query.edit_message_text(f"❌ Operator *{row['business_name']}* rejected.", parse_mode="Markdown")
-
-    elif data.startswith("sched_boat_"):
-        # Format: sched_boat_{boat_id}_{boat_name}
-        parts_data = data.split("_", 3)
-        boat_id = int(parts_data[2])
-        boat_name_sel = parts_data[3] if len(parts_data) > 3 else "default"
-        sd2 = await get_user_state(user.id)
-        t2 = sd2.get("temp_data", {}) or {}
-        import json as _j
-        op = await get_operator(user.id)
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS sched_stops TEXT DEFAULT '[]'")
-            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS location TEXT DEFAULT 'Jetty No. 1, Male'")
-            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS run_days TEXT DEFAULT 'daily'")
-            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS boat_name TEXT")
-            await conn.execute("""
-                INSERT INTO schedules (operator_id, route_from, route_to, departure_time,
-                                       price_per_seat, total_seats, available_seats,
-                                       sched_stops, location, run_days, boat_name)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-            """, op["id"], t2.get("sched_from"), t2.get("sched_to"),
-                t2.get("sched_time"), t2.get("sched_price"),
-                t2.get("sched_seats",0), t2.get("sched_seats",0),
-                _j.dumps(t2.get("sched_stops",[])),
-                t2.get("sched_location","Jetty No. 1, Male"),
-                t2.get("run_days","daily"),
-                None if boat_name_sel == "default" else boat_name_sel)
-        await set_user_state(user.id, OP_IDLE, {})
-        boat_display = boat_name_sel if boat_name_sel != "default" else "Default"
-        await query.edit_message_text(
-            f"✅ *Schedule Added!*\n\n"
-            f"📍 {t2.get('sched_from')} → {t2.get('sched_to')}\n"
-            f"⏰ {t2.get('sched_time')} | 📅 {t2.get('run_days','daily')}\n"
-            f"📌 {t2.get('sched_location','Jetty No. 1, Male')}\n"
-            f"🚤 Boat: {boat_display}\n"
-            f"💰 MVR {t2.get('sched_price')}/seat | 👥 {t2.get('sched_seats',0)} seats",
-            parse_mode="Markdown")
-
-    elif data == "op_fleet":
-        op = await get_operator(user.id)
-        if not op:
-            await query.message.reply_text("⚠️ No operator profile.")
-            return
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            boats = await conn.fetch("SELECT * FROM boats WHERE operator_id=$1 ORDER BY created_at", op["id"])
-        if not boats:
-            await query.message.reply_text(
-                "🚤 *Your Fleet*\n\nNo boats added yet.\n\nAdd your first boat:",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("➕ Add a Boat", callback_data="op_add_boat")
-                ]]))
-            return
-        msg = "🚤 *Your Fleet:*\n\n"
-        buttons = []
-        for b in boats:
-            status_icon = "✅" if b["status"] == "active" else "🔧"
-            msg += f"{status_icon} *{b['boat_name']}* — {b['capacity']} seats\n"
-            buttons.append([
-                InlineKeyboardButton(f"🔧 Maintenance — {b['boat_name']}", callback_data=f"boat_maintenance_{b['id']}"),
-                InlineKeyboardButton(f"✅ Active", callback_data=f"boat_active_{b['id']}")
-            ])
-        buttons.append([InlineKeyboardButton("➕ Add Another Boat", callback_data="op_add_boat")])
-        await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
-
-    elif data == "op_add_boat":
-        await set_user_state(user.id, OP_AWAIT_BOAT_ADD_NAME, {})
-        await query.message.reply_text(
-            "🚤 *Add a Boat*\n\nWhat is this boat's name?\n\n_Example: SamugaTravels 1, Ocean Star_",
-            parse_mode="Markdown")
-
-    elif data.startswith("boat_maintenance_"):
-        boat_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow("UPDATE boats SET status='maintenance' WHERE id=$1 RETURNING boat_name", boat_id)
-        if row:
-            await query.answer(f"🔧 {row['boat_name']} set to maintenance.", show_alert=True)
-            await query.edit_message_text(f"🔧 *{row['boat_name']}* is now under maintenance.\nCustomers won't see it in available boats.", parse_mode="Markdown")
-
-    elif data.startswith("boat_active_"):
-        boat_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow("UPDATE boats SET status='active' WHERE id=$1 RETURNING boat_name", boat_id)
-        if row:
-            await query.answer(f"✅ {row['boat_name']} is now active!", show_alert=True)
-            await query.edit_message_text(f"✅ *{row['boat_name']}* is now active.", parse_mode="Markdown")
-
-    elif data == "op_today":
-        op = await get_operator(user.id)
-        if not op:
-            return
-        from datetime import timedelta as _td
-        today = datetime.now().date()
-        tomorrow = today + _td(days=1)
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            # Today — view only
-            scheds_today = await conn.fetch("""
-                SELECT s.*, COALESCE(sc.new_boat_name, s.boat_name) as active_boat,
-                       COALESCE(sc.new_time, s.departure_time) as active_time,
-                       sc.note as change_note
-                FROM schedules s
-                LEFT JOIN schedule_changes sc ON sc.schedule_id=s.id AND sc.change_date=$1
-                WHERE s.operator_id=$2 AND s.is_active=TRUE
-                ORDER BY s.departure_time
-            """, today, op["id"])
-            bookings_today = await conn.fetch("""
-                SELECT schedule_id, COUNT(*) as cnt, SUM(passenger_count) as pax
-                FROM bookings WHERE travel_date=$1 AND status='confirmed' AND operator_id=$2
-                GROUP BY schedule_id
-            """, today, op["id"])
-            # Tomorrow — with change buttons
-            scheds_tmr = await conn.fetch("""
-                SELECT s.*, COALESCE(sc.new_boat_name, s.boat_name) as active_boat,
-                       COALESCE(sc.new_time, s.departure_time) as active_time,
-                       sc.note as change_note
-                FROM schedules s
-                LEFT JOIN schedule_changes sc ON sc.schedule_id=s.id AND sc.change_date=$1
-                WHERE s.operator_id=$2 AND s.is_active=TRUE
-                ORDER BY s.departure_time
-            """, tomorrow, op["id"])
-            bookings_tmr = await conn.fetch("""
-                SELECT schedule_id, COUNT(*) as cnt, SUM(passenger_count) as pax
-                FROM bookings WHERE travel_date=$1 AND status='confirmed' AND operator_id=$2
-                GROUP BY schedule_id
-            """, tomorrow, op["id"])
-
-        bk_map_today = {b["schedule_id"]: b for b in bookings_today}
-        bk_map_tmr   = {b["schedule_id"]: b for b in bookings_tmr}
-
-        msg = f"📅 *Today — {today.strftime('%A, %d %b')}*\n\n"
-        buttons = []
-        if not scheds_today:
-            msg += "_No schedules today._\n"
-        for s in scheds_today:
-            bk = bk_map_today.get(s["id"])
-            pax   = bk["pax"]  if bk else 0
-            cnt   = bk["cnt"]  if bk else 0
-            chng  = f" ⚠️ {s['change_note']}" if s.get("change_note") else ""
-            msg += (
-                f"⏰ *{s['active_time']}* — {s['route_from']} → {s['route_to']}\n"
-                f"🚤 {s['active_boat'] or 'Default'} | 📌 {s.get('location','Jetty No. 1, Male')}\n"
-                f"🎫 {cnt} bookings | 👥 {pax} pax{chng}\n\n"
-            )
-            if cnt:
-                buttons.append([InlineKeyboardButton(
-                    f"👥 Manifest {s['active_time']} — {s['route_from']} → {s['route_to']}",
-                    callback_data=f"op_manifest_{s['id']}_{today.strftime('%Y%m%d')}")])
-
-        msg += f"\n📅 *Tomorrow — {tomorrow.strftime('%A, %d %b')}* _(tap to manage)_\n\n"
-        if not scheds_tmr:
-            msg += "_No schedules tomorrow._\n"
-        for s in scheds_tmr:
-            bk = bk_map_tmr.get(s["id"])
-            pax   = bk["pax"]  if bk else 0
-            cnt   = bk["cnt"]  if bk else 0
-            chng  = f" ⚠️ {s['change_note']}" if s.get("change_note") else ""
-            msg += (
-                f"⏰ *{s['active_time']}* — {s['route_from']} → {s['route_to']}\n"
-                f"🚤 {s['active_boat'] or 'Default'} | 📌 {s.get('location','Jetty No. 1, Male')}\n"
-                f"🎫 {cnt} bookings | 👥 {pax} pax{chng}\n\n"
-            )
-            buttons.append([InlineKeyboardButton(
-                f"✏️ Manage {s['active_time']} — {s['route_from']} → {s['route_to']}",
-                callback_data=f"change_sched_{s['id']}")])
-
-        await query.message.reply_text(msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
-
-    elif data.startswith("op_manifest_"):
-        op = await get_operator(user.id)
-        if not op:
-            await query.answer("Operator account required.", show_alert=True)
-            return
-        parts = data.split("_")
-        sched_id = int(parts[2])
-        date_token = parts[3] if len(parts) > 3 else datetime.now().strftime("%Y%m%d")
-        manifest_date = datetime.strptime(date_token, "%Y%m%d").date()
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT b.id, b.booking_ref, b.passengers, b.passenger_count,
-                       b.boarded_at, b.status, b.customer_name,
-                       s.route_from, s.route_to, s.departure_time, s.location
-                FROM bookings b
-                JOIN schedules s ON b.schedule_id=s.id
-                WHERE b.schedule_id=$1
-                  AND b.operator_id=$2
-                  AND b.travel_date=$3
-                  AND b.status='confirmed'
-                ORDER BY b.boarded_at NULLS FIRST, b.created_at
-            """, sched_id, op["id"], manifest_date)
-        if not rows:
-            await query.message.reply_text(
-                f"👥 *Boarding Manifest*\n\nNo confirmed passengers for {manifest_date}.",
-                parse_mode="Markdown")
-            return
-        first = rows[0]
-        total_pax = sum(int(r["passenger_count"] or 0) for r in rows)
-        boarded_pax = sum(int(r["passenger_count"] or 0) for r in rows if r["boarded_at"])
-        msg = (
-            f"👥 *Boarding Manifest*\n\n"
-            f"📍 {first['route_from']} → {first['route_to']}\n"
-            f"📅 {manifest_date} @ {first['departure_time']}\n"
-            f"📌 {first.get('location') or 'Jetty No. 1, Male'}\n\n"
-            f"🛳️ Boarded: *{boarded_pax}/{total_pax}*\n\n"
-        )
-        buttons = []
-        for r in rows:
-            icon = "✅" if r["boarded_at"] else "⬜"
-            passengers = r["passengers"] or "[]"
-            if isinstance(passengers, str):
-                try:
-                    passengers = json.loads(passengers)
-                except Exception:
-                    passengers = []
-            pax_lines = []
-            for psg in passengers:
-                pax_lines.append(f"{psg.get('name','N/A')} — {psg.get('id_number','N/A')}")
-            if not pax_lines:
-                pax_lines = [r["customer_name"] or "Passenger details on file"]
-            msg += f"{icon} `{r['booking_ref']}`\n"
-            for line in pax_lines:
-                msg += f"   {line}\n"
-            if r["boarded_at"]:
-                msg += f"   Boarded: {str(r['boarded_at'])[:16]}\n\n"
-            else:
-                msg += "\n"
-                buttons.append([InlineKeyboardButton(
-                    f"✅ Mark boarded — {r['booking_ref']}",
-                    callback_data=f"mark_boarded_{r['id']}")])
-        await query.message.reply_text(
-            msg[:3900],
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
-
-    elif data.startswith("change_sched_"):
-        sched_id = int(data.split("_")[-1])
-        op = await get_operator(user.id)
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
-            boats = await conn.fetch("SELECT * FROM boats WHERE operator_id=$1 AND status='active'", op["id"])
-        if not sched:
-            await query.answer("Schedule not found.", show_alert=True)
-            return
-        buttons = []
-        for b in boats:
-            buttons.append([InlineKeyboardButton(
-                f"🚤 Swap to {b['boat_name']}",
-                callback_data=f"swap_boat_{sched_id}_{b['boat_name']}")])
-        buttons.append([InlineKeyboardButton("⏰ Change Time", callback_data=f"swap_time_{sched_id}")])
-        buttons.append([InlineKeyboardButton("🗺️ Change Route", callback_data=f"swap_route_{sched_id}")])
-        buttons.append([InlineKeyboardButton("❌ Cancel Tomorrow's Departure", callback_data=f"cancel_today_{sched_id}")])
-        await query.message.reply_text(
-            f"✏️ *Manage Tomorrow's Schedule*\n\n"
-            f"⏰ {sched['departure_time']} — {sched['route_from']} → {sched['route_to']}\n"
-            f"📌 {sched.get('location','Jetty No. 1, Male')}\n\n"
-            f"What would you like to change for tomorrow?",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
-
-    elif data.startswith("swap_time_"):
-        sched_id = int(data.split("_")[-1])
-        await set_user_state(user.id, OP_AWAIT_CHANGE_NOTE, {"change_type": "time", "change_sched_id": sched_id})
-        await query.message.reply_text(
-            "⏰ *Change Tomorrow's Departure Time*\n\nEnter the new time:\n_Example: 05:00 PM_",
-            parse_mode="Markdown")
-
-    elif data.startswith("swap_route_"):
-        sched_id = int(data.split("_")[-1])
-        await set_user_state(user.id, OP_AWAIT_CHANGE_NOTE, {"change_type": "route", "change_sched_id": sched_id})
-        await query.message.reply_text(
-            "🗺️ *Change Tomorrow's Route*\n\nEnter new stops comma-separated:\n_Example: Male, Gulhi, Maafushi_",
-            parse_mode="Markdown")
-
-    elif data.startswith("swap_boat_"):
-        parts_s = data.split("_", 3)
-        sched_id = int(parts_s[2])
-        new_boat = parts_s[3]
-        from datetime import timedelta as _td2
-        tomorrow = datetime.now().date() + _td2(days=1)
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO schedule_changes (schedule_id, change_date, new_boat_name, note)
-                VALUES ($1,$2,$3,'Boat swapped by operator')
-                ON CONFLICT DO NOTHING
-            """, sched_id, tomorrow, new_boat)
-            sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
-            bookings = await conn.fetch("""
-                SELECT customer_telegram_id, booking_ref FROM bookings
-                WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
-            """, sched_id, tomorrow)
-        await query.edit_message_text(
-            f"✅ Tomorrow's {sched['departure_time']} departure now uses *{new_boat}*.",
-            parse_mode="Markdown")
-        # Notify customers
-        for bk in bookings:
-            try:
-                await ctx.bot.send_message(bk["customer_telegram_id"],
-                    f"🚤 *Schedule Update*\n\n"
-                    f"Your booking `{bk['booking_ref']}` has a small update:\n\n"
-                    f"The boat for your *{sched['departure_time']}* departure has been changed to *{new_boat}*.\n"
-                    f"📌 Location: {sched.get('location','Jetty No. 1, Male')}\n\n"
-                    f"All other details remain the same. Safe travels! 🌊",
-                    parse_mode="Markdown")
-            except Exception as e:
-                logger.error(f"Customer notify error: {e}")
-
-    elif data.startswith("cancel_today_"):
-        sched_id = int(data.split("_")[-1])
-        from datetime import timedelta as _td3
-        tomorrow = datetime.now().date() + _td3(days=1)
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO schedule_changes (schedule_id, change_date, note, status)
-                VALUES ($1,$2,'Departure cancelled for tomorrow','cancelled')
-                ON CONFLICT DO NOTHING
-            """, sched_id, tomorrow)
-            sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
-            bookings = await conn.fetch("""
-                SELECT customer_telegram_id, booking_ref FROM bookings
-                WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
-            """, sched_id, tomorrow)
-        await query.edit_message_text(f"✅ Tomorrow's {sched['departure_time']} departure marked as cancelled.")
-        for bk in bookings:
-            try:
-                await ctx.bot.send_message(bk["customer_telegram_id"],
-                    f"❌ *Departure Cancelled*\n\n"
-                    f"We regret to inform you that your *{sched['departure_time']}* departure\n"
-                    f"{sched['route_from']} → {sched['route_to']} has been cancelled today.\n\n"
-                    f"Booking `{bk['booking_ref']}`\n\n"
-                    f"Please contact the operator for rebooking or refund. Sorry for the inconvenience. 🙏",
-                    parse_mode="Markdown")
-            except Exception as e:
-                logger.error(f"Cancel notify error: {e}")
-
-    # ── ADMIN PANEL CALLBACKS ──────────────────────────────────────────────────
-    elif data == "adm_operators":
-        if not await admin_check(query, ctx): return
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            ops = await conn.fetch("SELECT * FROM operators ORDER BY status, created_at DESC LIMIT 20")
-        if not ops:
-            await query.message.reply_text("No operators found.")
-            return
-        for op in ops:
-            status_icon = {"pending":"⏳","approved":"✅","rejected":"❌"}.get(op["status"],"❓")
-            rec = "🌟 " if op["is_recommended"] else ""
-            msg = (
-                f"{status_icon} {rec}*{op['business_name']}*\n"
-                f"🛥️ {op['boat_name']} | 💺 {op['seat_count']} seats\n"
-                f"👤 @{op['telegram_username'] or 'N/A'} (`{op['telegram_id']}`)\n"
-                f"📞 {op['owner_contact'] or 'N/A'}\n"
-                f"📅 {str(op['created_at'])[:10]}"
-            )
-            btns = []
-            if op["status"] != "approved":
-                btns.append([InlineKeyboardButton("✅ Approve", callback_data=f"approve_op_{op['id']}"),
-                             InlineKeyboardButton("❌ Reject",  callback_data=f"reject_op_{op['id']}")])
-            btns.append([
-                InlineKeyboardButton("🌟 Recommend" if not op["is_recommended"] else "⭐ Un-recommend",
-                    callback_data=f"admin_recommend_{op['id']}" if not op["is_recommended"] else f"admin_unrecommend_{op['id']}"),
-                InlineKeyboardButton("🔄 Reset", callback_data=f"admin_reset_{op['id']}"),
-                InlineKeyboardButton("🗑️ Delete", callback_data=f"admin_delete_{op['id']}")
-            ])
-            await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
-
-    elif data == "adm_bookings":
-        if not await admin_check(query, ctx): return
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            bks = await conn.fetch("""
-                SELECT b.*, o.business_name FROM bookings b
-                JOIN operators o ON b.operator_id=o.id
-                ORDER BY b.created_at DESC LIMIT 15
-            """)
-        if not bks:
-            await query.message.reply_text("No bookings yet.")
-            return
-        icons = {"pending_payment":"⏳","pending_confirmation":"🔄","confirmed":"✅","cancelled":"❌"}
-        msg = "📦 *Recent Bookings:*\n\n"
-        for b in bks:
-            ic = icons.get(b["status"],"❓")
-            msg += (f"{ic} `{b['booking_ref']}` — {b['business_name']}\n"
-                   f"   👤 {b['customer_name'] or 'N/A'} | 📅 {b['travel_date']} | MVR {b['total_amount']}\n\n")
-        await query.message.reply_text(msg, parse_mode="Markdown")
-
-    elif data == "adm_revenue" or data.startswith("adm_revenue_"):
-        if not await admin_check(query, ctx): return
-        now = datetime.now()
-        if data.startswith("adm_revenue_"):
-            parts = data.split("_")
-            year, month = int(parts[2]), int(parts[3])
-        else:
-            year, month = now.year, now.month
-        month_name = datetime(year, month, 1).strftime("%B %Y")
-
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            # Platform-wide monthly stats
-            mstats = await conn.fetchrow("""
-                SELECT
-                    COUNT(*) FILTER (WHERE status='confirmed')   AS confirmed,
-                    COUNT(*) FILTER (WHERE status='cancelled')   AS cancelled,
-                    COUNT(*) FILTER (WHERE status IN ('pending_payment','pending_confirmation')) AS pending,
-                    COUNT(*) AS total,
-                    COALESCE(SUM(total_amount) FILTER (WHERE status='confirmed'),0) AS revenue,
-                    COALESCE(SUM(passenger_count) FILTER (WHERE status='confirmed'),0) AS seats
-                FROM bookings
-                WHERE EXTRACT(YEAR FROM travel_date)=$1
-                  AND EXTRACT(MONTH FROM travel_date)=$2
-            """, year, month)
-
-            # Subscription income this month
-            sub_income_ops = await conn.fetchval("""
-                SELECT COUNT(*) FROM subscriptions
-                WHERE status='active'
-                AND EXTRACT(YEAR FROM updated_at)=$1
-                AND EXTRACT(MONTH FROM updated_at)=$2
-            """, year, month)
-            sub_fee = float(await get_setting("subscription_fee","500"))
-            sub_income = (sub_income_ops or 0) * sub_fee
-
-            # Top operators
-            top_ops = await conn.fetch("""
-                SELECT o.business_name, COUNT(*) as bookings,
-                       COALESCE(SUM(b.total_amount),0) as revenue
-                FROM bookings b JOIN operators o ON b.operator_id=o.id
-                WHERE b.status='confirmed'
-                  AND EXTRACT(YEAR FROM b.travel_date)=$1
-                  AND EXTRACT(MONTH FROM b.travel_date)=$2
-                GROUP BY o.business_name ORDER BY revenue DESC LIMIT 5
-            """, year, month)
-
-            # Inactive operators (no bookings in 30 days)
-            inactive = await conn.fetchval("""
-                SELECT COUNT(*) FROM operators o
-                WHERE o.status='approved'
-                AND NOT EXISTS (
-                    SELECT 1 FROM bookings b
-                    WHERE b.operator_id=o.id
-                    AND b.created_at > NOW() - INTERVAL '30 days'
-                )
-            """)
-
-            canc_rate = 0
-            if mstats["total"] > 0:
-                canc_rate = round(mstats["cancelled"] / mstats["total"] * 100, 1)
-
-        msg = (
-            f"📊 *Platform Report — {month_name}*\n\n"
-            f"📦 *Bookings:*\n"
-            f"  ✅ Confirmed: *{mstats['confirmed']}*\n"
-            f"  ❌ Cancelled: *{mstats['cancelled']}* ({canc_rate}%)\n"
-            f"  ⏳ Pending: *{mstats['pending']}*\n"
-            f"  📋 Total: *{mstats['total']}*\n\n"
-            f"💺 Seats sold: *{mstats['seats']}*\n"
-            f"💰 Platform revenue: *MVR {float(mstats['revenue']):,.2f}*\n\n"
-            f"💳 *Samuga Income:*\n"
-            f"  Subscriptions renewed: *{sub_income_ops}*\n"
-            f"  Subscription income: *MVR {sub_income:,.2f}*\n\n"
-            f"⚠️ Inactive operators (30d): *{inactive}*\n\n"
-            f"🏆 *Top Operators:*\n"
-        )
-        for i, op in enumerate(top_ops, 1):
-            msg += f"  {i}. {op['business_name']} — {op['bookings']} bookings | MVR {float(op['revenue']):.2f}\n"
-
-        # Month navigation
-        from datetime import timedelta
-        prev_m = (datetime(year, month, 1) - timedelta(days=1))
-        next_m_dt = datetime(year, month, 28) + timedelta(days=4)
-        next_m = next_m_dt.replace(day=1)
-        nav = [InlineKeyboardButton(f"◀ {prev_m.strftime('%b')}", callback_data=f"adm_revenue_{prev_m.year}_{prev_m.month}")]
-        if (next_m.year, next_m.month) <= (now.year, now.month):
-            nav.append(InlineKeyboardButton(f"{next_m.strftime('%b')} ▶", callback_data=f"adm_revenue_{next_m.year}_{next_m.month}"))
-
-        await query.message.reply_text(msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([nav]))
-
-    elif data == "adm_broadcast":
-        if not await admin_check(query, ctx): return
-        await set_user_state(user.id, ADMIN_AWAIT_BROADCAST, {})
-        await query.message.reply_text(
-            "📢 *Broadcast Message*\n\n"
-            "Type the message to send to *all approved operators*:\n\n"
-            "_Type_ `cancel` _to abort._",
-            parse_mode="Markdown")
-
-    elif data == "adm_upload_logo":
-        if not await admin_check(query, ctx): return
-        await set_user_state(user.id, ADMIN_AWAIT_LOGO, {})
-        await query.message.reply_text(
-            "🖼️ *Upload Samuga Travels Logo*\n\n"
-            "Send the logo image now and it will appear on every ticket! 🎫",
-            parse_mode="Markdown")
-
-    elif data == "adm_settings":
-        if not await admin_check(query, ctx): return
-        samuga_logo = await get_setting("samuga_logo_url", "Not set")
-        sub_fee = await get_setting("subscription_fee", "500")
-        sub_accounts = await get_setting("subscription_accounts", "[]")
-        msg = (
-            f"⚙️ *Settings*\n\n"
-            f"🖼️ Samuga Logo: {'✅ Set' if samuga_logo else '❌ Not set'}\n\n"
-            f"💳 *Subscription:*\n"
-            f"  Monthly fee: *MVR {sub_fee}*\n"
-            f"  Payment accounts: {'✅ Set' if sub_accounts != '[]' else '❌ Not set'}\n"
-        )
-        await query.message.reply_text(msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🖼️ Update Logo", callback_data="adm_upload_logo")],
-                [InlineKeyboardButton("💳 Subscriptions", callback_data="adm_subscriptions")],
-                [InlineKeyboardButton("🔙 Back to Admin", callback_data="adm_back")]
-            ]))
-
-    elif data == "adm_subscriptions":
-        if not await admin_check(query, ctx): return
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            subs = await conn.fetch("""
-                SELECT s.*, o.business_name, o.telegram_id
-                FROM subscriptions s JOIN operators o ON s.operator_id=o.id
-                ORDER BY s.created_at DESC LIMIT 20
-            """)
-        fee = await get_setting("subscription_fee", "500")
-        sub_icons = {"trial":"🎁","active":"✅","expired":"❌","pending":"⏳","grace":"⚠️"}
-        msg = f"💳 *Subscriptions* | Fee: MVR {fee}/month\n\n"
-        for s in subs:
-            ic = sub_icons.get(s["status"],"❓")
-            end = s["trial_ends_at"] or s["paid_until"]
-            end_str = end.strftime("%d %b %Y") if end else "N/A"
-            msg += f"{ic} *{s['business_name']}* — {s['status'].upper()} until {end_str}\n"
-        if not subs: msg += "_No subscriptions yet._"
-        await query.message.reply_text(msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💰 Set Fee", callback_data="adm_set_fee")],
-                [InlineKeyboardButton("🏦 Set Payment Accounts", callback_data="adm_set_sub_accounts")],
-            ]))
-
-    elif data == "adm_set_fee":
-        if not await admin_check(query, ctx): return
-        await set_user_state(user.id, "admin_await_sub_fee", {})
-        await query.message.reply_text(
-            "💰 *Set Subscription Fee*\n\nEnter the monthly fee in MVR:\n_Example: 500_",
-            parse_mode="Markdown")
-
-    elif data == "adm_set_sub_accounts":
-        if not await admin_check(query, ctx): return
-        await set_user_state(user.id, "admin_await_sub_accounts", {})
-        await query.message.reply_text(
-            "🏦 *Set Samuga Travels Payment Accounts*\n\n"
-            "Enter one per line: BANK NUMBER NAME\n\n"
-            "_Example:_\n"
-            "`BML 7770001234567 Samuga Travels`\n"
-            "`MIB 90101234567890 Samuga Travels`",
-            parse_mode="Markdown")
-
-    elif data == "adm_schedules":
-        if not await admin_check(query, ctx): return
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            scheds = await conn.fetch("""
-                SELECT s.*, o.business_name FROM schedules s
-                JOIN operators o ON s.operator_id=o.id
-                WHERE s.is_active=TRUE ORDER BY o.business_name, s.departure_time
-            """)
-        if not scheds:
-            await query.message.reply_text("No active schedules.")
-            return
-        msg = "🚤 *All Active Schedules:*\n\n"
-        for s in scheds:
-            msg += (f"🏢 *{s['business_name']}*\n"
-                   f"  ⏰ {s['departure_time']} | {s['route_from']} → {s['route_to']}\n"
-                   f"  📌 {s.get('location','N/A')} | 💺 {s['available_seats']} seats | MVR {s['price_per_seat']}\n\n")
-        await query.message.reply_text(msg[:4000], parse_mode="Markdown")
-
-    elif data == "adm_find_customer":
-        if not await admin_check(query, ctx): return
-        await query.message.reply_text(
-            "🔍 Use: `/findcustomer <booking_ref or telegram_id>`\n\nExample: `/findcustomer ST-260629-0389`",
-            parse_mode="Markdown")
-
-    elif data == "adm_control_room":
-        if not await admin_check(query, ctx): return
-        from datetime import timedelta
-        pool = await get_pool()
-        now = datetime.now()
-        today = now.date()
-        async with pool.acquire() as conn:
-            # Bookings today
-            bk_today = await conn.fetchval(
-                "SELECT COUNT(*) FROM bookings WHERE created_at::date=$1", today)
-            bk_confirmed = await conn.fetchval(
-                "SELECT COUNT(*) FROM bookings WHERE created_at::date=$1 AND status='confirmed'", today)
-            bk_pending_pay = await conn.fetchval(
-                "SELECT COUNT(*) FROM bookings WHERE created_at::date=$1 AND status='pending_payment'", today)
-            bk_pending_conf = await conn.fetchval(
-                "SELECT COUNT(*) FROM bookings WHERE status='pending_confirmation'")
-            # Revenue today
-            rev_today = await conn.fetchval(
-                "SELECT COALESCE(SUM(total_amount),0) FROM bookings WHERE created_at::date=$1 AND status='confirmed'", today)
-            seats_today = await conn.fetchval(
-                "SELECT COALESCE(SUM(passenger_count),0) FROM bookings WHERE created_at::date=$1 AND status='confirmed'", today)
-            # Departures today
-            departures = await conn.fetchval(
-                "SELECT COUNT(*) FROM schedules WHERE is_active=TRUE")
-            # Stale pending confirmations (>20 min)
-            stale = await conn.fetch("""
-                SELECT b.booking_ref, o.business_name,
-                       EXTRACT(EPOCH FROM (NOW()-b.created_at))/60 as mins_ago
-                FROM bookings b JOIN operators o ON b.operator_id=o.id
-                WHERE b.status='pending_confirmation'
-                AND b.created_at < NOW() - INTERVAL '20 minutes'
-                ORDER BY b.created_at
-                LIMIT 5
-            """)
-            # Subscriptions expiring in 7 days
-            expiring = await conn.fetchval("""
-                SELECT COUNT(*) FROM subscriptions
-                WHERE (trial_ends_at BETWEEN NOW() AND NOW()+INTERVAL '7 days'
-                       OR paid_until BETWEEN NOW() AND NOW()+INTERVAL '7 days')
-                AND status IN ('trial','active')
-            """)
-            # Departures in next 2 hours
-            soon = await conn.fetchval("""
-                SELECT COUNT(DISTINCT b.id) FROM bookings b
-                JOIN schedules s ON b.schedule_id=s.id
-                WHERE b.travel_date=$1 AND b.status='confirmed'
-                AND s.departure_time::time BETWEEN NOW()::time AND (NOW()+INTERVAL '2 hours')::time
-            """, today)
-
-        msg = (
-            f"📡 *Daily Control Room — {today.strftime('%d %b %Y')}*\n\n"
-            f"📦 *Bookings Today:* {bk_today}\n"
-            f"  ✅ Confirmed: {bk_confirmed}\n"
-            f"  💳 Pending payment: {bk_pending_pay}\n"
-            f"  🔄 Pending operator: {bk_pending_conf}\n\n"
-            f"🚤 Active schedules: {departures}\n"
-            f"👥 Seats sold today: {seats_today}\n"
-            f"💰 Revenue today: MVR {rev_today:.2f}\n\n"
-        )
-        # Needs attention
-        attention = []
-        if stale:
-            for s in stale:
-                attention.append(f"⏰ `{s['booking_ref']}` — {s['business_name']} waiting {int(s['mins_ago'])}min")
-        if expiring:
-            attention.append(f"💳 {expiring} subscription(s) expiring in 7 days")
-        if soon:
-            attention.append(f"🚢 {soon} confirmed bookings departing in next 2 hours")
-
-        if attention:
-            msg += "🚨 *Needs Attention:*\n"
-            for a in attention:
-                msg += f"  • {a}\n"
-        else:
-            msg += "✅ *All clear — nothing needs attention!*"
-
-        await query.message.reply_text(msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Refresh", callback_data="adm_control_room")],
-                [InlineKeyboardButton("🔙 Admin Panel", callback_data="adm_back")]
-            ]))
-
-    elif data == "adm_back":
-        if not await admin_check(query, ctx): return
-        await query.message.reply_text("Back to admin — type /admin", parse_mode="Markdown")
-
-    elif data.startswith("urgent_review_"):
-        op_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            op = await conn.fetchrow("SELECT * FROM operators WHERE id=$1", op_id)
-        if op:
-            urgency_msg = (
-                f"🚨 *URGENT REVIEW REQUEST*\n\n"
-                f"👤 @{op['telegram_username'] or op['telegram_id']} (`{op['telegram_id']}`)\n"
-                f"🏢 *{op['business_name']}*\n"
-                f"🛥️ {op['boat_name']}\n\n"
-                f"Operator is requesting urgent approval."
-            )
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Approve Now", callback_data=f"approve_op_{op_id}"),
-                InlineKeyboardButton("❌ Reject", callback_data=f"reject_op_{op_id}")
-            ]])
-            try:
-                await ctx.bot.send_message(ADMIN_GROUP_ID, urgency_msg,
-                    parse_mode="Markdown", message_thread_id=ADMIN_THREAD_ID, reply_markup=kb)
-                await query.answer("🚨 Urgent request sent to admin!", show_alert=True)
-                await query.edit_message_text(
-                    "🚨 *Urgent review request sent!*\n\n"
-                    "Our team has been notified. You will hear back shortly.",
-                    parse_mode="Markdown")
-            except Exception as e:
-                logger.error(f"Urgent notify error: {e}")
-                await query.answer("Failed to send. Try again.", show_alert=True)
-
-    elif data == "op_schedules":
-        op = await get_operator(user.id)
-        if not op or op.get("status") != "approved":
-            await query.message.reply_text("⚠️ Account not yet approved.")
-            return
-        await query.message.reply_text(
-            "🗓️ *Add Schedules*\n\nHow would you like to add?",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 Bulk Setup (recommended)", callback_data="op_bulk_setup")],
-                [InlineKeyboardButton("➕ Add Single Schedule", callback_data="op_single_schedule")],
-            ]))
-
-    elif data == "op_single_schedule":
-        op = await get_operator(user.id)
-        if not op or op.get("status") != "approved":
-            return
-        await set_user_state(user.id, OP_AWAIT_SCHEDULE_ROUTE, {})
-        await query.message.reply_text(
-            "🗓️ *Add a Single Schedule*\n\n"
-            "Enter stops comma-separated:\n_Male, Airport, Thoddoo_",
-            parse_mode="Markdown")
-
-    elif data == "op_bulk_setup":
-        op = await get_operator(user.id)
-        if not op or op.get("status") != "approved":
-            return
-        await set_user_state(user.id, OP_BULK_LOCATION, {})
-        await query.message.reply_text(
-            "📋 *Bulk Schedule Setup*\n\n"
-            "This will create all your weekly schedules at once!\n\n"
-            "*Step 1:* What are your route stops?\n"
-            "_Enter comma-separated in order:_\n"
-            "`Male, Airport, Thoddoo`",
-            parse_mode="Markdown")
-
-    elif data == "op_profile":
-        op = await get_operator(user.id)
-        if not op:
-            await query.message.reply_text("⚠️ No operator profile found.")
-            return
-        routes = ", ".join(op.get("routes") or [])
-        await query.message.reply_text(
-            f"🚤 *Your Operator Profile*\n\n"
-            f"🏢 *Business:* {op['business_name']}\n"
-            f"🛥️ *Boat:* {op['boat_name']}\n"
-            f"💺 *Seats:* {op['seat_count']}\n"
-            f"📍 *Routes:* {routes}\n"
-            f"📊 *Status:* {op['status'].upper()}\n"
-            f"⭐ *Rating:* {op['average_rating']} ({op['total_reviews']} reviews)\n"
-            f"✨ *Recommended:* {'Yes 🌟' if op['is_recommended'] else 'No'}\n\n"
-            f"{'─'*30}\n"
-            f"💡 *Quick Guide:*\n"
-            f"• 📌 Pin this message for quick access\n"
-            f"• Type `/profile` anytime to see your profile\n"
-            f"• Type `/schedules` to manage your routes\n"
-            f"• Type `/bookings` to see pending bookings\n"
-            f"• Type `/fleet` to manage your boats\n"
-            f"• Type `/today` to view today\'s schedule\n"
-            f"• Type `/help` for all commands\n\n"
-            f"_Commands are flexible — just type naturally!_",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📋 Bulk Schedule Setup", callback_data="op_bulk_setup"),
-                 InlineKeyboardButton("➕ Add Single Schedule", callback_data="op_single_schedule")],
-                [InlineKeyboardButton("🚤 My Fleet",            callback_data="op_fleet"),
-                 InlineKeyboardButton("📦 Pending Bookings",    callback_data="op_bookings")],
-                [InlineKeyboardButton("📅 Today & Tomorrow",    callback_data="op_today"),
-                 InlineKeyboardButton("✏️ Edit Info",           callback_data="op_edit")],
-                [InlineKeyboardButton("📊 Monthly Report",      callback_data="op_monthly_report"),
-                 InlineKeyboardButton("💳 My Subscription",     callback_data="op_subscription")],
-            ]))
-
-    elif data == "op_bookings":
-        op = await get_operator(user.id)
-        if not op:
-            return
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT b.*, s.route_from, s.route_to, s.departure_time
-                FROM bookings b JOIN schedules s ON b.schedule_id=s.id
-                WHERE b.operator_id=$1 AND b.status='pending_confirmation'
-                ORDER BY b.created_at DESC LIMIT 10
-            """, op["id"])
-        if not rows:
-            await query.message.reply_text("📦 No pending bookings.")
-            return
-        for b in rows:
-            await query.message.reply_text(
-                f"📦 *Pending Booking*\n\n🔖 `{b['booking_ref']}`\n"
-                f"📍 {b['route_from']} → {b['route_to']}\n"
-                f"📅 {b['travel_date']} @ {b['departure_time']}\n"
-                f"👥 {b['passenger_count']} passengers | 💰 MVR {b['total_amount']}",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{b['id']}")
-                ]]))
-
-
-
-
-    elif data == "op_monthly_report" or data.startswith("op_report_"):
-        op = await get_operator(user.id)
-        if not op:
-            await query.message.reply_text("⚠️ No operator profile found.")
-            return
-        now = datetime.now()
-        if data.startswith("op_report_"):
-            parts = data.split("_")
-            year, month = int(parts[2]), int(parts[3])
-        else:
-            year, month = now.year, now.month
-        month_name = datetime(year, month, 1).strftime("%B %Y")
-        stats, top_route, op_meta = await get_operator_monthly_report(op["id"], year, month)
-
-        total     = int(stats.get("total_bookings", 0) or 0)
-        confirmed = int(stats.get("confirmed_bookings", 0) or 0)
-        cancelled = int(stats.get("cancelled_bookings", 0) or 0)
-        pending   = int(stats.get("pending_bookings", 0) or 0)
-        seats     = int(stats.get("seats_sold", 0) or 0)
-        gross     = float(stats.get("gross_sales", 0) or 0)
-        canc_val  = float(stats.get("cancelled_value", 0) or 0)
-        cancelled_actions = int(stats.get("cancelled_this_month", 0) or 0)
-        refunds_completed = float(stats.get("refunds_completed", 0) or 0)
-        refunds_pending   = float(stats.get("refunds_pending", 0) or 0)
-        try:
-            commission_rate = float(await get_setting("commission_rate", "0") or 0)
-        except Exception:
-            commission_rate = 0.0
-        commission = gross * commission_rate / 100
-        net_earning = max(0, gross - refunds_completed - commission)
-        rating    = float(op_meta.get("average_rating", 0) or 0)
-        reviews   = int(op_meta.get("total_reviews", 0) or 0)
-
-        route_line = ""
-        if top_route:
-            route_line = f"\n🧭 Top route: *{top_route['route_from']} → {top_route['route_to']}* ({top_route['trips']} trips)"
-
-        if total == 0:
-            perf = "📭 No bookings yet this month."
-        elif confirmed / max(total, 1) >= 0.9:
-            perf = "🏆 Excellent — 90%+ confirmation rate!"
-        elif confirmed / max(total, 1) >= 0.7:
-            perf = "✅ Good month — strong confirmation rate."
-        else:
-            perf = "⚠️ Some bookings went unconfirmed — check pending."
-
-        msg = (
-            f"📊 *Monthly Report — {month_name}*\n\n"
-            f"🚤 *{op['business_name']}*\n\n"
-            f"📦 *Bookings:*\n"
-            f"  🎫 Total: *{total}*\n"
-            f"  ✅ Confirmed: *{confirmed}*\n"
-            f"  ❌ Cancelled: *{cancelled}*\n"
-            f"  ⏳ Pending: *{pending}*\n\n"
-            f"💺 Seats sold: *{seats}*\n\n"
-            f"💰 *Money:*\n"
-            f"  Gross confirmed sales: *MVR {gross:,.2f}*\n"
-            f"  Refunds completed: *MVR {refunds_completed:,.2f}*\n"
-            f"  Refunds pending: *MVR {refunds_pending:,.2f}*\n"
-            f"  Samuga commission ({commission_rate:g}%): *MVR {commission:,.2f}*\n"
-            f"  💵 Estimated net earning: *MVR {net_earning:,.2f}*\n\n"
-            f"📉 Cancelled trip value: *MVR {canc_val:,.2f}*\n"
-            f"🗓 Cancelled this month: *{cancelled_actions}*\n\n"
-            f"⭐ Rating: *{rating:.1f}* ({reviews} reviews){route_line}\n\n"
-            f"_{perf}_"
-        )
-
-        from datetime import timedelta as _tdr
-        prev_m = datetime(year, month, 1) - _tdr(days=1)
-        next_m = (datetime(year, month, 28) + _tdr(days=4)).replace(day=1)
-        nav = [InlineKeyboardButton(f"◀ {prev_m.strftime('%b %Y')}", callback_data=f"op_report_{prev_m.year}_{prev_m.month}")]
-        if (next_m.year, next_m.month) <= (now.year, now.month):
-            nav.append(InlineKeyboardButton(f"{next_m.strftime('%b %Y')} ▶", callback_data=f"op_report_{next_m.year}_{next_m.month}"))
-
-        await query.message.reply_text(msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                nav,
-                [InlineKeyboardButton("❌ Cancelled Bookings", callback_data=f"op_cancelled_{year}_{month}")],
-                [InlineKeyboardButton("🔙 Back", callback_data="op_profile")]
-            ]))
-
-    elif data.startswith("op_cancelled_"):
-        op = await get_operator(user.id)
-        if not op: return
-        parts = data.split("_")
-        year, month = int(parts[2]), int(parts[3])
-        month_name = datetime(year, month, 1).strftime("%B %Y")
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT booking_ref, customer_name, travel_date, passenger_count,
-                       total_amount, cancelled_at, cancellation_reason
-                FROM bookings
-                WHERE operator_id=$1 AND status='cancelled'
-                  AND EXTRACT(YEAR FROM travel_date)=$2
-                  AND EXTRACT(MONTH FROM travel_date)=$3
-                ORDER BY cancelled_at DESC LIMIT 10
-            """, op["id"], year, month)
-        if not rows:
-            await query.message.reply_text(f"✅ No cancelled bookings in {month_name}!", parse_mode="Markdown")
-            return
-        msg = f"❌ *Cancelled — {month_name}*\n\n"
-        for r in rows:
-            msg += (
-                f"📋 `{r['booking_ref']}`\n"
-                f"  👤 {r['customer_name'] or 'N/A'} | 👥 {r['passenger_count']} pax\n"
-                f"  📅 {r['travel_date']} | MVR {r['total_amount']}\n"
-                f"  🕐 {str(r['cancelled_at'])[:16] if r['cancelled_at'] else 'N/A'}\n\n"
-            )
-        await query.message.reply_text(msg[:4000], parse_mode="Markdown")
-
-    elif data.startswith("sub_approve_"):
-        if not await admin_check(query, ctx): return
-        sub_id = int(data.split("_")[-1])
-        from datetime import timedelta as _td_sub
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            sub = await conn.fetchrow("SELECT * FROM subscriptions WHERE id=$1", sub_id)
-        if not sub:
-            await query.answer("Subscription not found.", show_alert=True)
-            return
-        now = datetime.now()
-        base = sub["paid_until"] if sub["paid_until"] and sub["paid_until"] > now else now
-        new_until = base + _td_sub(days=30)
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE subscriptions SET status='active', paid_until=$1, updated_at=NOW() WHERE id=$2",
-                new_until, sub_id)
-            await conn.execute(
-                "UPDATE operators SET subscription_status='active' WHERE id=$1", sub["operator_id"])
-            op_row = await conn.fetchrow(
-                "SELECT telegram_id, business_name FROM operators WHERE id=$1", sub["operator_id"])
-        biz = op_row["business_name"] if op_row else "Operator"
-        until_str = new_until.strftime("%d %b %Y")
-        await query.edit_message_text(
-            f"✅ Subscription approved for *{biz}*\nActive until: *{until_str}*",
-            parse_mode="Markdown")
-        if op_row:
-            try:
-                await ctx.bot.send_message(op_row["telegram_id"],
-                    f"✅ *Subscription Activated!*\n\n"
-                    f"Thank you! *{biz}* is live on Samuga Travels.\n\n"
-                    f"📅 Active until: *{until_str}*\n\n"
-                    f"Your schedules are live and customers can book. 🌊",
-                    parse_mode="Markdown")
-            except Exception as e:
-                logger.error(f"Sub approve notify: {e}")
-
-    elif data.startswith("sub_reject_"):
-        if not await admin_check(query, ctx): return
-        sub_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            sub = await conn.fetchrow("SELECT * FROM subscriptions WHERE id=$1", sub_id)
-        if not sub:
-            await query.answer("Subscription not found.", show_alert=True)
-            return
-        async with pool.acquire() as conn:
-            op_row = await conn.fetchrow(
-                "SELECT telegram_id, business_name FROM operators WHERE id=$1", sub["operator_id"])
-        await query.edit_message_text("❌ Subscription payment rejected.")
-        if op_row:
-            try:
-                await ctx.bot.send_message(op_row["telegram_id"],
-                    f"❌ *Payment Not Confirmed*\n\n"
-                    f"We could not verify your payment. Please check the amount and account, "
-                    f"or contact @SamugaTravels. 🙏",
-                    parse_mode="Markdown")
-            except Exception as e:
-                logger.error(f"Sub reject notify: {e}")
-
-    elif data.startswith("upload_refund_"):
-        bk_id = int(data.split("_")[-1])
-        op = await get_operator(user.id)
-        if not op:
-            await query.answer("Operator account required.", show_alert=True)
-            return
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            bk = await conn.fetchrow("SELECT * FROM bookings WHERE id=$1", bk_id)
-        if not bk or str(bk["operator_id"]) != str(op["id"]):
-            await query.answer("Not your booking.", show_alert=True)
-            return
-        await set_user_state(user.id, OP_AWAIT_REFUND_SLIP,
-                             {"refund_booking_id": bk_id,
-                              "refund_booking_ref": bk["booking_ref"],
-                              "refund_amount": str(bk["total_amount"]),
-                              "refund_account": bk.get("refund_account",""),
-                              "refund_account_name": bk.get("refund_account_name",""),
-                              "customer_tg_id": bk["customer_telegram_id"],
-                              "op_name": op["business_name"],
-                              "op_contact": op["owner_contact"]})
-        await query.message.reply_text(
-            f"📤 *Upload Refund Slip*\n\n"
-            f"Booking: `{bk['booking_ref']}`\n"
-            f"Amount: MVR {bk['total_amount']}\n"
-            f"To: `{bk.get('refund_account','')}` — {bk.get('refund_account_name','')}\n\n"
-            f"Please send the *transfer screenshot* now 👇",
-            parse_mode="Markdown")
-
-    elif data.startswith("mark_boarded_"):
-        booking_id = int(data.split("_")[-1])
-        op = await get_operator(user.id)
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            bk = await conn.fetchrow("SELECT * FROM bookings WHERE id=$1", booking_id)
-        if not bk:
-            await query.answer("Booking not found.", show_alert=True)
-            return
-        # Only the operator who owns it or super admin can mark boarded
-        if user.id not in SUPER_ADMINS and (not op or op.get("id") != bk["operator_id"]):
-            await query.answer("⛔ Not authorised.", show_alert=True)
-            return
-        if bk.get("boarded_at"):
-            await query.answer("Already marked as boarded!", show_alert=True)
-            return
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                UPDATE bookings SET boarded_at=NOW(), boarded_by=$1 WHERE id=$2
-            """, user.id, booking_id)
-        passengers = bk.get("passengers") or "[]"
-        if isinstance(passengers, str):
-            try:
-                passengers = json.loads(passengers)
-            except Exception:
-                passengers = []
-        pax_names = ", ".join([psg.get("name", "") for psg in passengers if psg.get("name")]) or (bk.get("customer_name") or "Passenger")
-        await safe_edit(query,
-            f"🛳️ *Passenger boarded!*\n\n"
-            f"Ref: `{bk['booking_ref']}`\n"
-            f"Passenger: *{pax_names}*\n"
-            f"Marked at: {datetime.now().strftime('%d %b %Y %H:%M')} MVT\n\n"
-            f"✅ Ticket used — cannot be reused.",
-            parse_mode="Markdown")
-
-    elif data.startswith("not_received_"):
-        booking_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            bk = await conn.fetchrow("""
-                SELECT b.*, o.telegram_username AS operator_username,
-                       o.telegram_id AS operator_telegram_id,
-                       o.owner_contact AS operator_contact,
-                       o.business_name AS operator_business_name
-                FROM bookings b
-                JOIN operators o ON b.operator_id=o.id
-                WHERE b.id=$1
-            """, booking_id)
-        if not bk:
-            await query.answer("Booking not found.", show_alert=True)
-            return
-
-        # Customer contact button: prefer operator username, fallback to Telegram user ID deep-link.
-        # This lets the customer and operator talk directly, then operator can confirm or reject from the same admin message.
-        contact_buttons = []
-        op_username = (bk.get("operator_username") or "").strip()
-        if op_username:
-            contact_buttons.append([InlineKeyboardButton(
-                "📩 Contact Operator",
-                url=f"https://t.me/{op_username.lstrip('@')}"
-            )])
-        elif bk.get("operator_telegram_id"):
-            contact_buttons.append([InlineKeyboardButton(
-                "📩 Contact Operator",
-                url=f"tg://user?id={bk['operator_telegram_id']}"
-            )])
-
-        try:
-            await ctx.bot.send_message(bk["customer_telegram_id"],
-                f"⚠️ *Payment Not Confirmed*\n\n"
-                f"Hi! The operator could not verify your payment for booking `{bk['booking_ref']}`.\n\n"
-                f"This could be because:\n"
-                f"• Transfer sent to wrong account\n"
-                f"• Amount was incorrect\n"
-                f"• Screenshot was unclear\n\n"
-                f"⚠️ If money was sent to the wrong bank/account, Samuga Travels and the operator cannot refund it. You must contact your bank.\n\n"
-                f"Please double-check and resend your slip, or contact the operator. 🙏",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(contact_buttons) if contact_buttons else None)
-        except Exception as e:
-            logger.error(f"Not received notify: {e}")
-
-        customer_contact = bk.get("customer_name") or "Customer"
-        operator_buttons = [
-            [InlineKeyboardButton("📩 Contact Customer", url=f"tg://user?id={bk['customer_telegram_id']}")],
-            [InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{booking_id}")],
-            [InlineKeyboardButton("❌ Keep Not Confirmed", callback_data=f"reject_booking_{booking_id}")],
-        ]
-        await safe_edit(query,
-            f"❌ *Payment Not Confirmed*\n\n"
-            f"Customer has been notified for booking `{bk['booking_ref']}`.\n\n"
-            f"📩 We forwarded your contact button to the customer.\n"
-            f"👤 *Customer contact:* {customer_contact}\n\n"
-            f"After you talk and solve the issue, you can confirm the booking below. "
-            f"If the payment is still wrong, keep it not confirmed.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(operator_buttons))
-
-    elif data.startswith("reject_booking_"):
-        booking_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            bk = await conn.fetchrow("SELECT booking_ref, status FROM bookings WHERE id=$1", booking_id)
-        if not bk:
-            await query.answer("Booking not found.", show_alert=True)
-            return
-        if bk["status"] == "confirmed":
-            await query.answer("Already confirmed — cannot reject here.", show_alert=True)
-            return
-        await safe_edit(query,
-            f"❌ *Payment Still Not Confirmed*\n\n"
-            f"Booking `{bk['booking_ref']}` is left pending/not confirmed.\n\n"
-            f"Customer can resend a clearer slip or contact the operator again.",
-            parse_mode="Markdown")
-
-    elif data.startswith("confirm_booking_"):
-        booking_id = int(data.split("_")[-1])
-        await do_confirm_booking(ctx, booking_id, query)
-
-# ── HELPERS ───────────────────────────────────────────────────────────────────
-async def save_operator(user, temp: dict):
-    import json as _json
-    # Build payment accounts list
-    accounts = []
-    if temp.get("bml_account"):
-        parts = temp["bml_account"].split("|", 1)
-        accounts.append({"bank": "BML", "number": parts[0].strip(), "name": parts[1].strip() if len(parts) > 1 else ""})
-    if temp.get("mib_account"):
-        parts = temp["mib_account"].split("|", 1)
-        accounts.append({"bank": "MIB", "number": parts[0].strip(), "name": parts[1].strip() if len(parts) > 1 else ""})
-    payment_accounts_json = _json.dumps(accounts)
-
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        # Add payment_accounts column if it doesn't exist
-        await conn.execute("""
-            ALTER TABLE operators ADD COLUMN IF NOT EXISTS payment_accounts TEXT DEFAULT '[]'
-        """)
-        await conn.execute("""
-            INSERT INTO operators (telegram_id, telegram_username, business_name, boat_name,
-                                   logo_url, seat_count, boat_type, routes, owner_name,
-                                   owner_contact, owner_id_photo_url, bml_account,
-                                   payment_accounts, status)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending')
-            ON CONFLICT (telegram_id) DO UPDATE SET
-                business_name=EXCLUDED.business_name,
-                boat_name=EXCLUDED.boat_name,
-                logo_url=EXCLUDED.logo_url,
-                owner_name=EXCLUDED.owner_name,
-                owner_contact=EXCLUDED.owner_contact,
-                owner_id_photo_url=EXCLUDED.owner_id_photo_url,
-                bml_account=EXCLUDED.bml_account,
-                payment_accounts=EXCLUDED.payment_accounts,
-                status='pending'
-        """, user.id, user.username, temp.get("business_name"), temp.get("boat_name"),
-            temp.get("logo_url"), int(temp.get("seat_count") or 0), temp.get("boat_type"),
-            temp.get("routes",[]), temp.get("owner_name"), temp.get("owner_contact"),
-            temp.get("owner_id_photo_url"), temp.get("bml_account",""),
-            payment_accounts_json)
-        # Fetch the saved operator id
-        row = await conn.fetchrow("SELECT id FROM operators WHERE telegram_id=$1", user.id)
-        return row["id"] if row else 0
-
-async def notify_admin_new_op(ctx, user, temp: dict, op_id: int = 0):
-    if op_id == 0:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT id FROM operators WHERE telegram_id=$1", user.id)
-        op_id = row["id"] if row else 0
-
-    msg = (
-        f"🆕 *New Operator Application*\n\n"
-        f"👤 @{user.username or user.first_name} (`{user.id}`)\n"
-        f"🏢 *{temp.get('business_name')}*\n"
-        f"🛥️ {temp.get('boat_name')} — {temp.get('seat_count')} seats\n"
-        f"📍 {temp.get('boat_type','ferry').title()}\n"
-        f"🗺️ {', '.join(temp.get('routes',[]))}\n"
-        f"👤 {temp.get('owner_name')} | 📞 {temp.get('owner_contact')}\n"
-        f"🏦 BML: `{temp.get('bml_account','N/A')}`\n"
-        f"🏦 MIB: `{temp.get('mib_account','—')}`"
-    )
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve", callback_data=f"approve_op_{op_id}"),
-        InlineKeyboardButton("❌ Reject",  callback_data=f"reject_op_{op_id}")
-    ]])
+        lines.append(f"<b>{i}.</b> [{lang}/{cat}]{age}")
+        lines.append(f"   📰 {title}")
+        lines.append(f"   ▶️ Post now: <code>/qpost {i}</code>")
+        lines.append(f"   🗑 Delete: <code>/qdel {i}</code>")
+
+    lines.append("")
+    lines.append("🗑 Delete all: <code>/queue clear</code> → <code>/queue clear confirm</code>")
+    lines.append("<i>Anything not actioned will auto-post tomorrow from 6AM MVT.</i>")
+
+    msg = "\n".join(lines)
     try:
-        logger.info(f"Sending admin notification to group {ADMIN_GROUP_ID} thread {ADMIN_THREAD_ID}")
-        await ctx.bot.send_message(ADMIN_GROUP_ID, msg, parse_mode="Markdown",
-                                   message_thread_id=ADMIN_THREAD_ID, reply_markup=kb)
-        logger.info("✅ Admin notification sent")
+        send_text(CORE_TEAM_CHAT_ID, msg, thread_id=CONTENT_LAB_THREAD_ID)
+        log.info(f"[NIGHT] Queue review sent to Content Lab: {len(pending)} items")
     except Exception as e:
-        logger.error(f"❌ Admin notify FAILED: {e}")
-        # Try without thread ID as fallback
-        try:
-            await ctx.bot.send_message(ADMIN_GROUP_ID, msg, parse_mode="Markdown", reply_markup=kb)
-            logger.info("✅ Admin notification sent (no thread)")
-        except Exception as e2:
-            logger.error(f"❌ Admin notify fallback FAILED: {e2}")
-    try:
-        if temp.get("logo_url"):
-            await ctx.bot.send_photo(ADMIN_GROUP_ID, photo=temp["logo_url"],
-                                     caption="🖼️ Operator Logo", message_thread_id=ADMIN_THREAD_ID)
-        if temp.get("owner_id_photo_url"):
-            await ctx.bot.send_photo(ADMIN_GROUP_ID, photo=temp["owner_id_photo_url"],
-                                     caption="🪪 Owner ID", message_thread_id=ADMIN_THREAD_ID)
-    except Exception as e:
-        logger.error(f"❌ Admin photo send FAILED: {e}")
+        log.error(f"[NIGHT] Queue review send failed: {e}")
 
-async def notify_operator_payment(ctx, booking_id, sel, temp, ref, customer, slip_file_id):
-    # Get operator telegram ID — try all possible sources
-    op_tg_id = (sel.get("op_telegram_id") or temp.get("sel_op_tg") or
-                temp.get("op_tg_id") or temp.get("op_telegram_id"))
 
-    # Convert 0 to None (0 is falsy but stored as int)
-    if op_tg_id == 0 or op_tg_id == "0":
-        op_tg_id = None
+def night_queue_autoclear():
+    """
+    Runs at 11:30PM MVT.
+    If social queue still has items (team took no action since 11:05PM review),
+    clears everything automatically and notifies Content Lab.
+    Queue resets fresh for next day starting 6AM.
+    """
+    with _social_queue_lock:
+        pending = list(_social_queue)
 
-    logger.info(f"notify_operator: booking={booking_id} op_tg_id={op_tg_id} "
-                f"sel_op_tg={temp.get('sel_op_tg')} sel_operator_id={temp.get('sel_operator_id')}")
-
-    if not op_tg_id:
-        # Fallback: look up from DB using operator_id
-        op_id = (sel.get("operator_id") or sel.get("id") or
-                 temp.get("sel_operator_id") or temp.get("operator_id"))
-        if not op_id:
-            # Last resort: look up from the booking itself
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                bk_row = await conn.fetchrow(
-                    "SELECT operator_id FROM bookings WHERE id=$1", booking_id)
-            op_id = bk_row["operator_id"] if bk_row else None
-
-        if op_id:
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    "SELECT telegram_id FROM operators WHERE id=$1", int(op_id))
-            if row:
-                op_tg_id = row["telegram_id"]
-                logger.info(f"notify_operator: resolved op_tg_id={op_tg_id} from DB")
-
-    if not op_tg_id:
-        logger.error(f"❌ Cannot notify operator for booking {booking_id} — no telegram_id found. "
-                     f"sel={sel} temp_keys={list(temp.keys())}")
+    if not pending:
+        log.info("[NIGHT] Auto-clear: queue already empty")
         return
 
-    pax = temp.get("passengers_collected",[])
-    pax_lines = "\n".join([f"  {i+1}. {p.get('name','N/A')} ({p.get('id_number','N/A')})" for i,p in enumerate(pax)]) or "  (details on file)"
-    dep_time = sel.get("departure_time") or temp.get("sel_time","")
-    msg = (
-        f"💳 *New Payment Received!*\n\n"
-        f"🔖 Ref: `{ref}`\n"
-        f"👤 *Customer:* {temp.get('cx_name','N/A')} | 📞 {temp.get('cx_phone','N/A')}\n"
-        f"📍 {temp.get('route_from')} → {temp.get('route_to')}\n"
-        f"📅 {temp.get('travel_date')} @ {dep_time}\n"
-        f"👥 {temp.get('passenger_count')} passengers:\n{pax_lines}\n"
-        f"💰 MVR {temp.get('total_amount')}\n\n"
-        f"Please confirm or mark not received as soon as possible. The bot will remind you if this waits too long.\n\n"
-        f"Review the slip and confirm below 👇"
-    )
+    # Clear the queue
+    with _social_queue_lock:
+        count = len(_social_queue)
+        _social_queue.clear()
+
+    persist_state()
+    log.info(f"[NIGHT] Auto-cleared {count} pending social queue item(s) at 11:30PM MVT")
+
+    # Notify Content Lab
+    titles = []
+    for item in pending[:5]:
+        t = item.get("title", item.get("caption","?"))[:60]
+        titles.append(f"• {t}")
+
+    lines = [
+        "🌙 <b>NIGHT QUEUE AUTO-CLEARED</b>",
+        f"<i>No action was taken on {count} pending post(s) since the 11:05PM review.</i>",
+        f"<i>All items have been automatically deleted.</i>\n",
+    ]
+    if titles:
+        lines.append("<b>Deleted items:</b>")
+        lines.extend(titles)
+        if count > 5:
+            lines.append(f"  <i>...and {count - 5} more</i>")
+
+    lines.append("")
+    lines.append("✅ <b>Queue is now empty.</b> Fresh start tomorrow from 6AM MVT.")
+
     try:
-        await ctx.bot.send_photo(op_tg_id, photo=slip_file_id, caption=msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{booking_id}")],
-                [InlineKeyboardButton("❌ Not Received / Wrong Transfer", callback_data=f"not_received_{booking_id}")]
-            ]))
-        logger.info(f"✅ Operator {op_tg_id} notified for booking {booking_id}")
+        send_text(CORE_TEAM_CHAT_ID, "\n".join(lines), thread_id=CONTENT_LAB_THREAD_ID)
     except Exception as e:
-        logger.error(f"Operator notify error: {e}")
+        log.error(f"[NIGHT] Auto-clear notify failed: {e}")
 
-async def do_confirm_booking(ctx, booking_id: int, query):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        # ── ATOMIC TRANSACTION: lock booking + deduct seats in one operation ──
-        async with conn.transaction():
-            # Lock the booking row — prevents double-confirm race condition
-            booking = await conn.fetchrow("""
-                SELECT b.*, o.business_name, o.boat_name, o.logo_url,
-                       o.owner_contact, o.telegram_id as op_telegram_id,
-                       s.route_from, s.route_to, s.departure_time, s.price_per_seat
-                FROM bookings b
-                JOIN operators o ON b.operator_id=o.id
-                JOIN schedules s ON b.schedule_id=s.id
-                WHERE b.id=$1 AND b.status='pending_confirmation'
-                FOR UPDATE
-            """, booking_id)
 
-            if not booking:
-                # Already confirmed, cancelled, or doesn't exist
-                try:
-                    await query.answer("⚠️ This booking is already confirmed or no longer pending.", show_alert=True)
-                    await safe_edit(query,
-                        "⚠️ Already processed — no action needed.",
-                        parse_mode="Markdown")
-                except: pass
-                return
-
-            # Atomically deduct seats — only succeeds if enough seats available
-            seat_update = await conn.fetchrow("""
-                UPDATE schedules
-                SET available_seats = available_seats - $1
-                WHERE id=$2 AND available_seats >= $1
-                RETURNING available_seats
-            """, booking["passenger_count"], booking["schedule_id"])
-
-            if not seat_update:
-                try:
-                    await query.answer("❌ Not enough seats available to confirm!", show_alert=True)
-                    await safe_edit(query,
-                        f"❌ Cannot confirm — not enough seats available for `{booking['booking_ref']}`.",
-                        parse_mode="Markdown")
-                except: pass
-                return
-
-            # Both checks passed — confirm the booking
-            await conn.execute("""
-                UPDATE bookings SET status='confirmed', confirmed_at=NOW() WHERE id=$1
-            """, booking_id)
-
-        logger.info(f"✅ Booking {booking['booking_ref']} confirmed atomically. Seats left: {seat_update['available_seats']}")
-
-    booking_dict = dict(booking)
-    passengers = booking_dict.get("passengers", "[]")
-    if isinstance(passengers, str):
-        try: booking_dict["passengers"] = json.loads(passengers)
-        except: booking_dict["passengers"] = []
-
-    # Fetch full operator info including contact
-    pool2 = await get_pool()
-    async with pool2.acquire() as conn2:
-        full_op = await conn2.fetchrow("SELECT * FROM operators WHERE id=$1", booking["operator_id"])
-        sched_full = await conn2.fetchrow("SELECT * FROM schedules WHERE id=$1", booking["schedule_id"])
-
-    op_dict = {
-        "business_name": booking["business_name"],
-        "boat_name": booking["boat_name"],
-        "logo_url": booking["logo_url"],
-        "owner_contact": full_op["owner_contact"] if full_op else "",
-        "telegram_id": full_op["telegram_id"] if full_op else 0,
-    }
-    sched_dict = {
-        "route_from": booking["route_from"],
-        "route_to": booking["route_to"],
-        "departure_time": booking["departure_time"],
-        "price_per_seat": booking["price_per_seat"],
-        "location": sched_full["location"] if sched_full and "location" in sched_full.keys() else "Jetty No. 1, Male",
-    }
-
-    # Generate + send ticket (booking already confirmed — best-effort)
-    ticket_sent = False
+def send_night_summary():
+    log.info("🌙 Night summary...")
     try:
-        pdf_bytes = await generate_ticket_pdf(booking_dict, op_dict, sched_dict)
-        pdf_file  = io.BytesIO(pdf_bytes)
-        pdf_file.name = f"ticket_{booking['booking_ref']}.pdf"
-        await ctx.bot.send_document(
-            booking["customer_telegram_id"], document=pdf_file,
-            caption=(
-                f"✅ *Booking Confirmed!*\n\n"
-                f"🎫 Your ticket is attached.\n"
-                f"🔖 Ref: `{booking['booking_ref']}`\n"
-                f"🚤 {booking['business_name']}\n"
-                f"📍 {booking['route_from']} → {booking['route_to']}\n"
-                f"📅 {booking['travel_date']} @ {booking['departure_time']}\n\n"
-                f"Present this ticket when boarding. Safe travels! 🌊"
-            ),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🚢 Book Your Next Trip", callback_data="cx_search")],
-                [InlineKeyboardButton("📋 My Bookings", callback_data="cx_my_bookings")]
-            ]))
-        ticket_sent = True
+        if not recent_posts: log.info("No posts for summary"); return
+        posts_text="\n".join([f"• [{p['cat']}] {p['title']}" for p in recent_posts[-15:]])
+        prompt=f"""Create a "Tonight's Top Stories 🌙" summary for @samugacommunity.
+Today's posts: {posts_text}
+- Warm good evening greeting
+- Top 5 stories in 1 sentence each with emoji
+- Good night closing
+- Max 180 words, English"""
+        msg=ai.messages.create(model="claude-haiku-4-5-20251001",max_tokens=400,messages=[{"role":"user","content":prompt}])
+        summary=msg.content[0].text.strip()
+        caption=f"🌙 <b>Tonight's Top Stories</b>\n\n{summary}\n\n📡 <b>Samuga Media</b> | @samugacommunity"
+        send_text(TELEGRAM_CHANNEL_ID, caption)
+        log.info("✅ Night summary sent!")
+    except Exception as e: log.error(f"Night summary: {e}")
+
+# ── AI Nightly Journalist (v6) — the bot that THINKS ──────────────────────────
+# At ~10:30PM, Claude reviews the entire day's article archive and writes a real
+# editorial brief for the team: what mattered today, what it means for Maldivians,
+# and a ready-to-shoot TikTok angle for Thooma. Lands in Content Lab, not public.
+def send_ai_journalist_brief():
+    log.info("🧠 Samuga AI brief generating...")
+    try:
+        # Pull today's articles from the archive (richer than recent_posts)
+        articles_text = ""
+        trends_text = ""
+        if DB_ENABLED:
+            rows = db_execute(
+                """SELECT title, category, source, status FROM articles
+                   WHERE found_at > NOW() - INTERVAL '18 hours'
+                   ORDER BY score DESC LIMIT 40""", fetch="all")
+            if rows:
+                articles_text = "\n".join(
+                    [f"• [{cat}] {title} ({src}) — {status}" for title, cat, src, status in rows])
+            # Today's trends
+            trends = detect_trends(hours=24, min_mentions=3)
+            if trends:
+                trends_text = "\n".join([f"• {theme}: {count} stories" for theme, count, _ in trends[:6]])
+        # Fallback to recent_posts if no DB
+        if not articles_text and recent_posts:
+            articles_text = "\n".join([f"• [{p['cat']}] {p['title']}" for p in recent_posts[-20:]])
+        if not articles_text:
+            log.info("Samuga AI: no articles to review"); return
+
+        from datetime import timezone as _tzx
+        mvt = datetime.now(_tzx.utc) + timedelta(hours=5)
+        today_str = mvt.strftime("%A, %d %B %Y")
+
+        prompt = f"""You are Samuga AI, the senior editor at Samuga Media, a sharp Maldivian news outlet. It's the end of the day ({today_str}). Review today's news and write a private editorial brief for the team (Manchii, Uly, Thooma). Be insightful and specific to the Maldives — not generic.
+
+TODAY'S ARTICLES:
+{articles_text}
+
+TRENDING THEMES TODAY:
+{trends_text or "(not enough data yet)"}
+
+Write a brief with EXACTLY these sections (use the emoji headers):
+
+📰 TOP 3 STORIES TODAY
+(The 3 most important stories, 1 line each, ranked by what matters to ordinary Maldivians — not by what's flashy.)
+
+🇲🇻 WHAT THIS MEANS
+(2-3 sentences: the real significance for everyday people in the Maldives. Connect the dots between stories if there's a pattern.)
+
+🔮 WHAT TO WATCH TOMORROW
+(1-2 things likely to develop or worth following up on.)
+
+🎬 TIKTOK ANGLE FOR THOOMA
+(One specific, punchy video idea based on today's biggest story — give a hook line she could open with.)
+
+Keep it tight, smart, and in English. Max 280 words. Write like a real editor talking to their team, not a robot."""
+
+        msg = ai.messages.create(model="claude-haiku-4-5-20251001", max_tokens=700,
+                                 messages=[{"role": "user", "content": prompt}])
+        brief = msg.content[0].text.strip()
+        caption = (f"🧠 <b>SAMUGA NIGHTLY BRIEF</b>\n"
+                   f"<i>{today_str}</i>\n\n"
+                   f"{brief}\n\n"
+                   f"━━━━━━━━━━━━━━\n"
+                   f"<i>Auto-generated by Samuga AI. Not posted publicly — for the team only.</i>")
+        send_text(CORE_TEAM_CHAT_ID, caption, thread_id=ALERT_THREAD_ID)
+        log.info("🧠 ✅ Samuga AI brief sent to Content Lab!")
     except Exception as e:
-        logger.error(f"❌ Ticket PDF/send error for {booking['booking_ref']}: {e}", exc_info=True)
-        try:
-            await ctx.bot.send_message(
-                booking["customer_telegram_id"],
-                f"✅ *Booking Confirmed!*\n\n"
-                f"🔖 Ref: `{booking['booking_ref']}`\n"
-                f"🚤 {booking['business_name']}\n"
-                f"📍 {booking['route_from']} → {booking['route_to']}\n"
-                f"📅 {booking['travel_date']} @ {booking['departure_time']}\n"
-                f"👥 {booking['passenger_count']} passengers | 💰 MVR {booking['total_amount']}\n\n"
-                f"📞 Operator: {op_dict.get('owner_contact','')}\n\n"
-                f"Show this confirmation when boarding. Safe travels! 🌊",
-                parse_mode="Markdown")
-            ticket_sent = True
-        except Exception as e2:
-            logger.error(f"❌ Text confirmation also failed: {e2}")
+        log.error(f"Samuga AI brief: {e}")
+
+# ── Phase 2: ENGAGEMENT LEARNING ENGINE (observe-only until /learning on) ─────
+LEARN_MIN_POSTS        = 200   # total posted articles before activation allowed
+LEARN_MIN_WEEKS        = 4     # weeks of history before activation allowed
+LEARN_MIN_VALID_VIEWS  = 50    # posts that actually have view counts (real data)
+LEARN_CAP              = 15    # max ± points engagement may move a score (hard cap)
+
+_scraper_health = {"ok": 0, "fail": 0, "warned": False}
+
+def fetch_message_views(message_id):
+    """
+    Scrape view count for a public-channel post. Returns int or None.
+    Tracks success/failure so we can warn the team if it stops working.
+    NOTE: Telegram's Bot API can't read post views — this scrapes the public
+    t.me page. Works while the channel is public. Swap to a Telethon MTProto
+    client later for guaranteed counts (single-function change).
+    """
+    if not message_id:
+        return None
     try:
-        if ticket_sent:
-            await safe_edit(query,
-                f"✅ Booking `{booking['booking_ref']}` confirmed! Ticket sent.", parse_mode="Markdown")
+        chan = TELEGRAM_CHANNEL_ID.lstrip("@")
+        url = f"https://t.me/{chan}/{message_id}?embed=1&mode=tme"
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code != 200:
+            _scraper_health["fail"] += 1
+            return None
+        import re as _re
+        m = _re.search(r'tgme_widget_message_views[^>]*>([\d.,KMkm]+)<', resp.text)
+        if not m:
+            _scraper_health["fail"] += 1
+            return None
+        raw = m.group(1).strip().upper().replace(",", "")
+        if raw.endswith("K"):
+            val = int(float(raw[:-1]) * 1000)
+        elif raw.endswith("M"):
+            val = int(float(raw[:-1]) * 1_000_000)
         else:
-            await safe_edit(query,
-                f"✅ Booking `{booking['booking_ref']}` confirmed! ⚠️ Could not auto-send ticket — contact the customer.", parse_mode="Markdown")
-    except Exception:
-        pass
+            val = int(float(raw))
+        _scraper_health["ok"] += 1
+        return val
+    except Exception as e:
+        log.debug(f"fetch_message_views({message_id}): {e}")
+        _scraper_health["fail"] += 1
+        return None
 
+def check_scraper_health(min_attempts=20):
+    """Warn Content Lab once if view-scraping is mostly failing. Resets counters."""
+    ok, fail = _scraper_health["ok"], _scraper_health["fail"]
+    total = ok + fail
+    if total >= min_attempts and fail / total > 0.7 and not _scraper_health["warned"]:
+        send_text(CORE_TEAM_CHAT_ID,
+            "⚠️ <b>View tracking looks broken.</b>\n\n"
+            f"View scraping failed {fail}/{total} times this run. Telegram may have "
+            "changed their page format, or the channel went private.\n\n"
+            "Learning will keep using old numbers until this is fixed. Engagement "
+            "data won't update.\n\n"
+            "<i>Nothing else is affected — posting works normally.</i>",
+            thread_id=ALERT_THREAD_ID)
+        _scraper_health["warned"] = True
+        log.warning(f"⚠️ Scraper health poor: {fail}/{total} failed")
+    _scraper_health["ok"] = 0
+    _scraper_health["fail"] = 0
 
-# ── ERROR HANDLER ─────────────────────────────────────────────────────────────
-async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"Exception while handling update: {ctx.error}", exc_info=ctx.error)
-    if isinstance(update, Update) and update.effective_message:
+# ── Phase 2.5: META GRAPH API — Facebook + Instagram engagement ──────────────
+# Reads engagement off your OWN page (no scraping). FB lost reach/impressions in
+# Meta's June 2026 change, so FB = reactions+comments+shares. IG = likes+comments
+# (+impressions where available). Matched to articles by caption (match_key).
+_meta_health = {"ok": 0, "fail": 0, "warned": False}
+
+def _meta_get(path, params=None):
+    """GET the Graph API. Returns parsed JSON dict or None."""
+    if not META_PAGE_TOKEN:
+        return None
+    try:
+        p = dict(params or {})
+        p["access_token"] = META_PAGE_TOKEN
+        url = f"https://graph.facebook.com/{META_API_VER}/{path}"
+        resp = requests.get(url, params=p, timeout=15)
+        if resp.status_code == 200:
+            _meta_health["ok"] += 1
+            return resp.json()
+        # Surface the Graph error message to logs (token expiry, perms, etc.)
         try:
-            await update.effective_message.reply_text(
-                "⚠️ Something went wrong. Please try again or send /start")
+            err = resp.json().get("error", {}).get("message", resp.text[:200])
+        except Exception:
+            err = resp.text[:200]
+        log.error(f"Meta GET {path} → {resp.status_code}: {err}")
+        _meta_health["fail"] += 1
+        return None
+    except Exception as e:
+        log.error(f"Meta GET {path}: {e}")
+        _meta_health["fail"] += 1
+        return None
+
+def _resolve_ig_id():
+    """Find the Instagram Business account linked to the FB page. Cached in bot_kv."""
+    if META_IG_ID:
+        return META_IG_ID
+    cached = kv_get("meta_ig_id", {})
+    if isinstance(cached, dict) and cached.get("id"):
+        return cached["id"]
+    if not META_PAGE_ID:
+        return None
+    data = _meta_get(META_PAGE_ID, {"fields": "instagram_business_account"})
+    ig = (data or {}).get("instagram_business_account", {}).get("id") if data else None
+    if ig:
+        kv_set("meta_ig_id", {"id": ig})
+        log.info(f"📷 Resolved IG business account: {ig}")
+    return ig
+
+def _fetch_fb_post_engagement(limit=50):
+    """
+    Return list of (caption_text, engagement_int) for recent FB page posts.
+    Engagement = reactions + comments + shares (reach/impressions deprecated by Meta).
+    """
+    if not META_PAGE_ID:
+        return []
+    data = _meta_get(f"{META_PAGE_ID}/posts", {
+        "fields": "message,created_time,"
+                  "reactions.summary(total_count).limit(0),"
+                  "comments.summary(total_count).limit(0),"
+                  "shares",
+        "limit": limit,
+    })
+    out = []
+    for post in (data or {}).get("data", []):
+        msg = post.get("message", "")
+        if not msg:
+            continue
+        reacts = post.get("reactions", {}).get("summary", {}).get("total_count", 0)
+        comments = post.get("comments", {}).get("summary", {}).get("total_count", 0)
+        shares = post.get("shares", {}).get("count", 0)
+        eng = (reacts or 0) + (comments or 0) + (shares or 0)
+        out.append((msg, eng))
+    log.info(f"📘 FB: {len(out)} posts with engagement")
+    return out
+
+def _fetch_ig_post_engagement(limit=50):
+    """
+    Return list of (caption_text, engagement_int) for recent IG media.
+    Engagement = like_count + comments_count.
+    """
+    ig_id = _resolve_ig_id()
+    if not ig_id:
+        return []
+    data = _meta_get(f"{ig_id}/media", {
+        "fields": "caption,like_count,comments_count,timestamp",
+        "limit": limit,
+    })
+    out = []
+    for media in (data or {}).get("data", []):
+        cap = media.get("caption", "")
+        if not cap:
+            continue
+        eng = (media.get("like_count") or 0) + (media.get("comments_count") or 0)
+        out.append((cap, eng))
+    log.info(f"📷 IG: {len(out)} media with engagement")
+    return out
+
+def fetch_meta_insights(days=28):
+    """
+    Pull FB + IG engagement, match each post to an article by caption (match_key),
+    and write the combined number to articles.meta_engagement. Runs weekly.
+    Returns number of articles updated.
+    """
+    if not DB_ENABLED or not META_PAGE_TOKEN:
+        return 0
+    # Get candidate articles (posted recently, with a match key)
+    rows = db_execute("""
+        SELECT id, match_key FROM articles
+        WHERE status='posted' AND match_key IS NOT NULL AND match_key <> ''
+          AND posted_at > NOW() - INTERVAL %s
+    """, (f"{days} days",), fetch="all")
+    if not rows:
+        return 0
+    articles = [(aid, mk) for aid, mk in rows]
+
+    # Gather all platform posts (caption, engagement)
+    platform_posts = _fetch_fb_post_engagement() + _fetch_ig_post_engagement()
+    if not platform_posts:
+        check_meta_health()
+        return 0
+
+    # Pre-normalize platform captions to match keys
+    norm_posts = [(_caption_match_key(cap), eng) for cap, eng in platform_posts]
+
+    updated = 0
+    for aid, mk in articles:
+        if not mk:
+            continue
+        total_eng = 0
+        matched = False
+        for pmk, eng in norm_posts:
+            if not pmk:
+                continue
+            # Match if either key contains the other's leading chunk (captions get
+            # truncated differently per platform). Require a decent overlap.
+            short = min(len(mk), len(pmk))
+            if short >= 18 and (mk[:short] == pmk[:short] or mk in pmk or pmk in mk):
+                total_eng += eng
+                matched = True
+        if matched:
+            db_execute("UPDATE articles SET meta_engagement=%s WHERE id=%s", (total_eng, aid))
+            updated += 1
+    log.info(f"📊 Meta insights matched {updated}/{len(articles)} articles")
+    check_meta_health()
+    return updated
+
+def check_meta_health(min_attempts=4):
+    """Warn Content Lab once if Meta API calls are mostly failing (token expired etc.)."""
+    ok, fail = _meta_health["ok"], _meta_health["fail"]
+    total = ok + fail
+    if total >= min_attempts and fail / total > 0.7 and not _meta_health["warned"]:
+        send_text(CORE_TEAM_CHAT_ID,
+            "⚠️ <b>Facebook/Instagram data tracking failed.</b>\n\n"
+            f"Meta API calls failed {fail}/{total} times. The Page token may have "
+            "expired or lost permissions.\n\n"
+            "Regenerate it (Graph API Explorer → me/accounts) and update "
+            "<code>META_PAGE_TOKEN</code> in Railway.\n\n"
+            "<i>Posting still works — only FB/IG learning data is affected.</i>",
+            thread_id=ALERT_THREAD_ID)
+        _meta_health["warned"] = True
+        log.warning(f"⚠️ Meta health poor: {fail}/{total} failed")
+    _meta_health["ok"] = 0
+    _meta_health["fail"] = 0
+
+
+def backfill_tg_views(hours=240, limit=120):
+    """Update tg_views for posted articles with a message_id. Runs weekly."""
+    if not DB_ENABLED:
+        return 0
+    rows = db_execute("""
+        SELECT id, tg_message_id FROM articles
+        WHERE status='posted' AND tg_message_id IS NOT NULL
+          AND posted_at > NOW() - INTERVAL %s
+        ORDER BY posted_at DESC LIMIT %s
+    """, (f"{hours} hours", limit), fetch="all")
+    if not rows:
+        return 0
+    updated = 0
+    for art_id, mid in rows:
+        views = fetch_message_views(mid)
+        if views is not None and views > 0:
+            db_execute("UPDATE articles SET tg_views=%s WHERE id=%s", (views, art_id))
+            updated += 1
+        time.sleep(0.4)
+    log.info(f"📈 Backfilled views for {updated}/{len(rows)} posts")
+    check_scraper_health()
+    return updated
+
+def _median(nums):
+    """Median of a list of numbers. 0 if empty."""
+    s = sorted(n for n in nums if n is not None)
+    if not s:
+        return 0
+    mid = len(s) // 2
+    return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
+
+def compute_topic_weights(days=28):
+    """
+    Rank trend themes by MEDIAN engagement (average = secondary). Combines
+    Telegram views + Facebook/Instagram engagement, each normalized to its OWN
+    platform baseline first (different scales), then blended. Writes to
+    bot_kv['topic_weights']. Does NOT change scoring. Returns the weights dict.
+    """
+    if not DB_ENABLED:
+        return {}
+    rows = db_execute("""
+        SELECT title, summary, tg_views, meta_engagement FROM articles
+        WHERE status='posted'
+          AND (tg_views > 0 OR meta_engagement > 0)
+          AND posted_at > NOW() - INTERVAL %s
+    """, (f"{days} days",), fetch="all")
+    if not rows:
+        return {}
+
+    # Platform baselines (median of non-zero values) so we can normalize scales
+    tg_vals   = [r[2] for r in rows if r[2] and r[2] > 0]
+    meta_vals = [r[3] for r in rows if r[3] and r[3] > 0]
+    tg_base   = _median(tg_vals) or 1
+    meta_base = _median(meta_vals) or 1
+
+    def _combined_signal(tg, meta):
+        """Each platform normalized to ~1.0 = its own median, then averaged."""
+        parts = []
+        if tg and tg > 0:
+            parts.append(tg / tg_base)
+        if meta and meta > 0:
+            parts.append(meta / meta_base)
+        return sum(parts) / len(parts) if parts else 0.0
+
+    theme_signals = {}
+    for title, summary, tg, meta in rows:
+        sig = _combined_signal(tg, meta)
+        if sig <= 0:
+            continue
+        for theme in _detect_themes(f"{title or ''} {summary or ''}"):
+            theme_signals.setdefault(theme, []).append(sig)
+    if not theme_signals:
+        return {}
+
+    all_sig = [s for ss in theme_signals.values() for s in ss]
+    baseline = _median(all_sig) or 1.0
+
+    import math
+    weights = {}
+    for theme, ss in theme_signals.items():
+        if len(ss) < 3:
+            continue
+        med = _median(ss)
+        avg = sum(ss) / len(ss)
+        ratio = med / baseline if baseline else 1.0
+        raw = math.log2(ratio) * LEARN_CAP if ratio > 0 else 0
+        weight = max(-LEARN_CAP, min(LEARN_CAP, round(raw)))
+        # 'median' shown as a relative index (1.0 = typical post) for readability
+        weights[theme] = {"weight": weight, "median": round(med, 2),
+                          "avg": round(avg, 2), "n": len(ss)}
+
+    kv_set("topic_weights", weights)
+    kv_set("topic_weights_baseline", {"median": round(baseline, 2)})
+    log.info(f"📊 Computed topic weights for {len(weights)} themes (baseline median {round(baseline)})")
+    return weights
+
+def learning_stats():
+    """Return (posted_total, weeks_elapsed, valid_view_count)."""
+    if not DB_ENABLED:
+        return (0, 0, 0)
+    posted = db_execute("SELECT COUNT(*) FROM articles WHERE status='posted'", fetch="one")
+    posted = posted[0] if posted else 0
+    first = db_execute("SELECT MIN(found_at) FROM articles", fetch="one")
+    weeks = 0
+    if first and first[0]:
+        try:
+            weeks = (utcnow() - first[0].replace(tzinfo=None)).days / 7.0
+        except Exception:
+            weeks = 0
+    valid = db_execute("SELECT COUNT(*) FROM articles WHERE status='posted' AND (tg_views > 0 OR meta_engagement > 0)", fetch="one")
+    valid = valid[0] if valid else 0
+    return (posted, round(weeks, 1), valid)
+
+def learning_is_active():
+    """True only if a human flipped the switch."""
+    flag = kv_get("learning_active", {"on": False})
+    return bool(flag.get("on")) if isinstance(flag, dict) else bool(flag)
+
+def topic_weight_for(title, summary=""):
+    """Engagement nudge ±LEARN_CAP, ONLY if learning active. (points, theme) or (0,None)."""
+    if not learning_is_active():
+        return (0, None)
+    weights = kv_get("topic_weights", {})
+    if not weights:
+        return (0, None)
+    themes = _detect_themes(f"{title} {summary}")
+    best_pts, best_theme = 0, None
+    for th in themes:
+        w = weights.get(th, {}).get("weight", 0)
+        if abs(w) > abs(best_pts):
+            best_pts, best_theme = w, th
+    return (best_pts, best_theme)
+
+def _top_gainers_losers(weights, n=4):
+    """Format top +n gainers and -n losers as two text blocks."""
+    if not weights:
+        return ("", "")
+    items = [(th, d["weight"], d["median"], d["n"]) for th, d in weights.items()]
+    gain = sorted([i for i in items if i[1] > 0], key=lambda x: -x[1])[:n]
+    lose = sorted([i for i in items if i[1] < 0], key=lambda x:  x[1])[:n]
+    g = "\n".join([f"  • {th} +{w} <i>({med}× typical, {nn} posts)</i>" for th, w, med, nn in gain])
+    l = "\n".join([f"  • {th} {w} <i>({med}× typical, {nn} posts)</i>" for th, w, med, nn in lose])
+    return (g, l)
+
+def check_learning_readiness():
+    """Weekly: if gate met and not yet asked, send the ONE-TIME readiness prompt."""
+    if not DB_ENABLED:
+        return
+    posted, weeks, valid = learning_stats()
+    already = kv_get("learning_prompt_sent", {"sent": False})
+    if learning_is_active() or (isinstance(already, dict) and already.get("sent")):
+        return
+    if posted < LEARN_MIN_POSTS or weeks < LEARN_MIN_WEEKS or valid < LEARN_MIN_VALID_VIEWS:
+        log.info(f"🧪 Learning not ready: posts={posted}/{LEARN_MIN_POSTS} "
+                 f"weeks={weeks}/{LEARN_MIN_WEEKS} valid_views={valid}/{LEARN_MIN_VALID_VIEWS}")
+        return
+    weights = compute_topic_weights()
+    gainers, losers = _top_gainers_losers(weights)
+    msg = (
+        "🧠 <b>Learning mode ready</b>\n\n"
+        f"I've banked <b>{posted}</b> posts over <b>{weeks}</b> weeks, "
+        f"<b>{valid}</b> with real view counts.\n\n"
+        "<b>Top performers:</b>\n" + (gainers or "  (not enough data)") + "\n\n"
+        "<b>Underperformers:</b>\n" + (losers or "  (not enough data)") + "\n\n"
+        "If you approve, I'll let audience data <i>nudge</i> my posting decisions — "
+        f"capped at ±{LEARN_CAP} pts. It informs, it never overrides a serious story.\n\n"
+        "✅ <code>/learning on</code> to activate\n"
+        "📊 <code>/learning status</code> to see the numbers\n"
+        "<i>Ignore to stay observe-only. I won't ask again.</i>"
+    )
+    send_text(CORE_TEAM_CHAT_ID, msg, thread_id=ALERT_THREAD_ID)
+    kv_set("learning_prompt_sent", {"sent": True, "at": utcnow().isoformat()})
+    log.info("🧠 Readiness prompt sent to Content Lab (one-time).")
+
+# ── Weekly Analytics Report to Core Team ─────────────────────────────────────
+def send_weekly_analytics():
+    log.info("📊 Weekly analytics report...")
+    try:
+        from datetime import timezone
+        mvt = datetime.now(timezone.utc) + timedelta(hours=5)
+        week_str = mvt.strftime("Week of %d %B %Y")
+
+        total = sum(v for k, v in analytics["posts_by_cat"].items() if k != "SOCIAL")
+        by_cat = analytics["posts_by_cat"]
+
+        lines = []
+        for cat in ["LOCAL","WORLD","FOOTBALL","TOURISM","WEATHER","DISASTER"]:
+            if cat in by_cat:
+                lines.append(f"  • {cat}: {by_cat[cat]} posts")
+
+        cat_lines = chr(10).join([f"  - {c}: {by_cat[c]} posts" for c in ["LOCAL","WORLD","FOOTBALL","TOURISM","WEATHER","DISASTER"] if c in by_cat])
+        report = (
+            "<b>Samuga Media Weekly Report</b>" + chr(10)
+            + week_str + chr(10) + chr(10)
+            + "<b>Total Articles:</b> " + str(total) + chr(10)
+            + (cat_lines if cat_lines else "  No posts yet") + chr(10) + chr(10)
+            + "<b>Breaking News:</b> " + str(analytics["breaking_count"]) + chr(10) + chr(10)
+            + "<b>Social Posting:</b>" + chr(10)
+            + "  Success: " + str(analytics["social_success"]) + chr(10)
+            + "  Failed: " + str(analytics["social_fail"]) + chr(10) + chr(10)
+            + f"<b>Bot:</b> Samuga AI v{SAMUGA_VERSION}" + chr(10)
+            + "Samuga Media | @samugacommunity"
+        )
+        # ── Phase 2: weekly engagement crunch + readiness ──
+        learn_block = ""
+        try:
+            backfill_tg_views()                      # refresh view counts (matured)
+            fetch_meta_insights()                    # refresh FB + IG engagement
+            weights = compute_topic_weights()        # recompute (stored, not yet acting)
+            posted, weeks, valid = learning_stats()
+            gainers, losers = _top_gainers_losers(weights)
+            mode = "ACTIVE ✅" if learning_is_active() else "observing 👀"
+            learn_block = (
+                chr(10) + "<b>📈 What we learned this week</b>" + chr(10)
+                + f"Mode: {mode}  ({posted} posts, {valid} with views)" + chr(10) + chr(10)
+                + "<b>Top gainers:</b>" + chr(10) + (gainers or "  (gathering data)") + chr(10) + chr(10)
+                + "<b>Top losers:</b>"  + chr(10) + (losers  or "  (gathering data)") + chr(10)
+            )
+        except Exception as e:
+            log.error(f"weekly learning block: {e}")
+        report = report + learn_block
+
+        send_text(CORE_TEAM_CHAT_ID, report)
+        check_learning_readiness()                  # one-time prompt if gate met
+        log.info("✅ Analytics report sent to core team")
+    except Exception as e:
+        log.error(f"Analytics report: {e}")
+
+# ── Weekly Digest (Friday 6PM MVT) ───────────────────────────────────────────
+def send_weekly_digest():
+    log.info("📊 Weekly digest...")
+    try:
+        if not recent_posts: return
+        posts_text="\n".join([f"• [{p['cat']}] {p['title']}" for p in recent_posts])
+        prompt=f"""Create a "This Week in Maldives 🇲🇻" weekly digest for @samugacommunity.
+This week: {posts_text}
+- Top 5 most important stories
+- 2 sentences each with emoji
+- Encouraging closing
+- Max 280 words"""
+        msg=ai.messages.create(model="claude-haiku-4-5-20251001",max_tokens=500,messages=[{"role":"user","content":prompt}])
+        digest=msg.content[0].text.strip()
+        caption=f"📊 <b>This Week in Maldives 🇲🇻</b>\n\n{digest}\n\n📡 <b>Samuga Media</b> | @samugacommunity"
+        send_text(TELEGRAM_CHANNEL_ID, caption)
+        log.info("✅ Weekly digest sent!")
+    except Exception as e: log.error(f"Weekly digest: {e}")
+
+# ── Tavily Search ─────────────────────────────────────────────────────────────
+def tavily_search(query):
+    if not TAVILY_API_KEY: return ""
+    try:
+        resp=requests.post("https://api.tavily.com/search",
+            json={"api_key":TAVILY_API_KEY,"query":query,"search_depth":"basic","max_results":4,"include_answer":True},timeout=15)
+        if resp.status_code==200:
+            data=resp.json()
+            answer=data.get("answer","")
+            snippets=[r.get("content","")[:200] for r in data.get("results",[])[:3]]
+            log.info(f"✅ Tavily: {query[:40]}")
+            return (answer+"\n"+"\n".join(snippets)).strip()
+    except Exception as e: log.error(f"Tavily: {e}")
+    return ""
+
+
+def manual_topic_search_context(headline, subheading="", category="LOCAL", lang_hint="en"):
+    """Get fast web context for manually created social cards so website articles can be richer."""
+    try:
+        q = " ".join(x for x in [headline, subheading] if x).strip()
+        if not q:
+            return ""
+        query = q
+        # If input is Latin Dhivehi, convert to English for search.
+        if looks_latin_thaana(q):
+            try:
+                q_en = gemini_latin_thaana_to_english(q)
+                if q_en:
+                    query = q_en
+            except Exception:
+                pass
+        # Keep search focused on Maldives relevance.
+        if "maldives" not in query.lower():
+            query = "Maldives " + query
+        return tavily_search(query[:220])[:1200]
+    except Exception as e:
+        log.error(f"manual_topic_search_context: {e}")
+        return ""
+
+
+def manual_publish_website_article(title, subheading="", category="LOCAL", source_link="", publish_now=True):
+    """
+    For manual social cards, prepare an English website article, optionally publish it,
+    and always send the detailed article preview to Content Lab.
+    Returns dict with article_id, slug, body, title, summary, published.
+    """
+    try:
+        raw_title = (title or "").strip()
+        raw_sub   = (subheading or "").strip()
+        if not raw_title:
+            return None
+        safe_ok, safe_reason = contentlab_candidate_is_safe(raw_title, raw_sub, "Samuga Media", "en")
+        if not safe_ok:
+            log.warning(f"🧱 Manual website article blocked: {safe_reason} — {raw_title[:90]}")
+            return None
+
+        search_seed = (raw_title + ("\n\n" + raw_sub if raw_sub else "")).strip()
+        english_title = raw_title
+        english_summary = raw_sub or raw_title
+
+        if looks_latin_thaana(search_seed):
+            try:
+                conv = gemini_latin_thaana_to_english(search_seed)
+                if conv:
+                    paras = [p.strip() for p in conv.split("\n\n") if p.strip()]
+                    english_title = paras[0][:180] if paras else conv[:180]
+                    english_summary = " ".join(paras[1:]).strip() if len(paras) > 1 else conv[:500]
+            except Exception as e:
+                log.warning(f"manual article latin→english failed: {e}")
+
+        search_ctx = manual_topic_search_context(english_title, english_summary, category=category, lang_hint="en")
+        summary_for_article = english_summary
+        if search_ctx:
+            summary_for_article = (english_summary + "\n\nWeb context:\n" + search_ctx).strip()
+
+        article_id = "manual_" + hashlib.md5((english_title + "|" + summary_for_article + "|" + str(utcnow())).encode()).hexdigest()[:12]
+        body = generate_website_article_body(
+            title=english_title,
+            summary=summary_for_article,
+            category=category or "LOCAL",
+            source=SAMUGA_PUBLIC_SOURCE,
+            is_breaking=(category or "").upper() in ("BREAKING", "DISASTER")
+        )
+        slug = make_article_slug(english_title, article_id)
+
+        if publish_now:
+            db_publish_article_for_website(
+                article_id=article_id,
+                title=english_title[:500],
+                summary=summary_for_article[:2500],
+                category=category or "LOCAL",
+                source=SAMUGA_PUBLIC_SOURCE,
+                link=(source_link or SAMUGA_CAPTION_LINK or "").strip(),
+                lang="en",
+                score=190,
+                reliability=95,
+                is_breaking=(category or "").upper() in ("BREAKING", "DISASTER")
+            )
+            try:
+                row = db_execute("SELECT article_slug, article_body FROM articles WHERE id=%s", (article_id,), fetch="one")
+                if row:
+                    slug = row[0] or slug
+                    body = row[1] or body
+            except Exception:
+                pass
+
+        preview = (
+            f"📝 <b>Manual Website Article {'Published' if publish_now else 'Prepared'}</b>\n\n"
+            f"<b>{english_title}</b>\n\n"
+            f"{(body or summary_for_article or english_title)[:3500]}\n\n"
+            f"🌐 <b>Website:</b> {SAMUGA_CAPTION_LINK}"
+            + (f"/article.html?id={article_id}" if publish_now and article_id else "")
+        )
+        try:
+            send_text(CORE_TEAM_CHAT_ID, preview, thread_id=CONTENT_LAB_THREAD_ID)
+        except Exception as e:
+            log.warning(f"manual article preview to content lab: {e}")
+
+        return {
+            "article_id": article_id,
+            "slug": slug,
+            "body": body,
+            "title": english_title,
+            "summary": summary_for_article,
+            "category": category or "LOCAL",
+            "published": bool(publish_now),
+        }
+    except Exception as e:
+        log.error(f"manual_publish_website_article: {e}")
+        return None
+
+
+def manual_post_replied_article_to_website(reply_text, category_hint="LOCAL"):
+    """
+    Publish a human-written article from a replied Telegram message directly to the website.
+    First non-empty line = title. Remaining lines = body.
+    """
+    try:
+        raw = strip_source_links(str(reply_text or "")).strip()
+        if not raw:
+            return None, "Reply to the drafted article text first."
+        parts = [p.strip() for p in raw.split("\n") if p.strip()]
+        if not parts:
+            return None, "Reply text is empty."
+
+        parts = [p for p in parts if re.sub(r'@SamugaNewsBot\b', '', p, flags=re.I).strip().lower() not in ["/post to web", "/post web", "/posttoweb", "/postweb"]]
+        if not parts:
+            return None, "Only the command was found. Reply to the actual article text."
+
+        title = parts[0][:220]
+        body = "\n\n".join(parts[1:]).strip() if len(parts) > 1 else ""
+        if not body:
+            return None, "Article body is empty. Write the title on line 1 and the article on the lines below."
+
+        lang = "dv" if is_dhivehi(title + " " + body) else "en"
+        safe_ok, safe_reason = contentlab_candidate_is_safe(title, body, "Samuga Media", lang)
+        if not safe_ok:
+            alert_admin(f"Manual website post blocked\n\n<b>{title[:120]}</b>\nReason: {safe_reason}", dedupe_key=f"manualweb:{title[:80]}")
+            return None, f"Blocked by safety wall: {safe_reason}"
+
+        category = canonical_category(category_hint or "LOCAL", title, body)
+        base_id = "manualweb_" + hashlib.md5((title + "|" + body + "|" + str(utcnow())).encode()).hexdigest()[:12]
+        db_publish_article_for_website(
+            article_id=base_id,
+            title=title,
+            summary=body[:2500],
+            category=category,
+            source=SAMUGA_PUBLIC_SOURCE,
+            link=SAMUGA_CAPTION_LINK,
+            lang=lang,
+            score=195,
+            reliability=99,
+            is_breaking=(category in ("BREAKING","DISASTER"))
+        )
+        saved_id = base_id if lang != "dv" else f"{base_id}_dv"
+
+        row = None
+        try:
+            excerpt = make_article_excerpt(title, body, lang=lang)
+            db_execute(
+                "UPDATE articles SET article_body=%s, article_excerpt=%s, status='posted' WHERE id=%s RETURNING id, article_slug",
+                (body, excerpt, saved_id), fetch=None
+            )
+            row = db_execute("SELECT id, article_slug, status FROM articles WHERE id=%s LIMIT 1", (saved_id,), fetch="one")
+        except Exception as e:
+            log.warning(f"manual_post_replied_article_to_website body persist: {e}")
+
+        if not row:
+            row = db_execute("SELECT id, article_slug, status FROM articles WHERE id=%s LIMIT 1", (saved_id,), fetch="one")
+        if not row:
+            return None, "The article was not found in the database after publish."
+
+        _, slug, status = row
+        url = website_article_url(article_id=saved_id, slug=slug)
+        return {
+            "article_id": saved_id,
+            "slug": slug or make_article_slug(title, saved_id),
+            "title": title,
+            "body": body,
+            "category": category,
+            "lang": lang,
+            "url": url,
+            "status": status or "posted",
+        }, None
+    except Exception as e:
+        log.error(f"manual_post_replied_article_to_website: {e}")
+        alert_admin(f"Manual website post failed\n\nReason: {str(e)[:300]}", dedupe_key="manual_post_replied_article_to_website")
+        return None, str(e)
+
+
+def needs_web_search(msg):
+    # Skip search only for simple greetings / meta questions
+    # Skip search for short messages or greetings
+    if len(msg.strip()) <= 4: return False
+    skip_kws = ["hello", "hi", "who are you", "what is samuga", "about you",
+                "thank", "okay", "ok", "bye", "good morning", "good night",
+                "good evening", "assalam", "hey", "sup", "wassup"]
+    if any(k in msg.lower() for k in skip_kws): return False
+    return True  # Default: always search for current info
+
+# ── Smart Chat ────────────────────────────────────────────────────────────────
+def is_dhivehi(text):
+    """Check if text contains Thaana script (Dhivehi)"""
+    return any('\u0780' <= c <= '\u07BF' for c in text)
+
+def chat_with_gemini_dhivehi(user_message, context="", conversation_history=None):
+    """Handle Dhivehi chat using actual Gemini API (native Dhivehi support)"""
+    if not GEMINI_API_KEY:
+        log.warning("No GEMINI_API_KEY — falling back to Claude for Dhivehi")
+        return None
+    try:
+        # Try web search for Dhivehi queries too
+        web_context = ""
+        try:
+            if needs_web_search(user_message) or not context:
+                web_context = tavily_search("maldives news today 2026")
+                if web_context:
+                    log.info("🌐 Dhivehi path: web search done")
+        except Exception as e:
+            log.error(f"Dhivehi web search: {e}")
+
+        if web_context:
+            news_section = "LIVE WEB SEARCH (use this for answers, never repeat same info):\n" + web_context[:600]
+        elif context:
+            news_section = "LATEST NEWS CONTEXT:\n" + context
+        else:
+            news_section = ""
+
+        system_prompt = (
+            "You are Samuga AI, a Maldivian news assistant. Always reply in natural Dhivehi (Thaana script) only.\n\n"
+            "ABOUT SAMUGA:\n"
+            "- Samuga Media: Maldivian digital news outlet\n"
+            "- Channel: @samugacommunity\n"
+            "- Founder: Abdul Muhsin (Manchii) | Co-Founder: Mariyam Ulya (Uly)\n\n"
+            + (news_section + "\n\n" if news_section else "") +
+            "RULES:\n"
+            "- Reply ONLY in Dhivehi Thaana script\n"
+            "- Natural, conversational tone like a friendly Maldivian\n"
+            "- Max 3-4 sentences\n"
+            "- NEVER repeat the same news you already mentioned in this conversation\n"
+            "- If asked for more — give DIFFERENT stories\n"
+            "- Mention @samugacommunity when relevant\n"
+            "- Never write in English or Latin script\n"
+            "- Never say you cannot search or lack real-time info"
+        )
+
+        # Build contents array with history for multi-turn
+        contents = []
+        if conversation_history:
+            for turn in conversation_history[-6:]:
+                role = "user" if turn["role"] == "user" else "model"
+                contents.append({"role": role, "parts": [{"text": turn["content"]}]})
+        contents.append({"role": "user", "parts": [{"text": user_message}]})
+
+        payload = {
+            "system_instruction": {"parts": [{"text": system_prompt}]},
+            "contents": contents,
+            "generationConfig": {"maxOutputTokens": 400, "temperature": 0.7}
+        }
+
+        # Try models in fallback order
+        for model in GEMINI_MODELS:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+                resp = requests.post(url, json=payload, timeout=15)
+                if resp.status_code == 200:
+                    reply = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    log.info(f"✅ Gemini Dhivehi chat done ({model})")
+                    return reply
+                elif resp.status_code in [429, 503]:
+                    log.warning(f"[AI] Gemini {model} quota/unavailable, trying next")
+                    continue
+                else:
+                    log.error(f"Gemini {model} HTTP {resp.status_code}")
+                    break
+            except Exception as e:
+                log.warning(f"[AI] Gemini {model}: {e}")
+                continue
+    except Exception as e:
+        log.error(f"Gemini Dhivehi chat error: {e}")
+    return None
+
+def answer_story_query(message):
+    """
+    If the message is asking about a past event ('what happened with the ferry'),
+    search stories and return a formatted timeline answer. Returns None if no match.
+    """
+    if not DB_ENABLED:
+        return None
+    ml = message.lower()
+    # Triggers that suggest someone is asking about an ongoing/past event
+    triggers = ["what happened", "what's happening", "whats happening", "update on",
+                "latest on", "any news on", "any update", "tell me about the",
+                "what about the", "story of", "develop", "kobaa", "vaahaka"]
+    if not any(t in ml for t in triggers):
+        return None
+
+    matches = search_stories(message, limit=3)
+    if not matches:
+        return None
+
+    best = matches[0]
+    timeline = get_story_timeline(best["id"])
+    if not timeline or timeline["update_count"] < 2:
+        return None
+
+    from datetime import timedelta as _td
+    lines = [f"📚 <b>{timeline['title']}</b>",
+             f"<i>Story #{timeline['id']} · {timeline['update_count']} updates · {timeline['status']}</i>\n"]
+    for u in timeline["updates"]:
+        t = u["time"]
+        tstr = (t + _td(hours=5)).strftime("%d %b %H:%M") if t else ""
+        src = f" ({u['source']})" if u["source"] else ""
+        lines.append(f"🔹 <b>{tstr}</b>{src} — {u['headline'][:90]}")
+    if len(matches) > 1:
+        lines.append("\n<i>Also tracking: " +
+                     ", ".join(f"#{m['id']}" for m in matches[1:]) + " — use /story [id]</i>")
+    return "\n".join(lines)
+
+def chat_with_claude(user_message, user_id=None):
+    try:
+        # Run headlines + web search in parallel to cut latency
+        results = {}
+
+        def fetch_headlines():
+            try: results["headlines"] = get_local_headlines()
+            except Exception as e: log.debug(f"fetch_headlines: {e}"); results["headlines"] = []
+
+        def fetch_web():
+            try:
+                if needs_web_search(user_message):
+                    q = user_message
+                    local_kws = ["weather","news","update","what happened","anything","latest","today"]
+                    if any(w in user_message.lower() for w in local_kws) and "maldives" not in user_message.lower():
+                        q = f"maldives {user_message} 2026"
+                    elif any(w in user_message.lower() for w in ["world cup","match","score","won","win"]):
+                        q = f"{user_message} 2026 latest"
+                    results["web"] = tavily_search(q)
+                    if results["web"]: log.info(f"🌐 Web: {results['web'][:60]}...")
+            except Exception as e:
+                log.error(f"Web search: {e}")
+                results["web"] = ""
+
+        t1 = threading.Thread(target=fetch_headlines)
+        t2 = threading.Thread(target=fetch_web)
+        t1.start(); t2.start()
+        t1.join(timeout=5); t2.join(timeout=5)
+
+        headlines = results.get("headlines", [])
+        web_context = results.get("web", "") or ""
+        headlines_text = "\n".join(headlines[:8]) if headlines else "No recent headlines."
+
+        memory_text = ""
+        if recent_posts:
+            memory_text = "Recently posted:\n" + "".join([f"• [{p['cat']}] {p['title']}\n" for p in recent_posts[-5:]])
+
+        if web_context:
+            context = f"LIVE WEB SEARCH (use this for your answer):\n{web_context[:800]}"
+            if memory_text: context += f"\n\n{memory_text}"
+        else:
+            context = f"LATEST NEWS:\n{headlines_text}"
+            if memory_text: context += f"\n\n{memory_text}"
+
+        system=f"""You are Samuga AI — smart friendly Maldivian news assistant for Samuga Media.
+
+ABOUT SAMUGA:
+Samuga Media delivers trusted Maldivian news. @samugacommunity is our Telegram channel.
+Founder & MD: Abdul Muhsin (Manchii/Mutte) — Maldivian entrepreneur
+Co-Founder & Editor: Mariyam Ulya (Uly) — journalist & editorial lead
+
+CONTEXT:
+{context}
+
+PERSONALITY:
+- Warm, friendly, like a knowledgeable Maldivian friend
+- Max 4 sentences per reply
+- Use context for accurate answers
+- Guide to @samugacommunity for more
+- If user writes Dhivehi — reply in Dhivehi
+- Never say you lack real-time data"""
+
+        messages=get_conversation(user_id).copy() if user_id else []
+        messages.append({"role":"user","content":user_message})
+
+        msg=ai.messages.create(model="claude-haiku-4-5-20251001",max_tokens=600,system=system,messages=messages)
+        reply=msg.content[0].text.strip()
+
+        if user_id:
+            add_to_conversation(user_id,"user",user_message)
+            add_to_conversation(user_id,"assistant",reply)
+        return reply
+    except Exception as e:
+        log.error(f"Chat: {e}")
+        return "Hey! Something went wrong 😅 Check @samugacommunity for the latest!"
+
+# ── Core Team Smart Chat ──────────────────────────────────────────────────────
+def get_sender_info(user_name, first_name):
+    """Identify core team member from username or first name"""
+    check = (user_name or "").lower()
+    fname = (first_name or "").lower()
+    for key, info in CORE_TEAM_MEMBERS.items():
+        if key in check or key in fname or info["name"].lower() in fname:
+            return info
+    return None
+
+# ── Newsroom snapshot — cached 10 min, injected into brain when relevant ─────
+_snapshot_cache = {"data": None, "ts": None}
+_SNAPSHOT_TTL = 600  # 10 minutes
+
+def get_newsroom_snapshot():
+    """
+    Pull a tight live snapshot from the DB. Cached 10 min — safe to call on
+    every tagged message without hammering the DB or wasting tokens.
+    Returns a short string (~300 tokens max) or "" if DB off.
+    """
+    global _snapshot_cache
+    if not DB_ENABLED:
+        return ""
+    now = utcnow()
+    if (_snapshot_cache["ts"] and
+            (now - _snapshot_cache["ts"]).total_seconds() < _SNAPSHOT_TTL and
+            _snapshot_cache["data"]):
+        return _snapshot_cache["data"]
+    try:
+        lines = []
+
+        # ── What we posted today ─────────────────────────────────────────────
+        posted_today = db_execute("""
+            SELECT title, category, source, posted_at
+            FROM articles
+            WHERE status='posted' AND posted_at > NOW() - INTERVAL '24 hours'
+            ORDER BY posted_at DESC LIMIT 6
+        """, fetch="all") or []
+        if posted_today:
+            lines.append("POSTED TODAY:")
+            for title, cat, src, ts in posted_today:
+                from datetime import timedelta as _td
+                mvt = (ts + _td(hours=5)).strftime("%H:%M") if ts else ""
+                lines.append(f"  {mvt} [{cat}] {title[:55]} ({src})")
+
+        # ── Quick stats ──────────────────────────────────────────────────────
+        scanned = db_execute("SELECT COUNT(*) FROM articles WHERE found_at > NOW() - INTERVAL '24 hours'", fetch="one")
+        posted_n = db_execute("SELECT COUNT(*) FROM articles WHERE status='posted' AND posted_at > NOW() - INTERVAL '24 hours'", fetch="one")
+        queued_n = db_execute("SELECT COUNT(*) FROM articles WHERE status='queued'", fetch="one")
+        lines.append(f"\nTODAY: {posted_n[0] if posted_n else 0} posted, {scanned[0] if scanned else 0} scanned, {queued_n[0] if queued_n else 0} waiting approval")
+
+        # ── Best performer ───────────────────────────────────────────────────
+        top = db_execute("""
+            SELECT title, tg_views, meta_engagement
+            FROM articles
+            WHERE status='posted' AND posted_at > NOW() - INTERVAL '48 hours'
+              AND (tg_views > 0 OR meta_engagement > 0)
+            ORDER BY (tg_views + meta_engagement * 3) DESC LIMIT 1
+        """, fetch="one")
+        if top:
+            lines.append(f"TOP PERFORMER: {top[0][:55]} ({top[1]} views, {top[2]} reactions)")
+
+        # ── Developing stories ───────────────────────────────────────────────
+        dev = db_execute("""
+            SELECT id, title, update_count FROM stories
+            WHERE status='developing' AND last_update > NOW() - INTERVAL '24 hours'
+            ORDER BY update_count DESC LIMIT 3
+        """, fetch="all") or []
+        if dev:
+            lines.append("\nDEVELOPING STORIES:")
+            for sid, t, n in dev:
+                lines.append(f"  Story #{sid} ({n} updates): {t[:55]}")
+
+        # ── Trending themes ──────────────────────────────────────────────────
+        try:
+            trends = detect_trends(hours=24, min_mentions=2)
+            if trends:
+                top_themes = ", ".join(t[0] for t in trends[:4])
+                lines.append(f"\nTRENDING: {top_themes}")
+        except:
+            pass
+
+        # ── Pending approvals ────────────────────────────────────────────────
+        pending_keys = [k for k, v in approval_queue.items()
+                        if not v.get("expired", False)][:3]
+        if pending_keys:
+            lines.append(f"\nPENDING APPROVAL: {len(pending_keys)} card(s) waiting")
+
+        snapshot = "\n".join(lines)
+        _snapshot_cache = {"data": snapshot, "ts": now}
+        return snapshot
+
+    except Exception as e:
+        log.debug(f"Snapshot: {e}")
+        return ""
+
+def _needs_newsroom_context(message):
+    """
+    Returns True only when the conversation is about newsroom operations.
+    If someone says 'lol ok' or 'thanks', skip the snapshot — save tokens.
+    """
+    ml = message.lower()
+    keywords = [
+        "post", "story", "news", "publish", "article", "trending", "what did",
+        "what have", "today", "engagement", "views", "reactions", "performing",
+        "pending", "queue", "approval", "developing", "happening", "viral",
+        "breaking", "latest", "update", "idea", "suggest", "cover", "topic",
+        "what should", "should we", "think about", "what about", "plan"
+    ]
+    return any(k in ml for k in keywords)
+
+def should_respond_proactively(text, sender_name=""):
+    """
+    Use Claude to decide in 1 token whether the bot should jump in.
+    Returns (should_respond: bool, needs_search: bool).
+    Fast — uses Haiku, max 10 tokens, binary decision.
+    """
+    # Hard skip: very short messages, pure reactions, stickers
+    t = text.strip()
+    if len(t) < 6:
+        return False, False
+    # Skip if it's clearly a command or approval
+    if t.startswith("/") or t.lower().startswith("/approved") or t.lower().startswith("/reject"):
+        return False, False
+    # Also skip fuzzy approve/reject attempts (e.g. "approved dv48", "reject en12")
+    import re as _re2
+    if _re2.match(r'^(appro|appr|rejec)[a-z]*\s+[a-z]{1,3}\d+', t.lower()):
+        return False, False
+
+    try:
+        prompt = f"""You are deciding if an AI team member should respond to a Telegram message.
+Respond YES if the message: asks a question, discusses content/strategy/news, shares an idea, 
+needs feedback, mentions something newsworthy, or where input would genuinely help.
+Respond NO if: it's casual chitchat with no substance, greetings only, one-word reactions, 
+or internal team logistics where AI input isn't needed.
+Also add SEARCH if the message is about current events or news that may need web lookup.
+
+Message from {sender_name}: "{t}"
+
+Reply with ONLY one of: YES / YES+SEARCH / NO"""
+
+        msg = ai.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=10,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        decision = msg.content[0].text.strip().upper()
+        should = "YES" in decision
+        search = "SEARCH" in decision
+        return should, search
+    except Exception as e:
+        log.debug(f"Proactive decision: {e}")
+        # Fallback to keyword check
+        t_lower = t.lower()
+        return any(kw in t_lower for kw in ["?","idea","think","suggest","post","story","plan","content","caption"]), False
+
+def chat_with_coreteam(message, sender_name, sender_info=None, conversation_history=None,
+                       session_ctx="", needs_search=False):
+    """
+    Samuga AI core team brain — Claude Sonnet, persistent memory, web search.
+    Talks like a smart team member, not a bot.
+    """
+    try:
+        # ── Gather context in parallel ────────────────────────────────────────
+        ctx_results = {}
+
+        def _fetch_news():
+            try: ctx_results["news"] = get_local_headlines()
+            except: ctx_results["news"] = []
+
+        def _fetch_web():
+            if needs_search:
+                try:
+                    q = message
+                    if "maldives" not in message.lower():
+                        q = f"maldives {message} 2026"
+                    ctx_results["web"] = tavily_search(q) or ""
+                except: ctx_results["web"] = ""
+
+        def _fetch_memory():
+            try: ctx_results["memory"] = mem_list(20)
+            except: ctx_results["memory"] = []
+
+        def _fetch_snapshot():
+            # Only pull the live snapshot if this message is newsroom-related
+            if _needs_newsroom_context(message):
+                try: ctx_results["snapshot"] = get_newsroom_snapshot()
+                except: ctx_results["snapshot"] = ""
+
+        threads = [
+            threading.Thread(target=_fetch_news),
+            threading.Thread(target=_fetch_web),
+            threading.Thread(target=_fetch_memory),
+            threading.Thread(target=_fetch_snapshot),
+        ]
+        for t in threads: t.start()
+        for t in threads: t.join(timeout=6)
+
+        headlines = ctx_results.get("news", [])
+        web_info  = ctx_results.get("web", "")
+        memories  = ctx_results.get("memory", [])
+        snapshot  = ctx_results.get("snapshot", "")
+
+        # ── Recent posts ──────────────────────────────────────────────────────
+        recent_ctx = ""
+        if recent_posts:
+            recent_ctx = "Recent posts:\n" + "".join(
+                [f"• [{p['cat']}] {p['title']}\n" for p in recent_posts[-8:]])
+
+        # ── Build context block — smart, not everything every time ──────────
+        context_parts = []
+        if snapshot:  # only included when message is newsroom-related
+            context_parts.append(f"LIVE NEWSROOM STATUS:\n{snapshot}")
+        if web_info:
+            context_parts.append(f"LIVE WEB SEARCH:\n{web_info[:800]}")
+        if headlines:
+            context_parts.append("MALDIVES NEWS RIGHT NOW:\n" + "\n".join(headlines[:5]))
+        if recent_ctx:
+            context_parts.append(recent_ctx)
+        if memories:
+            context_parts.append("WHAT I KNOW ABOUT THE TEAM & AUDIENCE:\n" +
+                                  "\n".join(memories[:12]))
+        if session_ctx:
+            context_parts.append(f"SESSION CONTEXT:\n{session_ctx}")
+
+        context_block = "\n\n".join(context_parts)
+
+        # ── Sender context ────────────────────────────────────────────────────
+        if sender_info:
+            sender_ctx = f"{sender_info['name']} ({sender_info['role']}) — {sender_info['notes']}"
+        else:
+            sender_ctx = sender_name or "a team member"
+
+        system = f"""You are Samuga AI — the brain of Samuga Media, Maldives' first AI-powered newsroom.
+
+You live inside the core team's private Telegram group. You are not an assistant — you're a team member who happens to be an AI. You've been in the newsroom all day. You know what was posted, what's trending, what's developing, and what the audience responded to.
+
+THE TEAM:
+- Manchii (Abdul Muhsin) — Founder & MD. Visionary, builds at 2am, takes calculated risks. Roast him gently when earned.
+- Uly (Mariyam Ulya) — Editor-in-Chief. Sharp journalist brain, catches errors before anyone. You trust her on content.
+- Thooma (Aminath Thooma) — Presenter & Marketing. The face of Samuga, full of energy. Always back her up.
+- Kity — Manchii's wife, creative contributor. Fresh ideas, always worth taking seriously.
+
+YOU ARE SPEAKING WITH: {sender_ctx}
+
+HOW YOU TALK:
+- Casual, warm, direct — like a smart Maldivian colleague
+- SHORT by default (1-3 sentences). Only go long when they need detail.
+- You have opinions. Weak story idea? Say so. Great angle? Say so.
+- Crack jokes when the vibe is right, especially with Manchii
+- Never say "I'm just an AI" — you're part of the team
+- No corporate language. No customer service voice.
+- Read the room — if someone's stressed, match that energy
+
+WHEN YOU HAVE LIVE NEWSROOM DATA (in context below):
+- Use it naturally, like you've been watching the newsroom all day
+- Spot the ONE thing worth mentioning — a developing story, an engagement spike, a gap
+- Don't dump everything. Pick what's most relevant to what they just said.
+- If nothing newsworthy stands out, just answer without adding noise.
+- Suggest specific angles: "the Addu angle hasn't been touched" beats "cover more regions"
+
+SAMUGA'S VOICE: Real stories, no filter, people first. The compass for the people.
+
+{context_block}"""
+
+        messages = []
+        if conversation_history:
+            messages = conversation_history[-10:]
+        messages.append({"role": "user", "content": message})
+
+        msg = ai.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=500,
+            system=system,
+            messages=messages
+        )
+        return msg.content[0].text.strip()
+
+    except Exception as e:
+        log.error(f"Core team chat: {e}")
+        try:
+            msg = ai.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=300,
+                messages=[{"role": "user", "content": message}]
+            )
+            return msg.content[0].text.strip()
+        except:
+            return None
+
+# ── Chat Handler ──────────────────────────────────────────────────────────────
+# Per-user daily DM/search limit (resets at MVT midnight).
+DM_DAILY_LIMIT = int(os.environ.get("DM_DAILY_LIMIT", "20"))
+_dm_usage = {}  # user_id -> {"date": "YYYY-MM-DD", "count": int}
+
+
+def dm_check_and_increment(user_id):
+    """Check and increment a user's daily DM/search usage.
+    Returns (allowed, count, limit). When not allowed, the count is left at the
+    limit and not incremented further."""
+    today = (utcnow() + timedelta(hours=5)).strftime("%Y-%m-%d")
+    rec = _dm_usage.get(user_id)
+    if not rec or rec.get("date") != today:
+        rec = {"date": today, "count": 0}
+        _dm_usage[user_id] = rec
+    if rec["count"] >= DM_DAILY_LIMIT:
+        return False, rec["count"], DM_DAILY_LIMIT
+    rec["count"] += 1
+    return True, rec["count"], DM_DAILY_LIMIT
+
+
+def handle_updates():
+    # Use persisted offset so we never miss messages across restarts
+    def publish_approved_item(item, key, approver="Team", corrected=None):
+        """
+        Shared approve logic — called by both text command and button tap.
+        Wraps the same queue/publish flow used by the existing /approved handler.
+        """
+        try:
+            if item["lang"] == "dv":
+                # Run DV card generation in background thread
+                final_dv = corrected if corrected else item.get("dv_text","")
+                kw = item.get("keyword", item["cat"].lower())
+                bg = item.get("_bg_image") or fetch_background_image(kw)
+                ts_now = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+                card = generate_card(final_dv, SAMUGA_PUBLIC_SOURCE, ts_now, item["cat"], bg)
+                full_caption = (
+                    f"🇲🇻 <b>{item['title']}</b>\n\n"
+                    f"{final_dv}\n\n"
+                    f"📡 <b>ސަމުގާ މީޑިއާ</b> | @samugacommunity"
+                )
+                card.seek(0)
+                remember_post(item["title"], item["cat"], ts_now)
+                db_mark_status(item.get("article_id",""), "posted", posted=True)
+                db_log_learning(
+                    article_id=item.get("article_id"),
+                    action=("edited" if corrected else "approved"),
+                    member=approver,
+                    category=item.get("cat",""),
+                    source=item.get("source",""),
+                    theme=item.get("_trend_theme",""),
+                    original_caption=item.get("dv_text",""),
+                    final_caption=(corrected or item.get("dv_text","")),
+                    lang="dv")
+                queue_for_social(
+                    io.BytesIO(card.getvalue()), full_caption,
+                    notify_chat_id=CORE_TEAM_CHAT_ID,
+                    notify_thread_id=CONTENT_LAB_THREAD_ID,
+                    key_label=key.upper(),
+                    tg_ok=False,
+                    post_telegram=True,
+                    article_id=item.get("article_id"),
+                    title=item.get("title",""),
+                    summary=item.get("summary",""),
+                    cat=item.get("cat","LOCAL"),
+                    source=item.get("source","Samuga Media"),
+                    link=item.get("link",""),
+                    lang="dv",
+                    is_breaking=item.get("is_breaking", False))
+            else:
+                # English — use existing card bytes
+                is_breaking_card = item.get("is_breaking", False)
+                if is_breaking_card:
+                    _publish_now(
+                        item["card_bytes"], item["caption"], item["cat"],
+                        item["title"], item["link"],
+                        is_breaking_flag=True,
+                        allow_social=True,
+                        article_id=item.get("article_id",""))
+                else:
+                    db_mark_status(item.get("article_id",""), "posted", posted=True)
+                    db_log_learning(
+                        article_id=item.get("article_id"),
+                        action="approved",
+                        member=approver,
+                        category=item.get("cat",""),
+                        source=item.get("source",""),
+                        theme=item.get("_trend_theme",""),
+                        original_caption=item.get("caption",""),
+                        final_caption=item.get("caption",""),
+                        lang="en")
+                    queue_for_social(
+                        io.BytesIO(item["card_bytes"]), item["caption"],
+                        notify_chat_id=CORE_TEAM_CHAT_ID,
+                        notify_thread_id=CONTENT_LAB_THREAD_ID,
+                        key_label=key.upper(),
+                        tg_ok=False,
+                        post_telegram=True,
+                        article_id=item.get("article_id"),
+                        title=item.get("title",""),
+                        summary=item.get("summary",""),
+                        cat=item.get("cat","LOCAL"),
+                        source=item.get("source","Samuga Media"),
+                        link=item.get("link",""),
+                        lang="en",
+                        is_breaking=is_breaking_card)
+        except Exception as e:
+            log.error(f"publish_approved_item error: {e}")
+            send_text(CORE_TEAM_CHAT_ID, f"❌ Error publishing {key}: {e}",
+                      thread_id=CONTENT_LAB_THREAD_ID)
+
+    offset = _poll_offset[0]
+    bot_mention=f"@{BOT_USERNAME}".lower()
+    log.info(f"💬 Chat listening for @{BOT_USERNAME}... (offset={offset})")
+    while True:
+        try:
+            resp=requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                params={"offset":offset,"timeout":30},timeout=40)
+            if resp.status_code!=200: time.sleep(5); continue
+            for update in resp.json().get("result",[]):
+                offset=update["update_id"]+1
+                _poll_offset[0] = offset
+                # Save offset every 10 updates — cheap insurance against missing messages on restart
+                if offset % 10 == 0:
+                    persist_state()
+                # ── Handle inline button taps (callback_query) ────────────────────
+                cbq = update.get("callback_query")
+                if cbq:
+                    cbq_id   = cbq["id"]
+                    cbq_data = cbq.get("data","")
+                    cbq_user = cbq.get("from",{})
+                    cbq_chat = cbq.get("message",{}).get("chat",{})
+                    cbq_msg_id = cbq.get("message",{}).get("message_id")
+                    cbq_chat_id = cbq_chat.get("id")
+                    cbq_name = cbq_user.get("first_name","Team")
+
+                    if cbq_data.startswith("approve:") or cbq_data.startswith("reject:") or cbq_data.startswith("edit_approve:"):
+                        parts    = cbq_data.split(":", 1)
+                        action   = parts[0]
+                        cb_key   = parts[1].lower() if len(parts) > 1 else ""
+
+                        if action == "approve" and cb_key in approval_queue:
+                            answer_callback_query(cbq_id, "✅ Approving...")
+                            item = approval_queue.pop(cb_key)
+                            persist_state()
+                            # Remove buttons from the card message
+                            edit_message_reply_markup(cbq_chat_id, cbq_msg_id, {"inline_keyboard": []})
+                            # Run the same approve logic as the text command
+                            try:
+                                ok = False
+                                if item["lang"] == "dv":
+                                    import threading as _thr
+                                    def _approve_dv_bg(itm, k, nm):
+                                        try:
+                                            from cards import generate_dhivehi_card, fetch_background_image
+                                            bg = fetch_background_image(None, itm.get("cat","LOCAL"), itm.get("title",""))
+                                            buf = generate_dhivehi_card(itm.get("dv_text",""), itm.get("source",""), itm.get("timestamp",""), itm.get("cat","LOCAL"), bg)
+                                            if buf:
+                                                itm["card_bytes"] = buf.getvalue() if hasattr(buf,"getvalue") else buf.read()
+                                        except Exception as ex:
+                                            log.error(f"DV card bg: {ex}")
+                                        publish_approved_item(itm, k, approver=nm)
+                                    _thr.Thread(target=_approve_dv_bg, args=(item, cb_key, cbq_name), daemon=True).start()
+                                    send_text(cbq_chat_id, f"✅ <b>{cbq_name}</b> approved <b>{cb_key.upper()}</b> (Dhivehi) — generating card...", thread_id=CONTENT_LAB_THREAD_ID)
+                                else:
+                                    publish_approved_item(item, cb_key, approver=cbq_name)
+                                    send_text(cbq_chat_id, f"✅ <b>{cbq_name}</b> approved <b>{cb_key.upper()}</b> — publishing!", thread_id=CONTENT_LAB_THREAD_ID)
+                            except Exception as e:
+                                log.error(f"Button approve error: {e}")
+                                send_text(cbq_chat_id, f"⚠️ Error approving {cb_key}: {e}", thread_id=CONTENT_LAB_THREAD_ID)
+
+                        elif action == "reject" and cb_key in approval_queue:
+                            import random as _rnd
+                            answer_callback_query(cbq_id, "❌ Rejected")
+                            item = approval_queue.pop(cb_key)
+                            persist_state()
+                            edit_message_reply_markup(cbq_chat_id, cbq_msg_id, {"inline_keyboard": []})
+                            quip = _rnd.choice(REJECT_RESPONSES)
+                            send_text(cbq_chat_id,
+                                f"❌ <b>{cbq_name}</b> rejected <b>{cb_key.upper()}</b>\n\n<i>{quip}</i>",
+                                thread_id=CONTENT_LAB_THREAD_ID)
+                            log.info(f"❌ {cb_key} rejected via button by {cbq_name}")
+
+                        elif action == "edit_approve":
+                            # Prompt for corrected text via reply
+                            answer_callback_query(cbq_id, "✏️ Reply with corrected Dhivehi text")
+                            send_text(cbq_chat_id,
+                                f"✏️ <b>{cbq_name}</b>, reply with the corrected Dhivehi text for <b>{cb_key.upper()}</b>:\n"
+                                f"Or just type: <code>/approved {cb_key} [corrected text]</code>",
+                                thread_id=CONTENT_LAB_THREAD_ID)
+
+                        elif cb_key not in approval_queue:
+                            answer_callback_query(cbq_id, "⚠️ Card no longer in queue (already actioned or expired)", show_alert=True)
+                            edit_message_reply_markup(cbq_chat_id, cbq_msg_id, {"inline_keyboard": []})
+
+                    else:
+                        answer_callback_query(cbq_id)
+                    # Always advance offset after callback_query
+                    offset = update["update_id"] + 1
+                    _poll_offset[0] = offset
+                    continue  # Don't process as message
+
+                msg=update.get("message",{})
+                if not msg: continue
+                text=msg.get("text","") or msg.get("caption","")
+                text_cmd = re.sub(r'@SamugaNewsBot\b', '', text or '', flags=re.I).strip()
+                text_cmd_low = text_cmd.lower()
+                photo=msg.get("photo")  # list of photo sizes if message has photo
+                video=msg.get("video") or msg.get("video_note")
+                reply_msg = msg.get("reply_to_message", {}) or {}
+                reply_text = reply_msg.get("text","") or reply_msg.get("caption","") or ""
+                reply_msg_id = reply_msg.get("message_id")
+                if not text and not photo and not video: continue
+                if not text: text=""
+                # Skip videos for card creation — only photos supported
+                if video and not photo: photo = None
+                chat_id=msg["chat"]["id"]
+                msg_id=msg["message_id"]
+                thread_id=msg.get("message_thread_id")  # for forum/topic groups
+                chat_type=msg["chat"]["type"]
+                user_name=msg.get("from",{}).get("username","")
+                first_name=msg.get("from",{}).get("first_name","there")
+                display_name=user_name or first_name
+                user_id=str(msg.get("from",{}).get("id",""))
+
+                if chat_type=="private":
+                    if text.startswith("/start"):
+                        send_text(chat_id,
+                            f"👋 Hey {first_name}! I'm <b>Samuga AI</b> — your Maldives news assistant!\n\n"
+                            f"Ask me anything about Maldives news, politics, tourism, football or world news.\n\n"
+                            f"ދިވެހިން ވެސް ވާހަކަ ދެއްކިދާނެ! 🇲🇻\n\n"
+                            f"📡 Follow <b>@samugacommunity</b> for live news updates!", reply_to=msg_id)
+                    elif text.startswith("/search "):
+                        # Rate limit applies to /search too
+                        allowed, count, limit = dm_check_and_increment(user_id)
+                        if not allowed:
+                            send_text(chat_id,
+                                f"You've reached today's limit of {limit} messages 🙏\n\n"
+                                f"Come back tomorrow for more! Meanwhile follow "
+                                f"<b>@samugacommunity</b> for live Maldives news. 📡",
+                                reply_to=msg_id)
+                        else:
+                            query = text[8:].strip()
+                            log.info(f"🔍 Search: {query}")
+                            results = tavily_search(f"{query} maldives")
+                            reply = chat_with_claude(f"Tell me about: {query}. Use this info: {results[:400]}", user_id)
+                            send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
+                    else:
+                        # ── Rate limit check ──────────────────────────────────
+                        allowed, count, limit = dm_check_and_increment(user_id)
+                        if not allowed:
+                            send_text(chat_id,
+                                f"You've reached today's limit of {limit} messages 🙏\n\n"
+                                f"Come back tomorrow! Follow <b>@samugacommunity</b> "
+                                f"for live Maldives news in the meantime. 📡",
+                                reply_to=msg_id)
+                            log.info(f"🚫 DM rate limit hit: {display_name} ({user_id})")
+                        else:
+                            log.info(f"💬 Public Telegram Samuga AI {display_name} [{count}/{limit}]: {text[:50]}")
+                            try:
+                                reply = public_samuga_ai_chat(
+                                    message=text,
+                                    platform="telegram",
+                                    user_key=user_id,
+                                    session_id=str(chat_id),
+                                    lang=("dv" if is_dhivehi(text) else "en")
+                                )
+                            except Exception as e:
+                                log.error(f"Unified public Telegram chat failed: {e}")
+                                reply = "Small issue on my side bro 😅 Try again in a moment."
+                            send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
+
+                elif chat_type in ["group","supergroup"]:
+                    is_core_team = str(chat_id) == CORE_TEAM_CHAT_ID
+                    tagged = bot_mention in text.lower()
+                    clean = text.replace(bot_mention, "").strip() if tagged else text.strip()
+
+                    # Core team group — smarter behavior
+                    if is_core_team:
+                        sender_info = get_sender_info(display_name, first_name)
+                        history = get_conversation(user_id)
+
+                        # ── Fuzzy command normaliser ──────────────────────────────────────
+                        # Accepts typos, missing slash, wrong spelling — as long as intent
+                        # and key are clear. Ulya-proof.
+                        # approve variants: /approved, /approve, /aprroved, /aprrove, approved, approve
+                        # reject variants:  /reject, /rejected, /rejecte, /rejects, reject, rejected
+                        def _parse_fuzzy_cmd(raw):
+                            """
+                            Returns (cmd, key, extra) where cmd is 'approve' or 'reject',
+                            key is e.g. 'dv48' or 'en12', extra is optional corrected text.
+                            Returns (None, None, None) if not recognised.
+                            """
+                            import re as _re
+                            t = raw.strip()
+                            # Remove leading slash if present
+                            if t.startswith("/"): t = t[1:]
+                            tl = t.lower()
+                            # Split on whitespace — first token is the command word
+                            tokens = tl.split()
+                            if not tokens: return (None, None, None)
+                            cmd_word = tokens[0]
+                            # Normalise doubled letters: "aprroved" → "aproved", "rejecte" → "rejecte"
+                            import re as _re
+                            cmd_norm = _re.sub(r'(.)\1+', r'\1', cmd_word)
+                            # Approve variants: /approved /approve /aprroved /aprrove approved approve
+                            is_approve = (cmd_word.startswith("appro") or
+                                          cmd_norm.startswith("appro") or
+                                          cmd_norm.startswith("apro") or
+                                          cmd_word in ["approve", "approved"])
+                            # Reject variants: /reject /rejected /rejecte /rejects reject rejected
+                            is_reject  = (cmd_word.startswith("rejec") or
+                                          cmd_norm.startswith("rejec") or
+                                          cmd_word in ["reject", "rejected"])
+                            if not is_approve and not is_reject:
+                                return (None, None, None)
+                            # Find the key — pattern like dv48, en12, en50 etc.
+                            # Can be in any token after the command word
+                            rest_raw = raw.strip()
+                            if rest_raw.startswith("/"): rest_raw = rest_raw[1:]
+                            rest_tokens = rest_raw.split()
+                            key = None
+                            key_idx = None
+                            for i, tok in enumerate(rest_tokens[1:], 1):
+                                if _re.match(r'^[a-zA-Z]{1,3}\d+$', tok):
+                                    key = tok.lower()
+                                    key_idx = i
+                                    break
+                            if not key: return (None, None, None)
+                            # Extra text after the key = corrected Dhivehi
+                            extra = None
+                            if key_idx is not None and len(rest_tokens) > key_idx + 1:
+                                extra = " ".join(rest_tokens[key_idx+1:]).strip() or None
+                            cmd = "approve" if is_approve else "reject"
+                            return (cmd, key, extra)
+
+                        _fcmd, _fkey, _fextra = _parse_fuzzy_cmd(text_cmd)
+
+                        # /approved <key> [optional corrected dhivehi text]
+                        if _fcmd == "approve" or text.strip().lower().startswith("/approved "):
+                            if _fcmd == "approve" and _fkey:
+                                key      = _fkey
+                                corrected = _fextra
+                            else:
+                                parts     = text.strip()[10:].strip().split(" ", 1)
+                                key       = parts[0].strip().lower()
+                                corrected = parts[1].strip() if len(parts) > 1 else None
+
+                            # Always acknowledge immediately — team should NEVER get silence
+                            send_text(chat_id, f"⏳ Got it {first_name}! Processing <b>{key.upper()}</b>...", reply_to=msg_id, thread_id=thread_id)
+
+                            if key in approval_queue:
+                                item = approval_queue.pop(key)
+                                persist_state()
+                                action = "edited" if corrected else "approved"
+                                try:
+                                    ok = False
+                                    if item["lang"] == "dv":
+                                        # Run card generation in background — gives Uly instant feedback
+                                        def _process_dv(_item=item, _key=key, _corrected=corrected,
+                                                        _cid=chat_id, _tid=thread_id, _fname=first_name, _mid=msg_id):
+                                            try:
+                                                final_dv = _corrected if _corrected else _item["dv_text"]
+                                                kw = _item.get("keyword", _item["cat"].lower())
+                                                # Use pre-fetched bg if available, else fetch now
+                                                bg = _item.get("_bg_image") or fetch_background_image(kw)
+                                                ts_now = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+                                                card = generate_card(final_dv, SAMUGA_PUBLIC_SOURCE, ts_now, _item["cat"], bg)
+                                                full_caption = (
+                                                    f"🇲🇻 <b>{_item['title']}</b>\n\n"
+                                                    f"{final_dv}\n\n"
+                                                    f"📡 <b>ސަމުގާ މީޑިއާ</b> | @samugacommunity"
+                                                )
+                                                card.seek(0)
+                                                # Queue handles Telegram + FB + IG + X with 10-min gap
+                                                # tg_ok=False initially — queue will post Telegram too
+                                                remember_post(_item["title"], _item["cat"], ts_now)
+                                                db_mark_status(_item.get("article_id",""), "posted", posted=True)
+                                                db_log_learning(
+                                                    article_id=_item.get("article_id"),
+                                                    action=("edited" if _corrected else "approved"),
+                                                    member=_fname,
+                                                    category=_item.get("cat",""),
+                                                    source=_item.get("source",""),
+                                                    theme=_item.get("_trend_theme",""),
+                                                    original_caption=_item.get("dv_text",""),
+                                                    final_caption=(_corrected or _item.get("dv_text","")),
+                                                    lang="dv")
+                                                queue_for_social(
+                                                    io.BytesIO(card.getvalue()), full_caption,
+                                                    notify_chat_id=_cid,
+                                                    notify_thread_id=_tid,
+                                                    key_label=_key.upper(),
+                                                    tg_ok=False,
+                                                    post_telegram=True,   # queue posts Telegram too
+                                                    article_id=_item.get("article_id"),
+                                                    title=_item.get("title",""),
+                                                    summary=_item.get("summary",""),
+                                                    cat=_item.get("cat","LOCAL"),
+                                                    source=_item.get("source","Samuga Media"),
+                                                    link=_item.get("link",""),
+                                                    lang="dv",
+                                                    is_breaking=_item.get("is_breaking", False)
+                                                )
+                                            except Exception as e:
+                                                log.error(f"DV approval processing: {e}")
+                                                send_text(_cid, f"❌ Error processing {_key}: {e}", thread_id=_tid)
+                                        threading.Thread(target=_process_dv, daemon=True).start()
+                                        ok = True  # optimistic — thread handles actual result
+                                    else:
+                                        # English — queue for Telegram + social (10-min gap)
+                                        # EXCEPT breaking which fires immediately
+                                        is_breaking_card = item.get("is_breaking", False)
+                                        if is_breaking_card:
+                                            # Breaking bypasses queue — fires to all platforms now
+                                            tg_ok, social_res = _publish_now(
+                                                item["card_bytes"], item["caption"], item["cat"],
+                                                item["title"], item["link"],
+                                                is_breaking_flag=True,
+                                                allow_social=item.get("allow_social", True),
+                                                rewritten=item.get("rewritten",""),
+                                                summary=item.get("summary",""),
+                                                report_to=(chat_id, thread_id),
+                                                article_id=item.get("article_id")
+                                            )
+                                            ok = tg_ok
+                                        else:
+                                            # Regular — joins queue with 10-min gap
+                                            buf = io.BytesIO(item["card_bytes"])
+                                            queue_for_social(
+                                                buf, item["caption"],
+                                                notify_chat_id=chat_id,
+                                                notify_thread_id=thread_id,
+                                                key_label=key.upper(),
+                                                tg_ok=False,
+                                                post_telegram=True,
+                                                article_id=item.get("article_id"),
+                                                title=item.get("title",""),
+                                                summary=item.get("summary",""),
+                                                cat=item.get("cat","LOCAL"),
+                                                source=item.get("source","Samuga Media"),
+                                                link=item.get("link",""),
+                                                lang=item.get("lang","en"),
+                                                is_breaking=item.get("is_breaking", False)
+                                            )
+                                            ok = True
+
+                                    # DV cards handled entirely in background thread above
+                                    if item.get("lang") == "dv":
+                                        pass  # thread handles posting, confirmation and logging
+                                    elif ok:
+                                        if item.get("article_id"):
+                                            db_mark_status(item["article_id"], "posted", posted=True)
+                                        db_log_learning(
+                                            article_id=item.get("article_id"),
+                                            action=("edited" if corrected else "approved"),
+                                            member=first_name,
+                                            category=item.get("cat",""),
+                                            source=item.get("source",""),
+                                            theme=item.get("_trend_theme",""),
+                                            original_caption=item.get("dv_text") or item.get("caption",""),
+                                            final_caption=(corrected or item.get("dv_text") or item.get("caption","")),
+                                            lang=item.get("lang","en"))
+                                        log.info(f"✅ {key} ({item['lang']}) posted by {first_name}")
+                                    else:
+                                        # Telegram failed — put card back so team can retry
+                                        approval_queue[key] = item
+                                        persist_state()
+                                        send_text(chat_id,
+                                            f"❌ <b>{key.upper()} — Telegram failed</b>\n\n"
+                                            f"Card is still in queue. Try again:\n"
+                                            f"<code>/approved {key}</code>\n"
+                                            f"Or reject: <code>/reject {key}</code>",
+                                            reply_to=msg_id, thread_id=thread_id)
+                                        log.error(f"❌ {key} post failed for {first_name}")
+                                except Exception as e:
+                                    log.error(f"Approval post error: {e}")
+                                    # Put card back so team can retry
+                                    approval_queue[key] = item
+                                    persist_state()
+                                    send_text(chat_id,
+                                        f"❌ <b>Error posting {key.upper()}</b>: {str(e)[:100]}\n\n"
+                                        f"Card saved — try again: <code>/approved {key}</code>",
+                                        reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                # Key not found — give helpful context
+                                send_text(chat_id,
+                                    f"⚠️ <b>{key.upper()}</b> not found in queue\n\n"
+                                    f"It may have already posted, been rejected, or expired.\n"
+                                    f"Run <code>/pending</code> to see what's still waiting.",
+                                    reply_to=msg_id, thread_id=thread_id)
+
+                        # /reject <key>
+                        elif _fcmd == "reject" or text.strip().lower().startswith("/reject "):
+                            key = _fkey if (_fcmd == "reject" and _fkey) else text.strip()[8:].strip().lower()
+                            if key in approval_queue:
+                                rej_item  = approval_queue[key]
+                                rej_title = rej_item.get("title","")[:70]
+                                if rej_item.get("article_id"):
+                                    db_mark_status(rej_item["article_id"], "rejected")
+                                db_log_learning(
+                                    article_id=rej_item.get("article_id"),
+                                    action="rejected",
+                                    member=first_name,
+                                    category=rej_item.get("cat",""),
+                                    source=rej_item.get("source",""),
+                                    theme=rej_item.get("_trend_theme",""),
+                                    original_caption=rej_item.get("dv_text") or rej_item.get("caption",""),
+                                    lang=rej_item.get("lang","en"))
+                                try:
+                                    remember_story_title(rej_item.get("_dedup_title") or rej_item.get("title",""))
+                                except Exception:
+                                    pass
+                                del approval_queue[key]
+                                persist_state()
+                                import random as _r
+                                send_text(chat_id, f"❌ <b>{key.upper()}</b> rejected — {rej_title}\n\n{_r.choice(REJECT_RESPONSES)}", reply_to=msg_id, thread_id=thread_id)
+                                log.info(f"🗑️ {key} rejected by {first_name}")
+                            else:
+                                send_text(chat_id, f"Key <code>{key}</code> not found — maybe already posted or rejected.", reply_to=msg_id, thread_id=thread_id)
+
+                        # /hide <article_id_or_slug_or_url> — remove a website article fast
+                        elif text_cmd_low.startswith("/hide "):
+                            ident = text_cmd[6:].strip()
+                            rows = db_hide_article(ident)
+                            if rows:
+                                joined = "\n".join([f"• <code>{rid}</code> — {ttl[:70]}" for rid, ttl in rows[:5]])
+                                send_text(chat_id, f"🙈 <b>Hidden from website</b>\n\n{joined}", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                send_text(chat_id, f"⚠️ No website article found for <code>{ident}</code>", reply_to=msg_id, thread_id=thread_id)
+
+                        # /unhide <article_id_or_slug_or_url> — restore hidden article
+                        elif text_cmd_low.startswith("/unhide "):
+                            ident = text_cmd[8:].strip()
+                            rows = db_unhide_article(ident)
+                            if rows:
+                                joined = "\n".join([f"• <code>{rid}</code> — {ttl[:70]}" for rid, ttl in rows[:5]])
+                                send_text(chat_id, f"👀 <b>Restored on website</b>\n\n{joined}", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                send_text(chat_id, f"⚠️ No hidden website article found for <code>{ident}</code>", reply_to=msg_id, thread_id=thread_id)
+
+                        # /delete — reply to a bot message in Content Lab to delete it and remove queue item if present
+                        elif text_cmd_low in ["/delete", "/del", "/remove"]:
+                            if not reply_msg_id:
+                                send_text(chat_id,
+                                    "Reply to the bot message you want deleted, then send <code>/delete</code>.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                removed_key = None
+                                try:
+                                    lower_reply = reply_text.lower()
+                                    m = re.search(r"\b((?:dv|en)\d+)\b", lower_reply)
+                                    if m and m.group(1) in approval_queue:
+                                        removed_key = m.group(1)
+                                        approval_queue.pop(removed_key, None)
+                                        persist_state()
+                                except Exception:
+                                    pass
+                                ok = delete_telegram_message(chat_id, reply_msg_id)
+                                if ok:
+                                    msg_text = "🗑️ <b>Deleted from Content Lab.</b>"
+                                    if removed_key:
+                                        msg_text += f" Queue item <code>{removed_key}</code> removed too."
+                                    send_text(chat_id, msg_text, reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id,
+                                        "⚠️ <b>Couldn't delete that message.</b>\n\n"
+                                        "Common reasons:\n"
+                                        "• You replied to a <b>human message</b> — /delete only works on <b>bot messages</b>\n"
+                                        "• Message is older than 48h — Telegram blocks deletion after that\n"
+                                        "• Bot lost admin rights temporarily\n\n"
+                                        "Reply directly to a <b>Samuga AI bot message</b> (a card or queue message) and try again.",
+                                        reply_to=msg_id, thread_id=thread_id)
+                                    alert_admin("Content Lab delete failed. Check bot delete permissions in Telegram.", dedupe_key="telegram_delete_permission")
+
+                                                # /post to web — reply to a human-written article or include article + command in same message
+                        elif text_cmd_low in ["/post to web", "/post web", "/posttoweb"] or "/post to web" in text_cmd_low:
+                            article_source = ""
+                            if reply_text.strip():
+                                article_source = re.sub(r'@SamugaNewsBot\b', '', reply_text or '', flags=re.I).strip()
+                            else:
+                                article_source = extract_inline_post_to_web_body(text)
+                            if not article_source.strip():
+                                send_text(chat_id,
+                                    "⚠️ Website post needs article text. Either reply to the article and send <code>/post to web</code>, or send the article with <code>/post to web</code> at the bottom.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                send_text(chat_id, "🌐 Publishing article to website... ⏳", reply_to=msg_id, thread_id=thread_id)
+                                result, err = manual_post_replied_article_to_website(article_source, category_hint="LOCAL")
+                                if result:
+                                    send_text(chat_id,
+                                        f"✅ <b>Posted to website</b>\n\n"
+                                        f"<b>{result['title']}</b>\n"
+                                        f"Category: {result['category']}\n"
+                                        f"Lang: {result['lang']}\n"
+                                        f"ID: <code>{result['article_id']}</code>\n"
+                                        f"Link: {result['url']}",
+                                        reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id, f"❌ Facing some issues posting to website.\nReason: {err}", reply_to=msg_id, thread_id=thread_id)
+                                    alert_admin(f"Manual website publish failed\n\nReason: {str(err)[:300]}", dedupe_key="manual_web_post_fail")
+
+# /delete https://samugamedia.com/... — hide a website article by URL
+                        elif text_cmd_low.startswith("/delete http://") or text_cmd_low.startswith("/delete https://"):
+                            try:
+                                url = text_cmd[8:].strip()
+                                rows = db_delete_article_by_url(url)
+                                if rows:
+                                    joined = "\n".join([f"• <code>{rid}</code> — {ttl[:70]}" for rid, ttl, slug in rows[:5]])
+                                    send_text(chat_id,
+                                        f"🗑️ <b>Hidden from website by URL</b>\n\n{joined}",
+                                        reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id,
+                                        "⚠️ No website article matched that URL. Check the full post link or slug.",
+                                        reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                send_text(chat_id, f"❌ Delete by URL failed: {str(e)[:150]}", reply_to=msg_id, thread_id=thread_id)
+                                alert_admin(f"Delete by URL failed\n\nReason: {str(e)[:250]}", dedupe_key="cmd_delete_by_url_fail")
+
+# /web — website admin control panel inside Telegram
+                        elif text_cmd_low.startswith("/web"):
+                            try:
+                                raw = text_cmd.strip()
+                                low = raw.lower()
+
+                                if low in ["/web", "/web help"]:
+                                    send_text(chat_id,
+                                        "🌐 <b>Website admin commands</b>\n\n"
+                                        "• <code>/web recent</code> — recent posted website articles\n"
+                                        "• <code>/web hidden</code> — hidden website articles\n"
+                                        "• <code>/web dv</code> — posted Dhivehi website articles\n"
+                                        "• <code>/web en</code> — posted English website articles\n"
+                                        "• <code>/web search keyword</code> — search website articles\n"
+                                        "• <code>/web analytics</code> — website analytics snapshot\n"
+                                        "• <code>/featured</code> — list featured article IDs\n"
+                                        "• <code>/feature URL_or_id</code> — mark featured\n"
+                                        "• <code>/unfeature URL_or_id</code> — remove featured\n"
+                                        "• <code>/hide URL_or_id</code> — hide one article\n"
+                                        "• <code>/unhide URL_or_id</code> — restore one article\n"
+                                        "• <code>/delete URL</code> — hide by public URL",
+                                        reply_to=msg_id, thread_id=thread_id)
+
+                                elif low in ["/web recent", "/web list", "/web posts"]:
+                                    rows = db_list_website_articles(status="posted", limit=8)
+                                    send_text(chat_id, "🌐 <b>Recent website posts</b>\n\n" + _format_web_rows(rows), reply_to=msg_id, thread_id=thread_id)
+
+                                elif low in ["/web hidden", "/web hidden posts"]:
+                                    rows = db_list_website_articles(status="hidden", limit=8)
+                                    send_text(chat_id, "🙈 <b>Hidden website posts</b>\n\n" + _format_web_rows(rows), reply_to=msg_id, thread_id=thread_id)
+
+                                elif low in ["/web dv", "/web dhivehi"]:
+                                    rows = db_list_website_articles(status="posted", lang="dv", limit=8)
+                                    send_text(chat_id, "🇲🇻 <b>Posted Dhivehi website articles</b>\n\n" + _format_web_rows(rows), reply_to=msg_id, thread_id=thread_id)
+
+                                elif low in ["/web en", "/web english"]:
+                                    rows = db_list_website_articles(status="posted", lang="en", limit=8)
+                                    send_text(chat_id, "🇬🇧 <b>Posted English website articles</b>\n\n" + _format_web_rows(rows), reply_to=msg_id, thread_id=thread_id)
+
+                                elif low.startswith("/web search "):
+                                    q = raw[12:].strip()
+                                    if not q:
+                                        send_text(chat_id, "⚠️ Usage: <code>/web search keyword</code>", reply_to=msg_id, thread_id=thread_id)
+                                    else:
+                                        rows = db_search_website_articles(q, limit=8)
+                                        if rows:
+                                            send_text(chat_id, f"🔎 <b>Website search:</b> <code>{q}</code>\n\n" + _format_web_rows(rows, show_status=True), reply_to=msg_id, thread_id=thread_id)
+                                        else:
+                                            send_text(chat_id, f"ℹ️ No website articles found for <code>{q}</code>.", reply_to=msg_id, thread_id=thread_id)
+
+                                elif low in ["/web analytics", "/web stats", "/web top"]:
+                                    send_text(chat_id, _format_web_analytics(days=7), reply_to=msg_id, thread_id=thread_id)
+
+                                else:
+                                    send_text(chat_id, "⚠️ Unknown web command. Try <code>/web help</code>.", reply_to=msg_id, thread_id=thread_id)
+
+                            except Exception as e:
+                                send_text(chat_id, f"❌ Web admin command failed: {str(e)[:180]}", reply_to=msg_id, thread_id=thread_id)
+                                alert_admin(f"/web command failed\n\nReason: {str(e)[:250]}", dedupe_key="cmd_web_admin_fail")
+
+# /featured — list featured article IDs saved for website use
+                        elif text_cmd_low in ["/featured", "/web featured"]:
+                            try:
+                                feats = db_get_featured_articles()
+                                if feats:
+                                    send_text(chat_id, "⭐ <b>Featured article IDs</b>\n\n" + "\n".join([f"• <code>{x}</code>" for x in feats]), reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id, "ℹ️ No featured articles saved yet.", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                send_text(chat_id, f"❌ Featured list failed: {str(e)[:150]}", reply_to=msg_id, thread_id=thread_id)
+
+# /feature <url|id|slug> — save featured article for website/frontend use
+                        elif text_cmd_low.startswith("/feature "):
+                            ident = text_cmd[9:].strip()
+                            try:
+                                rows = db_feature_article(ident)
+                                if rows:
+                                    send_text(chat_id, f"⭐ <b>Article marked featured</b>\n\n• <code>{rows[0]}</code>", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id, f"⚠️ Could not feature <code>{ident}</code>", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                send_text(chat_id, f"❌ Feature failed: {str(e)[:150]}", reply_to=msg_id, thread_id=thread_id)
+
+# /unfeature <url|id|slug> — remove featured mark
+                        elif text_cmd_low.startswith("/unfeature "):
+                            ident = text_cmd[11:].strip()
+                            try:
+                                ok = db_unfeature_article(ident)
+                                if ok:
+                                    send_text(chat_id, f"🧹 <b>Article unfeatured</b>\n\n• <code>{ident}</code>", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id, f"ℹ️ That article was not in featured list: <code>{ident}</code>", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                send_text(chat_id, f"❌ Unfeature failed: {str(e)[:150]}", reply_to=msg_id, thread_id=thread_id)
+
+# /hide_dv — hide all currently posted Dhivehi website articles
+                        elif text.strip().lower() in ["/hide_dv", "/hide dv", "/hide all dv"]:
+                            rows = db_hide_all_dhivehi()
+                            if rows:
+                                send_text(chat_id,
+                                    f"🙈 <b>Hidden Dhivehi website articles:</b> {len(rows)}",
+                                    reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                send_text(chat_id,
+                                    "ℹ️ No posted Dhivehi website articles found to hide.",
+                                    reply_to=msg_id, thread_id=thread_id)
+
+
+                        # /stats — quick operational stats
+                        elif text_cmd_low in ["/stats", "/botstats", "/stat"]:
+                            try:
+                                send_text(chat_id, format_bot_stats(), reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                send_text(chat_id, f"❌ Stats command failed: {str(e)[:150]}", reply_to=msg_id, thread_id=thread_id)
+                                alert_admin(f"/stats failed\n\nReason: {str(e)[:250]}", dedupe_key="cmd_stats_fail")
+
+                                                # /banner status | /banner off | /banner on [text] | /post banner
+                        elif text_cmd_low.startswith("/banner") or text_cmd_low in ["/post banner", "/banner post"]:
+                            try:
+                                raw = text_cmd.strip()
+                                low = raw.lower()
+                                # image-based sponsor banner
+                                if low in ["/post banner", "/banner post"]:
+                                    banner_photo = photo or (reply_msg.get("photo") if reply_msg else None)
+                                    if not banner_photo:
+                                        send_text(chat_id, "⚠️ Attach a website-size photo or reply to a photo, then send <code>/post banner</code>.", reply_to=msg_id, thread_id=thread_id)
+                                    else:
+                                        img_bytes = download_telegram_photo_bytes(banner_photo)
+                                        if not img_bytes:
+                                            send_text(chat_id, "❌ Banner post failed: I couldn't download the Telegram photo.", reply_to=msg_id, thread_id=thread_id)
+                                            alert_admin("Banner post failed: Telegram photo download failed.", dedupe_key="banner_photo_download_fail")
+                                        else:
+                                            image_url = upload_to_imgbb(img_bytes)
+                                            if not image_url:
+                                                send_text(chat_id, "❌ Banner post failed: image upload failed (imgbb).", reply_to=msg_id, thread_id=thread_id)
+                                                alert_admin("Banner post failed: imgbb upload failed.", dedupe_key="banner_imgbb_fail")
+                                            else:
+                                                website_banner.update({"active": True, "text": "", "image_url": image_url, "updated_at": utcnow().isoformat()})
+                                                persist_state()
+                                                send_text(chat_id, f"🎯 <b>Website banner posted</b>\n\nImage saved and banner is active.\n{image_url}", reply_to=msg_id, thread_id=thread_id)
+                                elif low in ["/banner", "/banner status"]:
+                                    active = bool(website_banner.get("active"))
+                                    txt = (website_banner.get("text") or "").strip()
+                                    img = (website_banner.get("image_url") or "").strip()
+                                    send_text(chat_id,
+                                        f"🎯 <b>Website banner</b>\n\n"
+                                        f"Active: <b>{'Yes' if active else 'No'}</b>\n"
+                                        f"Image: {img or '—'}\n"
+                                        f"Text: {txt or '—'}",
+                                        reply_to=msg_id, thread_id=thread_id)
+                                elif low.startswith("/banner off"):
+                                    website_banner.update({"active": False, "text": "", "image_url": "", "updated_at": utcnow().isoformat()})
+                                    persist_state()
+                                    send_text(chat_id, "🧹 Website banner turned off.", reply_to=msg_id, thread_id=thread_id)
+                                elif low.startswith("/banner on"):
+                                    banner_text = raw[len("/banner on"):].strip()
+                                    if not banner_text:
+                                        send_text(chat_id, "⚠️ Use: <code>/banner on Your sponsored banner text</code> or attach a photo and use <code>/post banner</code>.", reply_to=msg_id, thread_id=thread_id)
+                                    else:
+                                        website_banner.update({"active": True, "text": banner_text[:240], "image_url": "", "updated_at": utcnow().isoformat()})
+                                        persist_state()
+                                        send_text(chat_id, f"🎯 Website text banner turned on.\n\n{banner_text[:240]}", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id, "⚠️ Use <code>/banner status</code>, <code>/banner on ...</code>, <code>/banner off</code>, or attach a photo and send <code>/post banner</code>.", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                send_text(chat_id, f"❌ Banner command failed: {str(e)[:150]}", reply_to=msg_id, thread_id=thread_id)
+                                alert_admin(f"Banner command failed\n\nReason: {str(e)[:250]}", dedupe_key="cmd_banner_fail")
+
+# /hide_dv — hide all currently posted Dhivehi website articles
+                        elif text_cmd_low in ["/hide_dv", "/hide dv", "/hide all dv", "/delete_dv", "/delete dv", "/delete all dv"]:
+                            try:
+                                rows = db_hide_all_dhivehi()
+                                if rows:
+                                    send_text(chat_id, f"🙈 <b>Hidden Dhivehi website articles:</b> {len(rows)}", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id, "ℹ️ No posted Dhivehi website articles found to hide.", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                send_text(chat_id, f"❌ hide_dv failed: {str(e)[:150]}", reply_to=msg_id, thread_id=thread_id)
+                                alert_admin(f"hide_dv failed\n\nReason: {str(e)[:250]}", dedupe_key="cmd_hide_dv_fail")
+
+                        # /unhide_dv — restore hidden Dhivehi website articles
+                        elif text_cmd_low in ["/unhide_dv", "/unhide dv", "/unhide all dv"]:
+                            try:
+                                rows = db_unhide_all_dhivehi()
+                                if rows:
+                                    send_text(chat_id, f"👀 <b>Restored hidden Dhivehi website articles:</b> {len(rows)}", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id, "ℹ️ No hidden Dhivehi website articles found to restore.", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                send_text(chat_id, f"❌ unhide_dv failed: {str(e)[:150]}", reply_to=msg_id, thread_id=thread_id)
+                                alert_admin(f"unhide_dv failed\n\nReason: {str(e)[:250]}", dedupe_key="cmd_unhide_dv_fail")
+
+                        # /buffercheck — test imgbb + Buffer connection live
+                        elif text.strip().lower() in ["/buffercheck", "/socialcheck", "/checkbuffer"]:
+                            send_text(chat_id, "🔍 Testing imgbb + Buffer connection... ⏳",
+                                      reply_to=msg_id, thread_id=thread_id)
+                            def _buffercheck(_cid=chat_id, _tid=thread_id):
+                                lines = ["🔍 <b>Social Platform Check</b>\n"]
+                                # 1. imgbb
+                                try:
+                                    import base64 as _b64
+                                    test_img = Image.new("RGB", (10,10), color=(20,40,80))
+                                    buf = io.BytesIO()
+                                    test_img.save(buf, format="JPEG"); buf.seek(0)
+                                    resp = requests.post("https://api.imgbb.com/1/upload",
+                                        data={"key": IMGBB_API_KEY,
+                                              "image": _b64.b64encode(buf.getvalue()).decode()},
+                                        timeout=15)
+                                    if resp.status_code == 200 and resp.json().get("data",{}).get("url"):
+                                        lines.append("🖼️ <b>imgbb:</b> ✅ Working")
+                                    else:
+                                        lines.append(f"🖼️ <b>imgbb:</b> ❌ HTTP {resp.status_code} — check IMGBB_API_KEY")
+                                except Exception as e:
+                                    lines.append(f"🖼️ <b>imgbb:</b> ❌ {str(e)[:60]}")
+
+                                # 2. Meta Graph API (FB + IG)
+                                if META_PAGE_TOKEN and META_PAGE_ID:
+                                    try:
+                                        r = requests.get(
+                                            f"https://graph.facebook.com/{META_API_VER}/{META_PAGE_ID}",
+                                            params={"fields": "name,instagram_business_account",
+                                                    "access_token": META_PAGE_TOKEN},
+                                            timeout=10)
+                                        if r.status_code == 200:
+                                            d = r.json()
+                                            pg = d.get("name","?")
+                                            ig = d.get("instagram_business_account",{}).get("id","")
+                                            lines.append(f"\n📘 <b>Facebook (Meta):</b> ✅ Page: {pg}")
+                                            if ig:
+                                                lines.append(f"📸 <b>Instagram:</b> ✅ IG account linked (id: {ig})")
+                                                if not META_IG_ID:
+                                                    lines.append(f"   ⚠️ Add META_IG_ID={ig} to Railway vars for IG posting")
+                                            else:
+                                                lines.append("📸 <b>Instagram:</b> ⚠️ No IG business account linked to this page")
+                                        else:
+                                            err = r.json().get("error",{}).get("message","unknown")
+                                            if "token" in err.lower() or "expired" in err.lower():
+                                                lines.append(f"\n📘 <b>Meta token:</b> ❌ EXPIRED — regenerate META_PAGE_TOKEN")
+                                            else:
+                                                lines.append(f"\n📘 <b>Meta (FB/IG):</b> ❌ {err[:80]}")
+                                    except Exception as e:
+                                        lines.append(f"\n📘 <b>Meta:</b> ❌ {str(e)[:60]}")
+                                else:
+                                    lines.append("\n📘 <b>Meta (FB/IG):</b> ❌ META_PAGE_TOKEN or META_PAGE_ID not set in Railway")
+
+                                # 3. Buffer (X/Twitter only — text posts)
+                                if not BUFFER_TOKEN:
+                                    lines.append("\n🐦 <b>X/Twitter (Buffer):</b> ❌ BUFFER_ACCESS_TOKEN not set")
+                                else:
+                                    try:
+                                        r = requests.post(
+                                            "https://api.buffer.com",
+                                            json={"query": "{ account { id name } }"},
+                                            headers={"Authorization": f"Bearer {BUFFER_TOKEN}",
+                                                     "Content-Type": "application/json"},
+                                            timeout=10)
+                                        if r.status_code == 200:
+                                            data = r.json()
+                                            if "errors" in data:
+                                                lines.append(f"\n🐦 <b>X/Twitter (Buffer):</b> ❌ {data['errors'][0].get('message','?')[:60]}")
+                                            else:
+                                                name = data.get("data",{}).get("account",{}).get("name","?")
+                                                lines.append(f"\n🐦 <b>X/Twitter (Buffer):</b> ✅ Valid — account: {name}")
+                                                lines.append(f"   <i>Note: Buffer posts text only (no image) — working as expected</i>")
+                                        else:
+                                            lines.append(f"\n🐦 <b>X/Twitter (Buffer):</b> ⚠️ HTTP {r.status_code}")
+                                    except Exception as e:
+                                        lines.append(f"\n🐦 <b>X/Twitter:</b> ❌ {str(e)[:60]}")
+
+                                # 4. Last errors
+                                lines.append(f"\n🔎 <b>Last Buffer (X) response:</b>")
+                                lines.append(f"<code>{_last_buffer_error.get('response','No posts yet')[:150]}</code>")
+                                if _last_buffer_error.get("fb_error"):
+                                    lines.append(f"\n❌ <b>Last FB error:</b> <code>{_last_buffer_error['fb_error'][:150]}</code>")
+                                if _last_buffer_error.get("ig_error"):
+                                    lines.append(f"\n❌ <b>Last IG error:</b> <code>{_last_buffer_error['ig_error'][:150]}</code>")
+                                send_text(_cid, "\n".join(lines), thread_id=_tid)
+                            threading.Thread(target=_buffercheck, daemon=True).start()
+
+                        # /diag — diagnose feeds, Gemini (Dhivehi), and queue health
+                        elif text.strip().lower() in ["/diag", "/health", "/diagnose"]:
+                            send_text(chat_id, "🔍 Running diagnostics... ⏳", reply_to=msg_id, thread_id=thread_id)
+                            def _run_diag(_cid=chat_id, _tid=thread_id):
+                                try:
+                                    lines = ["🔍 <b>Samuga AI Diagnostics</b>\n"]
+                                    # 1. Gemini test — try all models in fallback order
+                                    if GEMINI_API_KEY:
+                                        test_dv = make_dhivehi_caption("The government announced a new policy today.", "Test news")
+                                        if test_dv and any("ހ" <= c <= "޿" for c in test_dv):
+                                            lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ✅ Working")
+                                        elif test_dv:
+                                            lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ⚠️ Responded but no Thaana — check prompt")
+                                        else:
+                                            # Show which models failed
+                                            lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ❌ All models failed")
+                                            lines.append(f"   Models tried: {', '.join(GEMINI_MODELS)}")
+                                            lines.append("   Check GEMINI_API_KEY in Railway vars")
+                                    else:
+                                        lines.append("🇲🇻 <b>Dhivehi (Gemini):</b> ❌ GEMINI_API_KEY not set in Railway")
+                                    # 2. Dhivehi feed check (RSS — expected to fail, kept for reference)
+                                    dv_feeds = [f for f in LOCAL_FEEDS if f.get("lang")=="dv"]
+                                    lines.append(f"\n📡 <b>Dhivehi RSS feeds ({len(dv_feeds)}) — now replaced by Telegram:</b>")
+                                    for f in dv_feeds:
+                                        try:
+                                            parsed = feedparser.parse(f["url"])
+                                            n = len(parsed.entries)
+                                            domain = f["url"].split("/")[2]
+                                            status = f"✅ {n} items" if n > 0 else "❌ 0 items (blocked/down)"
+                                            lines.append(f"  {status} — {domain}")
+                                        except Exception as fe:
+                                            lines.append(f"  ❌ {f['url'].split('/')[2]}: error")
+                                    # 3. Source ladder / website latest pages
+                                    try:
+                                        lines.append(f"\n🪜 <b>Source ladder:</b>")
+                                        latest_counts = {}
+                                        for src in WEB_LATEST_SOURCES:
+                                            latest_counts[src["source"]] = latest_counts.get(src["source"], 0) + 1
+                                        latest_sample = fetch_latest_web_pages(limit_per_source=2)
+                                        by_src = {}
+                                        for a in latest_sample:
+                                            by_src[a.get("source","?")] = by_src.get(a.get("source","?"), 0) + 1
+                                        for src_name in sorted(set(s.get("source","") for s in WEB_LATEST_SOURCES)):
+                                            lines.append(f"  🌐 {src_name}: {by_src.get(src_name,0)} latest-page headline(s)")
+                                        rss_backup = fetch_local_rss_recovery(limit_per_source=1)
+                                        if rss_backup:
+                                            lines.append(f"\n📡 <b>RSS recovery ladder:</b> ✅ {len(rss_backup)} backup item(s)")
+                                        else:
+                                            lines.append(f"\n📡 <b>RSS recovery ladder:</b> ⚠️ 0 backup item(s)")
+                                        world_items = fetch_world_updates(limit=2)
+                                        lines.append(f"\n🌍 <b>World updates:</b> ✅ {len(world_items)} major world item(s) available")
+                                    except Exception as ce:
+                                        lines.append(f"\n🪜 <b>Source ladder:</b> ❌ {str(ce)[:40]}")
+
+                                    # 4. Telegram channels (signal only — websites are primary)
+                                    lines.append(f"\n📲 <b>Telegram signal channels:</b>")
+                                    for ch in DV_TELEGRAM_CHANNELS:
+                                        try:
+                                            arts = fetch_dv_telegram(ch["handle"], ch["source"], ch.get("reliability",80))
+                                            dv_count = sum(1 for a in arts if a["lang"]=="dv")
+                                            lines.append(f"  ✅ @{ch['handle']} / {ch['source']}: {len(arts)} items ({dv_count} Dhivehi)")
+                                        except Exception as ce:
+                                            lines.append(f"  ❌ @{ch.get('handle','?')} / {ch['source']}: {str(ce)[:30]}")
+                                    # 5. Source health memory
+                                    try:
+                                        lines.append("\n🫀 <b>Source health memory:</b>")
+                                        for row in source_health_summary(limit=8):
+                                            lines.append(
+                                                f"  • {row['source']}: <b>{row['health']}</b>/100 "
+                                                f"(ok {row['successes']}/{row['fetches']}, empty {row['empty']}, fail {row['fails']}, ads {row['ads_total']})"
+                                            )
+                                    except Exception as she:
+                                        lines.append(f"\n🫀 <b>Source health memory:</b> ❌ {str(she)[:40]}")
+
+                                    # 6. Queue state
+                                    lines.append("\n🧠 <b>Queue guards:</b> duplicate translation wall + internal/junk safety wall active")
+                                    try:
+                                        dup_recent = _watchdog_prune_recent("duplicate_hits_recent", minutes=120)
+                                        mpf = _watchdog_prune_recent("manual_post_failures", minutes=180)
+                                        lines.append(f"🔔 <b>Watchdog memory:</b> duplicates {len(dup_recent)} in 2h | manual failures {len(mpf)} in 3h")
+                                    except Exception:
+                                        pass
+                                    lines.append("🌐 <b>Dhivehi website rule:</b> no Dhivehi website publish without Content Lab approval")
+                                    lines.append(f"🎯 <b>Website banner:</b> {'ON' if website_banner.get('active') else 'OFF'}")
+                                    if website_banner.get("image_url"):
+                                        lines.append("🖼️ <b>Banner type:</b> image")
+                                    dv_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="dv")
+                                    en_queued = sum(1 for v in approval_queue.values() if v.get("lang")=="en")
+                                    lines.append(f"\n📋 <b>Approval queue:</b> {dv_queued} Dhivehi, {en_queued} English waiting")
+                                    # 5. Recent Dhivehi posts from DB
+                                    if DB_ENABLED:
+                                        dv_posted = db_execute("SELECT COUNT(*) FROM articles WHERE lang='dv' AND status='posted' AND posted_at > NOW() - INTERVAL '7 days'", fetch="one")
+                                        lines.append(f"📚 <b>Dhivehi posted (7d):</b> {dv_posted[0] if dv_posted else 0}")
+                                    send_text(_cid, "\n".join(lines), thread_id=_tid)
+                                except Exception as e:
+                                    log.error(f"/diag: {e}")
+                                    send_text(_cid, f"❌ Diag error: {e}", thread_id=_tid)
+                            threading.Thread(target=_run_diag, daemon=True).start()
+
+                        # /stats — newsroom archive overview (DB-powered)
+                        elif text.strip().lower() in ["/stats", "/archive"]:
+                            if not DB_ENABLED:
+                                send_text(chat_id, "🗄️ Database not connected — archive stats unavailable. Running in JSON mode.", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                try:
+                                    total = db_execute("SELECT COUNT(*) FROM articles", fetch="one")
+                                    today = db_execute("SELECT COUNT(*) FROM articles WHERE found_at > NOW() - INTERVAL '24 hours'", fetch="one")
+                                    posted = db_execute("SELECT COUNT(*) FROM articles WHERE status='posted' AND found_at > NOW() - INTERVAL '24 hours'", fetch="one")
+                                    dupes = db_execute("SELECT COUNT(*) FROM articles WHERE status='duplicate' AND found_at > NOW() - INTERVAL '24 hours'", fetch="one")
+                                    by_cat = db_execute("""
+                                        SELECT category, COUNT(*) FROM articles
+                                        WHERE found_at > NOW() - INTERVAL '24 hours'
+                                        GROUP BY category ORDER BY COUNT(*) DESC LIMIT 6
+                                    """, fetch="all")
+                                    top_src = db_execute("""
+                                        SELECT source, COUNT(*) FROM articles
+                                        WHERE found_at > NOW() - INTERVAL '24 hours' AND source IS NOT NULL
+                                        GROUP BY source ORDER BY COUNT(*) DESC LIMIT 5
+                                    """, fetch="all")
+                                    msg_lines = ["🗞️ <b>Samuga Newsroom — Last 24h</b>\n"]
+                                    msg_lines.append(f"📥 Scanned: <b>{today[0] if today else 0}</b>")
+                                    msg_lines.append(f"✅ Posted: <b>{posted[0] if posted else 0}</b>")
+                                    msg_lines.append(f"🔁 Duplicates blocked: <b>{dupes[0] if dupes else 0}</b>")
+                                    msg_lines.append(f"📚 Total archive: <b>{total[0] if total else 0}</b>\n")
+                                    if by_cat:
+                                        msg_lines.append("<b>By category:</b>")
+                                        for c, n in by_cat:
+                                            msg_lines.append(f"  • {c}: {n}")
+                                    if top_src:
+                                        msg_lines.append("\n<b>Top sources:</b>")
+                                        for s, n in top_src:
+                                            msg_lines.append(f"  • {s}: {n}")
+                                    send_text(chat_id, "\n".join(msg_lines), reply_to=msg_id, thread_id=thread_id)
+                                except Exception as e:
+                                    log.error(f"/stats: {e}")
+                                    send_text(chat_id, f"❌ Stats error: {e}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /stories — list active developing story threads
+                        elif text.strip().lower() in ["/stories", "/developing"]:
+                            if not DB_ENABLED:
+                                send_text(chat_id, "🗄️ Database not connected — story tracking unavailable.", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                stories = get_active_stories(10)
+                                if not stories:
+                                    send_text(chat_id, "📚 No active developing stories right now. Stories appear here once an event gets 2+ updates.", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    lines = ["📚 <b>Developing Stories — Last 72h</b>\n"]
+                                    for s in stories:
+                                        status_emoji = "🔴" if s["status"]=="developing" else "🟡"
+                                        lines.append(f"{status_emoji} <b>Story #{s['id']}</b> ({s['update_count']} updates)\n   {s['title'][:70]}")
+                                    lines.append("\n<i>Use /story [number] to see the full timeline.</i>")
+                                    send_text(chat_id, "\n".join(lines), reply_to=msg_id, thread_id=thread_id)
+
+                        # /story <id> — show the full timeline of a story
+                        elif text.strip().lower().startswith("/story"):
+                            arg = text.strip()[6:].strip()
+                            if not DB_ENABLED:
+                                send_text(chat_id, "🗄️ Database not connected — story tracking unavailable.", reply_to=msg_id, thread_id=thread_id)
+                            elif not arg.isdigit():
+                                send_text(chat_id, "Use <code>/story [number]</code> — e.g. <code>/story 248</code>. See /stories for the list.", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                timeline = get_story_timeline(int(arg))
+                                if not timeline:
+                                    send_text(chat_id, f"No story found with ID #{arg}.", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    from datetime import timedelta as _td
+                                    lines = [f"📚 <b>Story #{timeline['id']} — {timeline['status'].upper()}</b>\n"]
+                                    lines.append(f"<b>{timeline['title']}</b>")
+                                    lines.append(f"<i>{timeline['update_count']} updates · {timeline['category'] or 'news'}</i>\n")
+                                    lines.append("<b>Timeline:</b>")
+                                    for u in timeline["updates"]:
+                                        t = u["time"]
+                                        if t:
+                                            mvt = (t + _td(hours=5)) if t.tzinfo else t
+                                            tstr = mvt.strftime("%d %b %H:%M")
+                                        else:
+                                            tstr = ""
+                                        src = f" ({u['source']})" if u["source"] else ""
+                                        lines.append(f"🔹 <b>{tstr}</b>{src}\n   {u['headline'][:90]}")
+                                    out = "\n".join(lines)
+                                    if len(out) > 4000: out = out[:3990] + "\n…"
+                                    send_text(chat_id, out, reply_to=msg_id, thread_id=thread_id)
+
+                        # /trends — what Maldives is talking about right now
+                        elif text.strip().lower() in ["/trends", "/trending"]:
+                            if not DB_ENABLED:
+                                send_text(chat_id, "🗄️ Database not connected — trends unavailable.", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                try:
+                                    trends = detect_trends(hours=24, min_mentions=3)
+                                    if not trends:
+                                        send_text(chat_id, "📊 No clear trends yet — archive is still filling up. Check back after a few hours of news.", reply_to=msg_id, thread_id=thread_id)
+                                    else:
+                                        lines = ["🔥 <b>Trending in Maldives — Last 24h</b>\n"]
+                                        medals = ["🥇","🥈","🥉"] + ["🔹"]*20
+                                        for i, (theme, count, titles) in enumerate(trends[:8]):
+                                            lines.append(f"{medals[i]} <b>{theme}</b> — {count} stories")
+                                        lines.append("\n<i>The bot boosts stories about these hot topics automatically.</i>")
+                                        send_text(chat_id, "\n".join(lines), reply_to=msg_id, thread_id=thread_id)
+                                except Exception as e:
+                                    log.error(f"/trends: {e}")
+                                    send_text(chat_id, f"❌ Trends error: {e}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /learning on | off | status — engagement learning switch
+                        elif text.strip().lower().startswith("/learning"):
+                            arg = text.strip().lower().replace("/learning", "").strip()
+                            if not DB_ENABLED:
+                                send_text(chat_id, "🗄️ Database not connected — learning unavailable.", reply_to=msg_id, thread_id=thread_id)
+                            elif arg == "on":
+                                posted, weeks, valid = learning_stats()
+                                if posted < LEARN_MIN_POSTS or weeks < LEARN_MIN_WEEKS or valid < LEARN_MIN_VALID_VIEWS:
+                                    send_text(chat_id,
+                                        f"⏳ Not ready yet:\n"
+                                        f"  • Posts: {posted}/{LEARN_MIN_POSTS}\n"
+                                        f"  • Weeks: {weeks}/{LEARN_MIN_WEEKS}\n"
+                                        f"  • Posts with views: {valid}/{LEARN_MIN_VALID_VIEWS}\n\n"
+                                        f"I'll keep collecting and tell you when the gate is met.",
+                                        reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    kv_set("learning_active", {"on": True, "by": first_name, "at": utcnow().isoformat()})
+                                    weights = compute_topic_weights()
+                                    gainers, losers = _top_gainers_losers(weights)
+                                    send_text(chat_id,
+                                        f"✅ <b>Learning mode ON</b> (by {first_name})\n\n"
+                                        f"Audience data now nudges scoring, capped at ±{LEARN_CAP} pts.\n\n"
+                                        f"<b>Getting a boost:</b>\n{gainers or '  (none yet)'}\n\n"
+                                        f"<b>Getting demoted:</b>\n{losers or '  (none yet)'}\n\n"
+                                        f"<i>Serious news always wins — this only breaks ties.</i>\n"
+                                        f"Turn off anytime: <code>/learning off</code>",
+                                        reply_to=msg_id, thread_id=thread_id)
+                                    log.info(f"🧠 Learning ACTIVATED by {first_name}")
+                            elif arg == "off":
+                                kv_set("learning_active", {"on": False, "by": first_name, "at": utcnow().isoformat()})
+                                send_text(chat_id,
+                                    f"🛑 <b>Learning mode OFF</b> (by {first_name})\n"
+                                    f"Back to observe-only. Scoring ignores audience data again.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                                log.info(f"🧠 Learning DEACTIVATED by {first_name}")
+                            else:  # status
+                                posted, weeks, valid = learning_stats()
+                                active = learning_is_active()
+                                weights = kv_get("topic_weights", {})
+                                gainers, losers = _top_gainers_losers(weights)
+                                ready = (posted >= LEARN_MIN_POSTS and weeks >= LEARN_MIN_WEEKS and valid >= LEARN_MIN_VALID_VIEWS)
+                                send_text(chat_id,
+                                    f"🧠 <b>Learning status</b>\n\n"
+                                    f"Mode: {'ACTIVE ✅' if active else 'observing 👀'}\n"
+                                    f"Gate: {'met ✅' if ready else 'not met'}\n"
+                                    f"  • Posts: {posted}/{LEARN_MIN_POSTS}\n"
+                                    f"  • Weeks: {weeks}/{LEARN_MIN_WEEKS}\n"
+                                    f"  • Posts with views: {valid}/{LEARN_MIN_VALID_VIEWS}\n\n"
+                                    f"<b>Top gainers:</b>\n{gainers or '  (gathering data)'}\n\n"
+                                    f"<b>Top losers:</b>\n{losers or '  (gathering data)'}\n\n"
+                                    + (f"Cap: ±{LEARN_CAP} pts. " if active else "")
+                                    + ("<code>/learning on</code> to activate." if (ready and not active) else ""),
+                                    reply_to=msg_id, thread_id=thread_id)
+
+                        # /meta — test the Facebook/Instagram connection live
+                        elif text.strip().lower() in ["/meta", "/facebook", "/insights"]:
+                            if not META_PAGE_TOKEN:
+                                send_text(chat_id,
+                                    "📵 No <code>META_PAGE_TOKEN</code> set in Railway. "
+                                    "FB/IG learning is off.", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                send_text(chat_id, "🔌 Testing Facebook + Instagram connection... ⏳",
+                                          reply_to=msg_id, thread_id=thread_id)
+                                try:
+                                    fb = _fetch_fb_post_engagement(limit=10)
+                                    ig_id = _resolve_ig_id()
+                                    ig = _fetch_ig_post_engagement(limit=10) if ig_id else []
+                                    lines = ["🔌 <b>Meta connection test</b>\n"]
+                                    if fb:
+                                        top_fb = max(e for _, e in fb)
+                                        lines.append(f"📘 Facebook: ✅ {len(fb)} posts read (top engagement: {top_fb})")
+                                    else:
+                                        lines.append("📘 Facebook: ⚠️ no posts returned (new page, or check token perms)")
+                                    if ig_id and ig:
+                                        top_ig = max(e for _, e in ig)
+                                        lines.append(f"📷 Instagram: ✅ {len(ig)} posts read (top engagement: {top_ig})")
+                                    elif ig_id:
+                                        lines.append("📷 Instagram: linked ✅ but no posts returned yet")
+                                    else:
+                                        lines.append("📷 Instagram: ⚠️ not linked — switch IG to Professional & link to the FB page")
+                                    matched = fetch_meta_insights()
+                                    lines.append(f"\n🔗 Matched to <b>{matched}</b> articles in the archive.")
+                                    lines.append("<i>Runs automatically every Friday + Tuesday. Data feeds learning (still observe-only).</i>")
+                                    send_text(chat_id, "\n".join(lines), reply_to=msg_id, thread_id=thread_id)
+                                except Exception as e:
+                                    log.error(f"/meta: {e}")
+                                    send_text(chat_id, f"❌ Meta test error: {e}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /scrapetest <url> - test semantic scraper on any URL
+                        elif text.strip().lower().startswith("/scrapetest"):
+                            arg = text.strip()[11:].strip()
+                            if not arg.startswith("http"):
+                                send_text(chat_id, "Use <code>/scrapetest [url]</code>\nExample: <code>/scrapetest https://edition.mv/news/12345</code>", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                send_text(chat_id, f"🔍 Scraping... <i>{arg[:80]}</i>", reply_to=msg_id, thread_id=thread_id)
+                                try:
+                                    from samuga_scraper import semantic_scrape
+                                    art = semantic_scrape(arg, source="ScrapeTest")
+                                    if art.get("error"):
+                                        send_text(chat_id, f"❌ <b>Scrape failed</b>\nReason: {art['error']}", reply_to=msg_id, thread_id=thread_id)
+                                    else:
+                                        out = [
+                                            "✅ <b>Scrape OK</b>",
+                                            f"<b>Title:</b> {art.get('title','')}",
+                                            f"<b>Category:</b> {art.get('cat','')}   <b>Lang:</b> {art.get('lang','')}",
+                                            f"<b>ID:</b> <code>{art.get('id','')}</code>",
+                                            f"<b>Body:</b> {str(art.get('summary',''))[:400]}...",
+                                        ]
+                                        send_text(chat_id, "\n".join(out), reply_to=msg_id, thread_id=thread_id)
+                                except Exception as ste:
+                                    send_text(chat_id, f"❌ Scraper error: {ste}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /discovery - manage discovery engine topics
+                        elif text.strip().lower().startswith("/discovery"):
+                            arg = text.strip()[10:].strip()
+                            parts = arg.split(None, 1)
+                            sub = parts[0].lower() if parts else "list"
+                            rest = parts[1] if len(parts) > 1 else ""
+                            try:
+                                from discovery import (
+                                    discovery_list, discovery_add, discovery_remove,
+                                    discovery_pause, discovery_resume, run_discovery as _disc_run
+                                )
+                                if sub in ("", "list"):
+                                    send_text(chat_id, discovery_list(), reply_to=msg_id, thread_id=thread_id)
+                                elif sub == "run":
+                                    send_text(chat_id, "🔍 Running discovery hunt now...", reply_to=msg_id, thread_id=thread_id)
+                                    import threading as _dthr
+                                    _dthr.Thread(target=_disc_run, daemon=True).start()
+                                elif sub == "pause":
+                                    send_text(chat_id, discovery_pause(), reply_to=msg_id, thread_id=thread_id)
+                                elif sub == "resume":
+                                    send_text(chat_id, discovery_resume(), reply_to=msg_id, thread_id=thread_id)
+                                elif sub == "add":
+                                    if not rest:
+                                        send_text(chat_id, "Usage: /discovery add <topic>\nExample: /discovery add fuel price hike", reply_to=msg_id, thread_id=thread_id)
+                                    else:
+                                        send_text(chat_id, discovery_add(rest.strip(), f"Maldives {rest.strip()} 2026"), reply_to=msg_id, thread_id=thread_id)
+                                elif sub == "remove":
+                                    if not rest.isdigit():
+                                        send_text(chat_id, "Usage: /discovery remove <number>\nSee /discovery list for numbers.", reply_to=msg_id, thread_id=thread_id)
+                                    else:
+                                        send_text(chat_id, discovery_remove(int(rest)), reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id, "Commands: /discovery list | add <topic> | remove <n> | run | pause | resume", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as dce:
+                                log.error(f"/discovery: {dce}")
+                                send_text(chat_id, f"❌ Discovery error: {dce}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /queue — show social queue contents
+                        elif text.strip().lower() in ["/queue", "/socialqueue", "/sq"]:
+                            try:
+                                with _social_queue_lock:
+                                    q = list(_social_queue)
+                                if not q:
+                                    send_text(chat_id, "📭 Social queue is empty — nothing waiting to post.", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    eta_secs = _calc_eta_seconds()
+                                    lines = [f"📋 <b>Social Queue — {len(q)} item(s) waiting</b>"]
+                                    lines.append(f"⏱ Next post in: <b>{int(eta_secs//60)}m {int(eta_secs%60)}s</b>\n")
+                                    for i, item in enumerate(q, 1):
+                                        key = item.get("key_label", f"item{i}")
+                                        title = item.get("title", item.get("caption","?"))[:60]
+                                        cat = item.get("cat", "?")
+                                        lang = item.get("lang", "en").upper()
+                                        queued = item.get("queued_at")
+                                        age = ""
+                                        if queued:
+                                            try:
+                                                mins = int((utcnow() - queued).total_seconds() / 60)
+                                                age = f" ({mins}min ago)"
+                                            except Exception:
+                                                pass
+                                        lines.append(f"<b>{i}.</b> <code>{key}</code> [{lang}/{cat}]{age}")
+                                        lines.append(f"   📰 {title}")
+                                        lines.append(f"   ▶️ <code>/qpost {i}</code>  🗑 <code>/qdel {i}</code>")
+                                    lines.append(f"\n🗑 Delete all: <code>/queue clear</code>")
+                                    lines.append(f"▶️ Force post next: <code>/qpost 1</code>")
+                                    send_text(chat_id, "\n".join(lines), reply_to=msg_id, thread_id=thread_id)
+                            except Exception as qe:
+                                send_text(chat_id, f"❌ Queue error: {qe}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /queue clear — delete entire social queue (with confirmation)
+                        elif text.strip().lower() in ["/queue clear", "/qclear", "/clearqueue"]:
+                            try:
+                                with _social_queue_lock:
+                                    count = len(_social_queue)
+                                if count == 0:
+                                    send_text(chat_id, "📭 Queue is already empty.", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    # Store pending confirmation
+                                    kv_set(f"queue_clear_confirm_{chat_id}", {"at": utcnow().isoformat(), "count": count})
+                                    send_text(chat_id,
+                                        f"⚠️ <b>Confirm queue clear</b>\n"
+                                        f"This will delete ALL <b>{count}</b> item(s) from the social queue.\n"
+                                        f"They will NOT be posted anywhere.\n\n"
+                                        f"Type <code>/queue clear confirm</code> to proceed.",
+                                        reply_to=msg_id, thread_id=thread_id)
+                            except Exception as qce:
+                                send_text(chat_id, f"❌ Error: {qce}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /queue clear confirm — actually clear the queue
+                        elif text.strip().lower() in ["/queue clear confirm", "/qclear confirm"]:
+                            try:
+                                confirm = kv_get(f"queue_clear_confirm_{chat_id}", None)
+                                if not confirm:
+                                    send_text(chat_id, "⚠️ No pending clear request. Run <code>/queue clear</code> first.", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    with _social_queue_lock:
+                                        count = len(_social_queue)
+                                        _social_queue.clear()
+                                    kv_set(f"queue_clear_confirm_{chat_id}", None)
+                                    persist_state()
+                                    send_text(chat_id,
+                                        f"🗑 <b>Queue cleared</b> — {count} item(s) deleted.\n"
+                                        f"<i>Nothing was posted. Queue is now empty.</i>",
+                                        reply_to=msg_id, thread_id=thread_id)
+                                    log.info(f"[QUEUE] Cleared by {first_name}: {count} items deleted")
+                            except Exception as qcce:
+                                send_text(chat_id, f"❌ Error: {qcce}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /qdel <n> — delete specific item from social queue by position
+                        elif text.strip().lower().startswith("/qdel "):
+                            try:
+                                n = int(text.strip().split()[1]) - 1  # convert to 0-indexed
+                                with _social_queue_lock:
+                                    if 0 <= n < len(_social_queue):
+                                        removed = _social_queue.pop(n)
+                                        title = removed.get("title", removed.get("key_label","?"))[:60]
+                                        send_text(chat_id,
+                                            f"🗑 <b>Deleted from queue:</b>\n{title}\n"
+                                            f"<i>{len(_social_queue)} item(s) remaining</i>",
+                                            reply_to=msg_id, thread_id=thread_id)
+                                        persist_state()
+                                    else:
+                                        send_text(chat_id, f"❌ No item #{n+1} in queue. Use <code>/queue</code> to see current list.", reply_to=msg_id, thread_id=thread_id)
+                            except (ValueError, IndexError):
+                                send_text(chat_id, "Usage: <code>/qdel 2</code> (deletes item #2 from queue)", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as qde:
+                                send_text(chat_id, f"❌ Error: {qde}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /qpost <n> — force post specific item from queue immediately
+                        elif text.strip().lower().startswith("/qpost "):
+                            try:
+                                n = int(text.strip().split()[1]) - 1  # 0-indexed
+                                with _social_queue_lock:
+                                    if 0 <= n < len(_social_queue):
+                                        item = _social_queue.pop(n)
+                                    else:
+                                        item = None
+                                if not item:
+                                    send_text(chat_id, f"❌ No item #{n+1} in queue.", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    title = item.get("title", item.get("key_label","?"))[:60]
+                                    send_text(chat_id, f"▶️ Force posting: <b>{title}</b>...", reply_to=msg_id, thread_id=thread_id)
+                                    try:
+                                        import io as _io
+                                        img_buf = _io.BytesIO(item["img_bytes"])
+                                        result = post_to_buffer(img_buf, item["caption"])
+                                        tg_ok = item.get("tg_ok", False)
+                                        if not tg_ok and item.get("post_telegram", True):
+                                            tg_ok = send_photo_to_community(item["img_bytes"], item["caption"])
+                                        fb = "✅" if result.get("fb") else "❌"
+                                        ig = "✅" if result.get("ig") else "❌"
+                                        x  = "✅" if result.get("x")  else "❌"
+                                        tg = "✅" if tg_ok else "❌"
+                                        send_text(chat_id,
+                                            f"✅ <b>Force posted!</b>\n"
+                                            f"Telegram {tg} · FB {fb} · IG {ig} · X {x}\n"
+                                            f"<i>{len(_social_queue)} item(s) still in queue</i>",
+                                            reply_to=msg_id, thread_id=thread_id)
+                                        globals()["_last_social_post_time"] = utcnow()
+                                        persist_state()
+                                    except Exception as fpe:
+                                        # Put back in queue if post failed
+                                        with _social_queue_lock:
+                                            _social_queue.insert(n, item)
+                                        send_text(chat_id, f"❌ Force post failed: {fpe}\nItem put back in queue.", reply_to=msg_id, thread_id=thread_id)
+                            except (ValueError, IndexError):
+                                send_text(chat_id, "Usage: <code>/qpost 1</code> (force posts item #1)", reply_to=msg_id, thread_id=thread_id)
+                            except Exception as qpe:
+                                send_text(chat_id, f"❌ Error: {qpe}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /qrefresh — reset the social queue timer + show queue status
+                        elif text.strip().lower() in ["/qrefresh", "/queue refresh", "/resetqueue"]:
+                            try:
+                                globals()["_last_social_post_time"] = None
+                                with _social_queue_lock:
+                                    count = len(_social_queue)
+                                # Check what's blocking
+                                blocked_reason = ""
+                                if posting_paused():
+                                    blocked_reason = "\n⚠️ POSTING_PAUSED=true — queue won't post until unpaused"
+                                elif not can_post_social():
+                                    limit = 3 if not is_day_social() else 20
+                                    blocked_reason = (f"\n⚠️ Night mode social limit ({limit}/night) reached."
+                                                      f"\nUse <code>/qpost N</code> to force post individual items."
+                                                      f"\nOr queue will auto-clear at 6AM MVT.")
+                                send_text(chat_id,
+                                    f"🔄 <b>Queue timer reset!</b>\n"
+                                    f"{count} item(s) in queue{blocked_reason}\n\n"
+                                    f"Use <code>/queue</code> to see items and <code>/qpost N</code> to force post.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                                log.info(f"[QUEUE] Timer reset by {first_name}")
+                            except Exception as qre:
+                                send_text(chat_id, f"❌ Error: {qre}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /release — flush ALL pending cards to Content Lab right now (when team is actively reviewing)
+                        elif text.strip().lower() in ["/release", "/flush", "/releaseall"]:
+                            try:
+                                pending = [(k, v) for k, v in approval_queue.items()
+                                           if not v.get("_content_lab_sent") and not v.get("_content_lab_suppressed")]
+                                if not pending:
+                                    send_text(chat_id, "📭 No pending cards waiting to be released — all already sent to Content Lab.", reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    send_text(chat_id,
+                                        f"📤 Releasing <b>{len(pending)}</b> pending card(s) to Content Lab now...\n"
+                                        f"<i>Use this when your team is actively reviewing so you don't miss anything.</i>",
+                                        reply_to=msg_id, thread_id=thread_id)
+                                    released = 0
+                                    for k, v in pending:
+                                        try:
+                                            _send_approval_card(k, v, force=True)
+                                            released += 1
+                                        except Exception as rel_e:
+                                            log.error(f"/release {k}: {rel_e}")
+                                    send_text(chat_id,
+                                        f"✅ Released <b>{released}/{len(pending)}</b> card(s) to Content Lab.\n"
+                                        f"Use <code>/pending</code> to see full queue.",
+                                        reply_to=msg_id, thread_id=thread_id)
+                            except Exception as e:
+                                log.error(f"/release: {e}")
+                                send_text(chat_id, f"❌ Release error: {e}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /why <key> — explain how a queued card scored
+                        elif text.strip().lower().startswith("/why"):
+                            key = text.strip()[4:].strip()
+                            if not key:
+                                send_text(chat_id,
+                                    "Usage: <code>/why en12</code> — explains how a card in the "
+                                    "queue scored. Run <code>/pending</code> to see keys.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                            elif key not in approval_queue:
+                                send_text(chat_id,
+                                    f"Key <code>{key}</code> not in the queue. "
+                                    f"<code>/pending</code> shows what's waiting.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                item = approval_queue[key]
+                                art = {
+                                    "title": item.get("title",""),
+                                    "summary": item.get("summary",""),
+                                    "cat": item.get("cat","LOCAL"),
+                                    "source": item.get("source",""),
+                                    "lang": item.get("lang","en"),
+                                    "_cluster_size": item.get("_cluster_size", 1),
+                                    "_trend_theme": item.get("_trend_theme",""),
+                                }
+                                try:
+                                    send_text(chat_id, format_score_breakdown(art),
+                                              reply_to=msg_id, thread_id=thread_id)
+                                except Exception as e:
+                                    log.error(f"/why: {e}")
+                                    send_text(chat_id, f"❌ Couldn't explain {key}: {e}",
+                                              reply_to=msg_id, thread_id=thread_id)
+
+                        # /weather — force send a weather card preview to core team
+                        elif text.strip().lower() in ["/weather", "/wx"]:
+                            send_text(chat_id, "🌤️ Fetching weather + island data... ⏳",
+                                      reply_to=msg_id, thread_id=thread_id)
+                            def _send_weather_preview(_chat_id=chat_id, _thread_id=thread_id, _name=first_name):
+                                try:
+                                    data = get_weather_data()
+                                    if not data:
+                                        send_text(_chat_id, "❌ Weather data unavailable right now.", thread_id=_thread_id)
+                                        return
+                                    islands = get_island_forecasts()
+                                    prayer_info = get_prayer_times()
+                                    card = generate_weather_card(data, island_data=islands if islands else None,
+                                                                 prayer_data=prayer_info)
+                                    current = data.get("current", {})
+                                    temp  = round(current.get("temperature_2m", 29))
+                                    code  = current.get("weathercode", 0)
+                                    emoji, condition = weather_code_to_info(code)
+                                    source = data.get("_source", "")
+                                    island_lines = ""
+                                    if islands:
+                                        island_lines = "\n\n🏝 <b>Weather Watch</b>\n"
+                                        for isl in islands:
+                                            _out = isl.get("outlook") or f"{isl.get('temp',29)}°C • wind {isl.get('wind',0)} km/h"
+                                            island_lines += f"📍 <b>{isl['name']}</b> — {_out}\n"
+                                    caption = (
+                                        f"🌤️ <b>Weather Preview — Malé, Maldives</b>\n"
+                                        f"{emoji} {temp}°C — {condition}"
+                                        f"{island_lines}\n"
+                                        f"<i>Data: {source} · Preview only, not posted to community</i>"
+                                    )
+                                    send_photo(_chat_id, card, caption, thread_id=_thread_id)
+                                    log.info(f"🌤️ Weather preview sent to core team by {_name}")
+                                except Exception as e:
+                                    log.error(f"/weather preview: {e}")
+                                    send_text(_chat_id, f"❌ Error: {e}", thread_id=_thread_id)
+                            threading.Thread(target=_send_weather_preview, daemon=True).start()
+
+                        # /alert [white|yellow|orange|red] — preview an alert card in Content Lab
+                        elif text.strip().lower().startswith("/alert"):
+                            arg = text.strip().lower().replace("/alert", "").strip()
+                            valid_levels = ["white", "yellow", "orange", "red"]
+
+                            if arg == "status" or arg == "":
+                                # Show current real conditions + whether an alert would fire
+                                send_text(chat_id, "🔍 Checking current conditions... ⏳",
+                                          reply_to=msg_id, thread_id=thread_id)
+                                def _alert_status(_cid=chat_id, _tid=thread_id):
+                                    try:
+                                        data = get_weather_data()
+                                        if not data:
+                                            send_text(_cid, "❌ Weather data unavailable.", thread_id=_tid); return
+                                        should, lvl, txt = detect_weather_alert(data)
+                                        cur = data.get("current", {})
+                                        w = round(cur.get("windspeed_10m",0))
+                                        g = round(cur.get("windgust_10m",0))
+                                        if should:
+                                            cfg = MMS_ALERT_LEVELS[lvl]
+                                            msg = (f"{cfg['emoji']} <b>{cfg['label']} would fire right now</b>\n\n"
+                                                   f"{txt}\n\n"
+                                                   f"Wind {w} km/h, gusts {g} km/h\n"
+                                                   f"Alerts used today: {weather_alerts_today['count']}/2\n\n"
+                                                   f"Use <code>/alert {lvl}</code> to preview the card.")
+                                        else:
+                                            msg = (f"🟢 <b>No alert conditions right now</b>\n\n"
+                                                   f"Wind {w} km/h, gusts {g} km/h — all calm.\n"
+                                                   f"Alerts used today: {weather_alerts_today['count']}/2\n\n"
+                                                   f"Preview any level: <code>/alert white|yellow|orange|red</code>")
+                                        send_text(_cid, msg, thread_id=_tid)
+                                    except Exception as e:
+                                        log.error(f"/alert status: {e}")
+                                        send_text(_cid, f"❌ Error: {e}", thread_id=_tid)
+                                threading.Thread(target=_alert_status, daemon=True).start()
+
+                            elif arg in valid_levels:
+                                send_text(chat_id, f"⚠️ Building {arg.upper()} alert preview... ⏳",
+                                          reply_to=msg_id, thread_id=thread_id)
+                                def _alert_preview(_lvl=arg, _cid=chat_id, _tid=thread_id):
+                                    try:
+                                        data = get_weather_data()
+                                        if not data:
+                                            send_text(_cid, "❌ Weather data unavailable.", thread_id=_tid); return
+                                        islands = get_island_forecasts()
+                                        prayer_info = get_prayer_times()
+                                        cfg = MMS_ALERT_LEVELS[_lvl]
+                                        # Build a representative alert_text for this level
+                                        sample_text = {
+                                            "white":  "Strong winds and rough seas expected over Malé. Wind 32 km/h, gusts 56 km/h. Stay informed and take normal precautions.",
+                                            "yellow": "Thunderstorms, strong winds and rough seas expected over Malé. Wind 42 km/h, gusts 66 km/h. Caution advised. Avoid unnecessary sea travel.",
+                                            "orange": "Severe winds and very rough seas expected over Malé. Wind 58 km/h, gusts 82 km/h. Avoid sea travel. Secure loose objects. Stay indoors if possible.",
+                                            "red":    "DANGEROUS storm conditions over Malé. Wind 78 km/h, gusts 105 km/h. DANGER. Do not travel by sea. Stay indoors and follow official guidance.",
+                                        }[_lvl]
+                                        card = generate_weather_card(data, alert_mode=True,
+                                                                     alert_text=sample_text, alert_level=_lvl,
+                                                                     island_data=islands if islands else None,
+                                                                     prayer_data=prayer_info)
+                                        caption = (
+                                            f"{cfg['emoji']} <b>{cfg['label']} PREVIEW — {cfg['headline']}</b>\n\n"
+                                            f"{sample_text}\n\n"
+                                            f"<i>⚠️ This is a PREVIEW only — not posted to community.\n"
+                                            f"Real alerts fire automatically when conditions are met.</i>"
+                                        )
+                                        send_photo(_cid, card, caption, thread_id=_tid)
+                                        log.info(f"⚠️ Alert preview ({_lvl}) sent to core team")
+                                    except Exception as e:
+                                        log.error(f"/alert preview: {e}")
+                                        send_text(_cid, f"❌ Error: {e}", thread_id=_tid)
+                                threading.Thread(target=_alert_preview, daemon=True).start()
+                            else:
+                                send_text(chat_id,
+                                    "Usage:\n"
+                                    "<code>/alert status</code> — check if an alert would fire now\n"
+                                    "<code>/alert white</code> — preview White (informational)\n"
+                                    "<code>/alert yellow</code> — preview Yellow (advisory)\n"
+                                    "<code>/alert orange</code> — preview Orange (warning)\n"
+                                    "<code>/alert red</code> — preview Red (emergency)",
+                                    reply_to=msg_id, thread_id=thread_id)
+
+                        # /brief — generate the AI nightly editorial brief on demand
+                        elif text.strip().lower() in ["/brief", "/journalist", "/editor"]:
+                            send_text(chat_id, "🧠 Generating editorial brief from today's news... give me a moment ⏳", reply_to=msg_id, thread_id=thread_id)
+                            threading.Thread(target=send_ai_journalist_brief, daemon=True).start()
+
+                        # /pending — list all cards waiting for approval
+                        elif text.strip().lower() in ["/pending", "/queue", "/list"]:
+                            if not approval_queue:
+                                send_text(chat_id, "📭 No cards waiting for approval right now.", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                lines = ["📋 <b>Cards waiting for approval:</b>\n"]
+                                now_ = utcnow()
+                                for k, v in approval_queue.items():
+                                    age_min = int((now_ - v["created_at"]).total_seconds() / 60)
+                                    lang_flag = "🇲🇻" if v["lang"] == "dv" else "🇬🇧"
+                                    if v["lang"] == "en":
+                                        left = max(0, 30 - age_min)
+                                        timing = f"auto-posts in {left}m"
+                                    else:
+                                        left = max(0, 120 - age_min)
+                                        timing = f"expires in {left}m"
+                                    lines.append(f"🔑 <b>{k.upper()}</b> {lang_flag} — {v['title'][:55]} <i>({timing})</i>")
+                                send_text(chat_id, "\n".join(lines), reply_to=msg_id, thread_id=thread_id)
+
+                        # @SamugaNewsBot card [dhivehi text] — manual card creation
+                        elif tagged and (
+                            "create card and post" in clean.lower() or
+                            "create card and send to community" in clean.lower() or
+                            "create card and send to core team" in clean.lower() or
+                            "create card and post to core team" in clean.lower() or
+                            "create card and post to community" in clean.lower()
+                        ):
+                            log.info(f"🃏 Manual card — raw text: {repr(text[:200])}")
+                            log.info(f"🃏 Manual card — photo: {bool(photo)}")
+                            cl = clean.lower()
+                            if "core team" in cl or "coreteam" in cl:
+                                destination = "coreteam"
+                            elif "community" in cl:
+                                destination = "community"
+                            else:
+                                destination = "all"
+
+                            # Detect category from command
+                            manual_cat = "LOCAL"
+                            if any(w in cl for w in ["breaking", "breaking news"]):          manual_cat = "BREAKING"
+                            elif any(w in cl for w in ["political", "politics", "parliament", "government"]): manual_cat = "POLITICAL"
+                            elif any(w in cl for w in ["lifestyle", "culture", "health", "tourism", "travel", "resort", "weather", "storm"]): manual_cat = "LIFESTYLE"
+                            elif any(w in cl for w in ["sports", "sport", "football", "soccer"]): manual_cat = "SPORTS"
+                            elif any(w in cl for w in ["world", "international", "global"]): manual_cat = "LOCAL"
+
+                            # Extract the content text (everything before @SamugaNewsBot)
+                            # The text comes from the photo caption or message, minus the command
+                            raw_text = text  # original full text including caption
+                            # Remove the bot mention and ALL command variants
+                            # Do this BEFORE any other processing
+                            cmd_variants = [
+                                "create card and post to coreteam",
+                                "create card and post to core team",
+                                "create card and send to coreteam",
+                                "create card and send to core team",
+                                "create card and post to community",
+                                "create card and send to community",
+                                "create card and post",
+                            ]
+                            raw_lower = raw_text.lower()
+                            for cmd in cmd_variants:
+                                idx = raw_lower.find(cmd)
+                                if idx != -1:
+                                    raw_text = raw_text[:idx].strip()
+                                    raw_lower = raw_text.lower()
+                                    break
+                            # Remove bot mention (anywhere in text)
+                            raw_text = re.sub(r"@\w+", "", raw_text).strip()
+                            raw_text = raw_text.strip()
+
+                            if video and not photo:
+                                send_text(chat_id, "Videos are not supported for cards — please send a photo instead 📸", reply_to=msg_id, thread_id=thread_id)
+                            elif not raw_text and not photo:
+                                send_text(chat_id, "Send a photo with caption text, or just text, then add the command at the end.", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                # ── Parse headline / subheading split ──────────────────
+                                # Split on blank lines first, then strip category keywords
+                                # from each part individually (handles Dhivehi text with
+                                # English category word at the bottom correctly).
+                                CAT_KWS = ["breaking news","breaking","political","politics",
+                                           "sports","sport","football","soccer","lifestyle",
+                                           "world","international","global","tourism","weather",
+                                           "local","culture","health","travel","resort","storm"]
+                                def strip_cat_kws(t):
+                                    """
+                                    Return empty string if this paragraph IS a category keyword
+                                    (possibly with punctuation/spaces). Otherwise return unchanged.
+                                    We only discard a whole paragraph that is purely a category
+                                    label — never strip keywords from inside real sentences.
+                                    """
+                                    cleaned = t.strip().rstrip("!.,;:").strip().lower()
+                                    if cleaned in CAT_KWS:
+                                        return ""
+                                    return t
+
+                                raw_parts = [p.strip() for p in raw_text.split("\n\n") if p.strip()]
+                                # A part that is ONLY a category keyword (after stripping) = discard
+                                parts = []
+                                for p in raw_parts:
+                                    cleaned = strip_cat_kws(p)
+                                    if cleaned:          # still has real content → keep
+                                        parts.append(cleaned)
+                                    # else: it was just "Breaking" or "Sports" → discard silently
+
+                                has_thaana_input = any('\u0780'<=c<='\u07bf' for c in raw_text)
+                                SUBHEAD_CARD_LIMIT = 80 if has_thaana_input else 150
+                                if len(parts) >= 2:
+                                    card_headline = parts[0]
+                                    card_subhead  = " ".join(parts[1:])  # everything after first blank line
+                                    if len(card_subhead) <= SUBHEAD_CARD_LIMIT:
+                                        # Fits on card — pass as one block with newline so
+                                        # generate_card renders it as headline + smaller body.
+                                        # We use ". " trick for English, space for Dhivehi path.
+                                        if has_thaana_input:
+                                            content_text = card_headline + " " + card_subhead
+                                        else:
+                                            content_text = card_headline.rstrip(".") + ". " + card_subhead
+                                        caption_subhead = ""   # already on card, not needed in caption
+                                    else:
+                                        # Too long — card gets headline only, subhead goes to caption
+                                        content_text  = card_headline
+                                        caption_subhead = card_subhead
+                                else:
+                                    # No blank line = just headline, no subhead
+                                    content_text    = raw_text
+                                    caption_subhead = ""
+
+                                content_text = content_text or "Samuga Media"
+                                try:
+                                    send_text(chat_id, "⏳ Creating card...", thread_id=thread_id)
+
+                                    # Use uploaded photo as background if available
+                                    if photo:
+                                        bg = download_telegram_photo(photo)
+                                        log.info("🖼️ Using uploaded photo as card background")
+                                    else:
+                                        bg = fetch_background_image(None, cat=manual_cat)
+
+                                    ts_now = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+                                    card = generate_card(content_text, "Samuga Media", ts_now, manual_cat, bg)
+                                    cat_emoji = {"BREAKING":"🚨","LOCAL":"🇲🇻","POLITICAL":"🏛️","LIFESTYLE":"🌴","SPORTS":"🏅","FOOTBALL":"⚽","DISASTER":"🚨","WORLD":"🌍","WEATHER":"🌤️","TOURISM":"✈️"}.get(manual_cat,"📰")
+                                    breaking_prefix = "🚨 <b>BREAKING NEWS</b>\n\n" if manual_cat in ["BREAKING", "DISASTER"] else ""
+                                    # Caption: headline (always) + subhead if it didn't fit on card
+                                    caption_body = card_headline if len(parts) >= 2 else content_text
+                                    if caption_subhead:
+                                        caption_body = caption_body + "\n\n" + caption_subhead
+                                    full_caption = (
+                                        breaking_prefix + cat_emoji + " " + caption_body + "\n\n"
+                                        "📡 <b>Samuga Media</b> | @samugacommunity"
+                                    )
+
+                                    # Build/publish website article for manual social cards.
+                                    manual_article = manual_publish_website_article(
+                                        title=card_headline if len(parts) >= 2 else content_text,
+                                        subheading=caption_subhead,
+                                        category=manual_cat,
+                                        source_link=SAMUGA_CAPTION_LINK,
+                                        publish_now=(destination != "all")
+                                    )
+
+                                    posted = []
+                                    _social_fired = False
+
+                                    if destination == "community":
+                                        card.seek(0)
+                                        if send_to_telegram(card, full_caption):
+                                            posted.append("Community ✅")
+                                        if manual_article:
+                                            posted.append("Website ✅")
+
+                                    elif destination == "coreteam":
+                                        card.seek(0)
+                                        if send_photo(CORE_TEAM_CHAT_ID, card, full_caption, thread_id=CONTENT_LAB_THREAD_ID):
+                                            posted.append("Content Lab ✅")
+                                        if manual_article:
+                                            posted.append("Website ✅")
+
+                                    elif destination == "all":
+                                        # ── PREVIEW + CONFIRM gate ────────────────────────
+                                        # Do NOT post anywhere public yet.
+                                        # Send the card as a PREVIEW to the core team only,
+                                        # then wait for /confirm (posts everywhere) or /cancel.
+                                        card_bytes_stored = card.getvalue()
+                                        _pending_manual_post.clear()
+                                        _pending_manual_post.update({
+                                            "card_bytes":   card_bytes_stored,
+                                            "full_caption": full_caption,
+                                            "chat_id":      chat_id,
+                                            "thread_id":    thread_id,
+                                            "first_name":   first_name,
+                                            "created_at":   utcnow(),
+                                            "manual_article": manual_article,
+                                        })
+                                        # Send preview card to core team
+                                        preview = io.BytesIO(card_bytes_stored)
+                                        preview_caption = (
+                                            f"👀 <b>PREVIEW — not posted yet</b>\n\n"
+                                            f"{full_caption}\n\n"
+                                            f"━━━━━━━━━━━━━━\n"
+                                            f"📲 This will post to <b>Telegram Community + Facebook + Instagram + X</b>.\n"
+                                            f"🌐 Website article draft is prepared in parallel and will publish on /confirm.\n"
+                                            f"✅ <code>/confirm</code> to post everywhere\n"
+                                            f"❌ <code>/cancel</code> to discard"
+                                        )
+                                        send_photo(chat_id, preview, preview_caption, thread_id=thread_id)
+                                        log.info(f"🃏 Manual card PREVIEW sent to core team by {first_name} — awaiting /confirm")
+                                        _social_fired = True  # block fallthrough
+
+                                    if not _social_fired:
+                                        if posted:
+                                            send_text(chat_id, "✅ Posted to: " + ", ".join(posted), reply_to=msg_id, thread_id=thread_id)
+                                            log.info(f"✅ Manual card posted to: {posted}")
+                                        else:
+                                            send_text(chat_id, "❌ Failed to post.", reply_to=msg_id, thread_id=thread_id)
+
+                                except Exception as e:
+                                    log.error(f"Manual card: {e}")
+                                    send_text(chat_id, f"❌ Error: {e}", reply_to=msg_id, thread_id=thread_id)
+
+                        # /read command — store context for this session
+                        elif text.strip().lower().startswith("/read"):
+                            context_text = text.strip()[5:].strip()
+                            if context_text:
+                                core_team_session_context[chat_id] = context_text
+                                send_text(chat_id, "Got it! I have read that and will use it as context for this session 📖", reply_to=msg_id, thread_id=thread_id)
+                                log.info(f"📖 Session context stored: {context_text[:60]}...")
+                            else:
+                                send_text(chat_id, "Send it like this: /read [paste your content here]", reply_to=msg_id, thread_id=thread_id)
+
+                        # /confirm — post pending preview card EVERYWHERE (Telegram + FB + IG + X)
+                        elif text.strip().lower() in ["/confirm"]:
+                            if not _pending_manual_post:
+                                send_text(chat_id,
+                                    "Nothing waiting to confirm. "
+                                    "Use <code>create card and post</code> first.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                age = (utcnow() - _pending_manual_post["created_at"]).total_seconds()
+                                if age > 600:
+                                    _pending_manual_post.clear()
+                                    send_text(chat_id,
+                                        "⏰ That preview expired (10 min window). "
+                                        "Create a new one with <code>create card and post</code>.",
+                                        reply_to=msg_id, thread_id=thread_id)
+                                else:
+                                    try:
+                                        cap = _pending_manual_post["full_caption"]
+                                        cbytes = _pending_manual_post["card_bytes"]
+                                        send_text(chat_id, "🚀 Posting to all platforms... ⏳",
+                                                  reply_to=msg_id, thread_id=thread_id)
+
+                                        done = []
+                                        # 1) Telegram community
+                                        tg_buf = io.BytesIO(cbytes)
+                                        tg_ok_now = bool(send_to_telegram(tg_buf, cap))
+                                        tg_icon = "✅" if tg_ok_now else "❌"
+
+                                        # Socials via 10-min queue — confirmation after posting
+                                        social_buf = io.BytesIO(cbytes)
+                                        queue_for_social(social_buf, cap,
+                                            notify_chat_id=chat_id,
+                                            notify_thread_id=thread_id,
+                                            key_label="Manual post",
+                                            tg_ok=tg_ok_now,
+                                            post_telegram=False)  # already posted above
+
+                                        manual_article = _pending_manual_post.get("manual_article") or {}
+                                        website_ok = False
+                                        if manual_article and not manual_article.get("published"):
+                                            try:
+                                                db_publish_article_for_website(
+                                                    article_id=manual_article.get("article_id"),
+                                                    title=manual_article.get("title",""),
+                                                    summary=manual_article.get("summary",""),
+                                                    category=manual_article.get("category","LOCAL"),
+                                                    source=SAMUGA_PUBLIC_SOURCE,
+                                                    link=SAMUGA_CAPTION_LINK,
+                                                    lang="en",
+                                                    score=190,
+                                                    reliability=95,
+                                                    is_breaking=(manual_article.get("category","").upper() in ("BREAKING","DISASTER"))
+                                                )
+                                                website_ok = True
+                                            except Exception as we:
+                                                log.error(f"Manual website publish on /confirm: {we}")
+                                        elif manual_article:
+                                            website_ok = True
+
+                                        _pending_manual_post.clear()
+                                        send_text(chat_id,
+                                            f"✅ <b>Confirmed by {first_name}</b>\n"
+                                            f"Telegram {tg_icon} · FB IG X ⏳ queued"
+                                            + (f" · Website ✅" if website_ok else ""),
+                                            reply_to=msg_id, thread_id=thread_id)
+                                        log.info(f"✅ Manual card confirmed by {first_name} — posted everywhere")
+                                    except Exception as e:
+                                        log.error(f"/confirm: {e}")
+                                        send_text(chat_id, f"❌ Error posting: {e}",
+                                                  reply_to=msg_id, thread_id=thread_id)
+
+                        # /cancel — discard the pending preview card
+                        elif text.strip().lower() in ["/cancel"]:
+                            if not _pending_manual_post:
+                                send_text(chat_id, "Nothing to cancel.",
+                                          reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                _pending_manual_post.clear()
+                                send_text(chat_id,
+                                    f"❌ <b>Cancelled by {first_name}</b> — card discarded, nothing posted. Website draft not published.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                                log.info(f"❌ Manual card cancelled by {first_name}")
+
+                        # /ai on|off — toggle proactive mode
+                        elif text.strip().lower() in ["/ai on", "/ai off"]:
+                            global _ai_proactive_mode
+                            _ai_proactive_mode = "on" in text.strip().lower()
+                            status = "ON 🟢" if _ai_proactive_mode else "OFF 🔴"
+                            msg_txt = (
+                                f"🧠 Samuga AI proactive mode: <b>{status}</b>\n\n"
+                                + ("I'll jump in when I have something useful to add — tag me anytime too."
+                                   if _ai_proactive_mode else
+                                   "Silent mode. I'll only respond when you tag me.")
+                            )
+                            send_text(chat_id, msg_txt, reply_to=msg_id, thread_id=thread_id)
+                            log.info(f"🧠 AI proactive mode: {status} by {first_name}")
+
+                        # /remember — save something to persistent team memory
+                        elif text.strip().lower().startswith("/remember"):
+                            mem_text = text.strip()[9:].strip()
+                            if not mem_text:
+                                send_text(chat_id,
+                                    "What should I remember? Try: <code>/remember our audience loves political stories on weekdays</code>",
+                                    reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                # Classify category automatically
+                                cat = "fact"
+                                low = mem_text.lower()
+                                if any(w in low for w in ["audience","people","readers","followers","engage","viral","perform"]):
+                                    cat = "audience"
+                                elif any(w in low for w in ["style","tone","voice","format","caption","card","design"]):
+                                    cat = "style"
+                                elif any(w in low for w in ["decided","decision","agreed","policy","rule","always","never"]):
+                                    cat = "decision"
+                                elif any(w in low for w in ["prefer","like","don't like","avoid","focus"]):
+                                    cat = "preference"
+                                mem_add(mem_text, category=cat, added_by=first_name)
+                                send_text(chat_id,
+                                    f"✅ Got it, saved to memory [{cat}]\n<i>\"{mem_text}\"</i>",
+                                    reply_to=msg_id, thread_id=thread_id)
+                                log.info(f"🧠 Memory added by {first_name}: {mem_text[:60]}")
+
+                        # /memory — show what's stored
+                        elif text.strip().lower() in ["/memory", "/memories"]:
+                            items = mem_list(25)
+                            if not items:
+                                send_text(chat_id,
+                                    "Nothing in memory yet. Use <code>/remember [something]</code> to teach me.",
+                                    reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                lines = ["🧠 <b>What I remember about Samuga:</b>\n"]
+                                for item in items:
+                                    lines.append(f"• {item}")
+                                send_text(chat_id, "\n".join(lines), reply_to=msg_id, thread_id=thread_id)
+
+                        # /forget — clear last memory or all
+                        elif text.strip().lower().startswith("/forget"):
+                            arg = text.strip()[7:].strip().lower()
+                            if arg == "all":
+                                mem_clear_all()
+                                send_text(chat_id, "🗑️ All memories cleared.", reply_to=msg_id, thread_id=thread_id)
+                            elif arg == "last":
+                                mem_delete_last(1)
+                                send_text(chat_id, "🗑️ Last memory deleted.", reply_to=msg_id, thread_id=thread_id)
+                            else:
+                                send_text(chat_id,
+                                    "Use <code>/forget last</code> to delete the last one, or <code>/forget all</code> to wipe everything.",
+                                    reply_to=msg_id, thread_id=thread_id)
+
+                        # Respond when tagged OR proactively when AI mode is on
+                        elif tagged or (_ai_proactive_mode and not text.strip().startswith("/")):
+                            if not clean: clean = text.strip()
+                            is_proactive = not tagged
+
+                            # For proactive — ask Claude if it should actually respond
+                            needs_search = False
+                            if is_proactive:
+                                should, needs_search = should_respond_proactively(clean, sender_name=display_name)
+                                if not should:
+                                    continue  # stay quiet
+
+                            # Check if tagged message needs web search
+                            if tagged and not needs_search:
+                                needs_search = needs_web_search(clean)
+
+                            log.info(f"🧠 Core team {'[proactive]' if is_proactive else '[tagged]'} {display_name}: {clean[:50]}")
+                            session_ctx = core_team_session_context.get(chat_id, "")
+
+                            def _reply_coreteam():
+                                try:
+                                    # First check if this is a story-timeline question
+                                    story_answer = answer_story_query(clean)
+                                    if story_answer:
+                                        send_text(chat_id, story_answer,
+                                                  reply_to=msg_id if tagged else None, thread_id=thread_id)
+                                        return
+
+                                    if is_dhivehi(clean):
+                                        headlines = get_local_headlines()
+                                        ctx = "\n".join(headlines[:5]) if headlines else ""
+                                        reply = chat_with_gemini_dhivehi(clean, ctx, history)
+                                        if not reply:
+                                            reply = chat_with_coreteam(clean, display_name, sender_info,
+                                                                        history, session_ctx, needs_search)
+                                    else:
+                                        reply = chat_with_coreteam(clean, display_name, sender_info,
+                                                                    history, session_ctx, needs_search)
+
+                                    if reply:
+                                        add_to_conversation(user_id, "user", clean)
+                                        add_to_conversation(user_id, "assistant", reply)
+                                        # Proactive replies don't quote/reply — they just speak naturally
+                                        send_text(chat_id, reply,
+                                                  reply_to=msg_id if tagged else None,
+                                                  thread_id=thread_id)
+                                except Exception as e:
+                                    log.error(f"Core team reply: {e}")
+
+                            threading.Thread(target=_reply_coreteam, daemon=True).start()
+
+                    # Regular public group — only respond when tagged, using the same public Samuga AI brain
+                    elif tagged and clean:
+                        log.info(f"💬 Public group Samuga AI {display_name}: {clean[:50]}")
+                        try:
+                            reply = public_samuga_ai_chat(
+                                message=clean,
+                                platform="telegram_group",
+                                user_key=f"{chat_id}:{user_id}",
+                                session_id=str(chat_id),
+                                lang=("dv" if is_dhivehi(clean) else "en")
+                            )
+                        except Exception as e:
+                            log.error(f"Unified public group chat failed: {e}")
+                            reply = "Small issue on my side bro 😅 Try again in a moment."
+                        send_text(chat_id, reply, reply_to=msg_id, thread_id=thread_id)
+        except Exception as e:
+            log.error(f"Update loop: {e}"); time.sleep(5)
+
+
+def _watchdog_prune_recent(key, minutes=90):
+    cutoff = utcnow() - timedelta(minutes=minutes)
+    arr = _ops_watchdog_state.setdefault(key, [])
+    _ops_watchdog_state[key] = [t for t in arr if isinstance(t, datetime) and t > cutoff]
+    return _ops_watchdog_state[key]
+
+def note_duplicate_skip():
+    arr = _watchdog_prune_recent("duplicate_hits_recent", minutes=120)
+    arr.append(utcnow())
+
+def note_manual_post_failure():
+    arr = _watchdog_prune_recent("manual_post_failures", minutes=180)
+    arr.append(utcnow())
+
+def _watchdog_source_alerts():
+    issues = []
+    snapshot = source_health_summary(limit=20)
+    alerts = _ops_watchdog_state.setdefault("source_health_alerts", {})
+    now = utcnow()
+
+    for row in snapshot:
+        src = row.get("source", "Unknown")
+        key = _caption_match_key(src) or src.lower()
+        last = alerts.get(key)
+
+        if row.get("fetches", 0) >= 4 and row.get("fails", 0) >= 3:
+            if not last or (now - last).total_seconds() > 6 * 3600:
+                issues.append(f"Source looks unstable: <b>{src}</b> has {row.get('fails',0)} failures in {row.get('fetches',0)} fetches.")
+                alerts[key] = now
+
+        if row.get("fetches", 0) >= 6 and row.get("empty", 0) >= max(4, int(row.get("fetches",0) * 0.7)):
+            if not last or (now - last).total_seconds() > 8 * 3600:
+                issues.append(f"Source mostly empty: <b>{src}</b> returned empty {row.get('empty',0)} times in {row.get('fetches',0)} fetches.")
+                alerts[key] = now
+
+        items_total = row.get("items_total", 0)
+        ads_total = row.get("ads_total", 0)
+        if (items_total + ads_total) >= 6 and ads_total >= max(4, items_total):
+            if not last or (now - last).total_seconds() > 8 * 3600:
+                issues.append(f"Source is ad-heavy/noisy: <b>{src}</b> skipped {ads_total} ad-like items.")
+                alerts[key] = now
+
+        if row.get("health", 70) <= 40 and row.get("fetches", 0) >= 4:
+            if not last or (now - last).total_seconds() > 8 * 3600:
+                issues.append(f"Source health is weak: <b>{src}</b> scored only {row.get('health')}/100.")
+                alerts[key] = now
+    return issues
+
+def ops_watchdog():
+    """Operational watchdog. Sends Alert messages when something looks wrong before damage spreads."""
+    try:
+        issues = []
+
+        # 1. Website Dhivehi leak / unexpected rise
+        try:
+            stats = db_bot_stats() or {}
+            posted_dv = int(stats.get("posted_dv", 0))
+            last_posted_dv = int(_ops_watchdog_state.get("last_posted_dv", 0) or 0)
+
+            if posted_dv > 0 and os.environ.get("DHIVEHI_WEBSITE_APPROVED", "false").lower() != "true":
+                issues.append(f"Dhivehi website leak detected: {posted_dv} posted Dhivehi article(s) still visible. Use /hide_dv if needed.")
+
+            if posted_dv > last_posted_dv and last_posted_dv >= 0:
+                issues.append(f"Dhivehi website count increased: {last_posted_dv} → {posted_dv}. Check recent website output.")
+            _ops_watchdog_state["last_posted_dv"] = posted_dv
+        except Exception as e:
+            issues.append(f"Stats check failed: {str(e)[:120]}")
+
+        # 2. Queue flood / stuck queue
+        try:
+            if len(approval_queue) >= 25:
+                issues.append(f"Approval queue is high: {len(approval_queue)} items waiting.")
+            if len(_social_queue) >= 12:
+                issues.append(f"Social queue is high: {len(_social_queue)} items waiting.")
+
+            if len(_social_queue) > 0:
+                if not _ops_watchdog_state.get("social_queue_stuck_since"):
+                    _ops_watchdog_state["social_queue_stuck_since"] = utcnow()
+                stuck_for = (utcnow() - _ops_watchdog_state["social_queue_stuck_since"]).total_seconds()
+                if stuck_for > 45 * 60 and _last_social_post_time:
+                    issues.append(f"Social queue may be stuck: {len(_social_queue)} item(s) still waiting after {int(stuck_for//60)} minutes.")
+            else:
+                _ops_watchdog_state["social_queue_stuck_since"] = None
         except Exception:
             pass
 
-# ── SCHEDULED JOBS ───────────────────────────────────────────────────────────
-
-async def job_payment_confirmation_watchdog(ctx: ContextTypes.DEFAULT_TYPE):
-    """Remind operator/admin when a paid booking is waiting too long for confirmation."""
-    pool = await get_pool()
-
-    async def _send_admin_alert(text: str, reply_markup=None):
+        # 3. Duplicate flood signal
         try:
-            await ctx.bot.send_message(
-                ADMIN_GROUP_ID, text, parse_mode="Markdown",
-                message_thread_id=ADMIN_THREAD_ID, reply_markup=reply_markup
-            )
-        except Exception as e:
-            logger.error(f"Payment watchdog admin thread send failed: {e}")
-            try:
-                await ctx.bot.send_message(ADMIN_GROUP_ID, text, parse_mode="Markdown", reply_markup=reply_markup)
-            except Exception as e2:
-                logger.error(f"Payment watchdog admin fallback failed: {e2}")
+            dup_recent = _watchdog_prune_recent("duplicate_hits_recent", minutes=120)
+            if len(dup_recent) >= 8:
+                issues.append(f"Duplicate flood detected: {len(dup_recent)} duplicate story skips in the last 2 hours.")
+        except Exception:
+            pass
 
-    async with pool.acquire() as conn:
-        first_alerts = await conn.fetch("""
-            UPDATE bookings b
-            SET payment_alert_stage=1, payment_alert_last_at=NOW()
-            FROM operators o, schedules s
-            WHERE b.operator_id=o.id AND b.schedule_id=s.id
-              AND b.status='pending_confirmation'
-              AND COALESCE(b.payment_alert_stage,0)=0
-              AND b.created_at <= NOW() - INTERVAL '15 minutes'
-            RETURNING b.id, b.booking_ref, b.customer_telegram_id, b.customer_name,
-                      b.travel_date, b.passenger_count, b.total_amount,
-                      o.telegram_id AS operator_telegram_id, o.business_name AS operator_name,
-                      o.owner_contact AS operator_contact,
-                      s.route_from, s.route_to, s.departure_time
-        """)
-        second_alerts = await conn.fetch("""
-            UPDATE bookings b
-            SET payment_alert_stage=2, payment_alert_last_at=NOW()
-            FROM operators o, schedules s
-            WHERE b.operator_id=o.id AND b.schedule_id=s.id
-              AND b.status='pending_confirmation'
-              AND COALESCE(b.payment_alert_stage,0)=1
-              AND b.created_at <= NOW() - INTERVAL '20 minutes'
-            RETURNING b.id, b.booking_ref, b.customer_telegram_id, b.customer_name,
-                      b.travel_date, b.passenger_count, b.total_amount,
-                      o.telegram_id AS operator_telegram_id, o.business_name AS operator_name,
-                      o.owner_contact AS operator_contact,
-                      s.route_from, s.route_to, s.departure_time
-        """)
-
-    for b in first_alerts:
-        op_buttons = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📩 Contact Customer", url=f"tg://user?id={b['customer_telegram_id']}")],
-            [InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{b['id']}")],
-            [InlineKeyboardButton("❌ Not Received / Wrong Transfer", callback_data=f"not_received_{b['id']}")]
-        ])
+        # 4. Manual publish failures
         try:
-            await ctx.bot.send_message(
-                b["operator_telegram_id"],
-                f"⏳ *Payment confirmation pending*\n\n"
-                f"Booking `{b['booking_ref']}` has been waiting about *15 minutes*.\n\n"
-                f"👤 Customer: {b['customer_name'] or 'N/A'}\n"
-                f"📍 {b['route_from']} → {b['route_to']}\n"
-                f"📅 {b['travel_date']} @ {b['departure_time']}\n"
-                f"👥 {b['passenger_count']} pax | 💰 MVR {b['total_amount']}\n\n"
-                f"Please check your bank and confirm, or mark not received.",
-                parse_mode="Markdown", reply_markup=op_buttons
-            )
-        except Exception as e:
-            logger.error(f"Payment watchdog first operator ping failed: {e}")
+            fails = _watchdog_prune_recent("manual_post_failures", minutes=180)
+            if len(fails) >= 3:
+                issues.append(f"Manual website/banner failures repeating: {len(fails)} failure(s) in the last 3 hours.")
+        except Exception:
+            pass
 
-        await _send_admin_alert(
-            f"⚠️ *Payment waiting too long*\n\n"
-            f"Booking: `{b['booking_ref']}`\n"
-            f"Operator: *{b['operator_name']}* ({b['operator_contact'] or 'no contact'})\n"
-            f"Customer: {b['customer_name'] or 'N/A'} (`{b['customer_telegram_id']}`)\n"
-            f"Trip: {b['route_from']} → {b['route_to']}\n"
-            f"Date: {b['travel_date']} @ {b['departure_time']}\n"
-            f"Pax: {b['passenger_count']} | Amount: MVR {b['total_amount']}\n\n"
-            f"Bot pinged the operator. If not approved in another 5 minutes, it will ping again.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📩 Contact Operator", url=f"tg://user?id={b['operator_telegram_id']}"),
-                InlineKeyboardButton("📩 Contact Customer", url=f"tg://user?id={b['customer_telegram_id']}")
-            ]])
+        # 5. Source health warnings
+        try:
+            issues.extend(_watchdog_source_alerts())
+        except Exception as e:
+            issues.append(f"Source health watchdog failed: {str(e)[:120]}")
+
+        # 6. Weather rate-limit reminder
+        try:
+            lb = (_last_buffer_error or {}).get("response", "")
+            if "429" in str(lb):
+                issues.append("Recent platform/API 429 seen in posting pipeline. Watch cache / queue pacing.")
+        except Exception:
+            pass
+
+        if issues:
+            alert_admin("<br/>".join(dict.fromkeys(issues)), dedupe_key="ops_watchdog", cooloff_minutes=30)
+    except Exception as e:
+        log.error(f"ops_watchdog: {e}")
+
+
+def _website_public_url_for(article_id, slug):
+    base = (SAMUGA_CAPTION_LINK or "https://samugamedia.com").rstrip("/")
+    if slug:
+        return f"{base}/{slug}"
+    return f"{base}/article.html?id={article_id}"
+
+def _format_web_rows(rows, show_status=False):
+    if not rows:
+        return "— none —"
+    out = []
+    for row in rows:
+        # supports tuples from db_list/search
+        article_id, title, slug = row[0], row[1], row[2]
+        category = row[3] if len(row) > 3 else ""
+        lang = row[4] if len(row) > 4 else ""
+        status = row[3] if show_status else ""
+        url = _website_public_url_for(article_id, slug)
+        extra = []
+        if show_status and status:
+            extra.append(status)
+        if category:
+            extra.append(str(category))
+        if lang:
+            extra.append(str(lang))
+        extra_txt = f" ({' • '.join(extra)})" if extra else ""
+        out.append(f"• <b>{title[:80]}</b>{extra_txt}\n  <code>{article_id}</code>\n  {url}")
+    return "\n".join(out)
+
+def _format_web_analytics(days=7):
+    a = db_website_analytics(days=days, limit=5) or {}
+    lines = [f"🌐 <b>Website analytics ({int(a.get('days', days))}d)</b>"]
+    lines.append(f"📰 Posted: <b>{a.get('posted_total', 0)}</b>")
+    lines.append(f"👁️ Website views: <b>{a.get('total_views', 0)}</b>")
+    lines.append(f"📲 Telegram views: <b>{a.get('total_tg_views', 0)}</b>")
+    lines.append(f"❤️ Meta engagement: <b>{a.get('total_meta_engagement', 0)}</b>")
+
+    top_views = a.get("top_views") or []
+    if top_views:
+        lines.append("\n🏆 <b>Top website views</b>")
+        for aid, title, slug, views in top_views[:5]:
+            lines.append(f"• {title[:75]} — <b>{int(views or 0)}</b> views")
+
+    top_tg = a.get("top_tg") or []
+    if top_tg:
+        lines.append("\n📲 <b>Top Telegram views</b>")
+        for aid, title, slug, tg_views in top_tg[:5]:
+            lines.append(f"• {title[:75]} — <b>{int(tg_views or 0)}</b> TG views")
+
+    top_meta = a.get("top_meta") or []
+    if top_meta:
+        lines.append("\n❤️ <b>Top Meta engagement</b>")
+        for aid, title, slug, meta_eng in top_meta[:5]:
+            lines.append(f"• {title[:75]} — <b>{int(meta_eng or 0)}</b> interactions")
+    return "\n".join(lines)
+
+def format_bot_stats():
+    """Human-friendly stats block for Telegram."""
+    stats = db_bot_stats() or {}
+    lines = ["📊 <b>Samuga Bot Stats</b>"]
+    lines.append(f"🗂️ Articles total: <b>{stats.get('articles_total', 0)}</b>")
+    lines.append(f"🌐 Website posted: <b>{stats.get('posted_total', 0)}</b>")
+    lines.append(f"🙈 Website hidden: <b>{stats.get('hidden_total', 0)}</b>")
+    lines.append(f"🇲🇻 Posted Dhivehi on website: <b>{stats.get('posted_dv', 0)}</b>")
+    lines.append(f"🇬🇧 Posted English on website: <b>{stats.get('posted_en', 0)}</b>")
+    lines.append(f"🕓 Articles found in last 24h: <b>{stats.get('last_24h', 0)}</b>")
+    lines.append(f"🧠 Approval queue: <b>{len(approval_queue)}</b>")
+    lines.append(f"📲 Social queue: <b>{len(_social_queue)}</b>")
+    lines.append(f"📚 Seen title memory: <b>{len(recent_story_titles)}</b>")
+    lines.append(f"🎯 Banner active: <b>{'Yes' if website_banner.get('active') else 'No'}</b>")
+    if website_banner.get("image_url"):
+        lines.append("🖼️ Banner image: saved")
+    return "\n".join(lines)
+
+
+# ── Website API ───────────────────────────────────────────────────────────────
+from flask import Flask, jsonify, request
+import html as _html
+import re as _api_re
+
+api_app = Flask(__name__)
+api_app.json.ensure_ascii = False
+
+def _api_clean_text(value, limit=900):
+    """Clean DB text for website/API rendering."""
+    value = str(value or "")
+    value = _html.unescape(value)
+    value = strip_source_links(value)
+    value = _api_re.sub(r"<[^>]+>", " ", value)
+    value = _api_re.sub(r"https?://\S+", "", value)
+    value = _api_re.sub(r"\s+", " ", value).strip()
+    return value[:limit]
+
+def _api_has_thaana(text):
+    return any("\u0780" <= ch <= "\u07BF" for ch in str(text or ""))
+
+def _api_lang(title, summary, lang):
+    # Website language must be based on actual script quality.
+    # Do not show Latin Thaana in the Dhivehi side.
+    text = (title or "") + " " + (summary or "")
+    return "dv" if _api_has_thaana(text) else "en"
+
+def _api_category(cat, title="", summary=""):
+    try:
+        return canonical_category(cat or "LOCAL", title or "", summary or "")
+    except Exception:
+        return (cat or "LOCAL").upper()
+
+
+def ensure_article_engine_body(article_id, title, summary, category,
+                               lang="en", is_breaking=False):
+    """Return a full website article body for an article, generating and
+    persisting one via Claude if the stored body is missing/too short."""
+    try:
+        body = generate_website_article_body(
+            title=title, summary=summary, category=category,
+            source=SAMUGA_PUBLIC_SOURCE, is_breaking=is_breaking
         )
-
-    for b in second_alerts:
-        op_buttons = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📩 Contact Customer", url=f"tg://user?id={b['customer_telegram_id']}")],
-            [InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{b['id']}")],
-            [InlineKeyboardButton("❌ Not Received / Wrong Transfer", callback_data=f"not_received_{b['id']}")]
-        ])
-        try:
-            await ctx.bot.send_message(
-                b["operator_telegram_id"],
-                f"🚨 *Second reminder — customer is waiting*\n\n"
-                f"Booking `{b['booking_ref']}` is still not approved.\n\n"
-                f"👤 Customer: {b['customer_name'] or 'N/A'}\n"
-                f"📍 {b['route_from']} → {b['route_to']}\n"
-                f"📅 {b['travel_date']} @ {b['departure_time']}\n"
-                f"👥 {b['passenger_count']} pax | 💰 MVR {b['total_amount']}\n\n"
-                f"Please confirm now or mark not received. Samuga Travels may contact you directly.",
-                parse_mode="Markdown", reply_markup=op_buttons
+    except Exception as e:
+        log.error(f"ensure_article_engine_body generate error: {e}")
+        body = ""
+    body = (body or "").strip()
+    if not body:
+        body = summary or title or ""
+    # Persist so we don't regenerate on every request.
+    try:
+        if article_id and body:
+            db_execute(
+                "UPDATE articles SET article_body=%s WHERE id=%s",
+                (body, article_id),
             )
-        except Exception as e:
-            logger.error(f"Payment watchdog second operator ping failed: {e}")
+    except Exception as e:
+        log.warning(f"ensure_article_engine_body persist skipped: {e}")
+    return body
 
-        await _send_admin_alert(
-            f"🚨 *Second ping — operator still has not approved*\n\n"
-            f"Booking: `{b['booking_ref']}`\n"
-            f"Operator: *{b['operator_name']}* ({b['operator_contact'] or 'no contact'})\n"
-            f"Customer: {b['customer_name'] or 'N/A'} (`{b['customer_telegram_id']}`)\n"
-            f"Trip: {b['route_from']} → {b['route_to']}\n"
-            f"Date: {b['travel_date']} @ {b['departure_time']}\n"
-            f"Pax: {b['passenger_count']} | Amount: MVR {b['total_amount']}\n\n"
-            f"Please reach out to the operator directly.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📩 Contact Operator", url=f"tg://user?id={b['operator_telegram_id']}"),
-                InlineKeyboardButton("📩 Contact Customer", url=f"tg://user?id={b['customer_telegram_id']}")
-            ]])
-        )
 
-async def job_morning_ping(ctx: ContextTypes.DEFAULT_TYPE):
-    """20:00 MVT — ping all operators to prepare tomorrow's schedules"""
-    from datetime import timedelta as _td
-    tomorrow = datetime.now().date() + _td(days=1)
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        # Get all approved operators with active schedules
-        operators = await conn.fetch("""
-            SELECT DISTINCT o.telegram_id, o.business_name, o.id as op_id
-            FROM operators o
-            JOIN schedules s ON s.operator_id = o.id
-            WHERE o.status = 'approved' AND s.is_active = TRUE
-        """)
-        for op in operators:
-            scheds = await conn.fetch("""
-                SELECT * FROM schedules WHERE operator_id=$1 AND is_active=TRUE
-                ORDER BY departure_time
-            """, op["op_id"])
-            if not scheds:
+def _clean_article_engine_output(body, title=""):
+    """Clean a generated English article body for website/API rendering:
+    strip HTML/source links/stray title echo and normalize whitespace per
+    paragraph (preserving paragraph breaks)."""
+    body = str(body or "")
+    body = _html.unescape(body)
+    body = strip_source_links(body)
+    body = _api_re.sub(r"<[^>]+>", " ", body)
+    body = _api_re.sub(r"https?://\S+", "", body)
+    paras = []
+    for para in _api_re.split(r"\n\s*\n", body):
+        para = _api_re.sub(r"\s+", " ", para).strip()
+        if not para:
+            continue
+        # Drop a leading line that just repeats the title.
+        if title and para.lower() == title.strip().lower():
+            continue
+        paras.append(para)
+    return "\n\n".join(paras)[:6000]
+
+
+def related_articles_for_api(article_id, category, limit=4):
+    """Return a small list of related published articles in the same category
+    (excluding the current article) for the website 'related' rail."""
+    try:
+        rows = db_execute("""
+            SELECT id, title, category, posted_at, found_at, article_slug
+            FROM articles
+            WHERE category=%s
+              AND id<>%s
+              AND (status IN ('posted','published','social_posted') OR (status='queued' AND lang='en'))
+            ORDER BY COALESCE(posted_at, found_at) DESC NULLS LAST
+            LIMIT %s
+        """, (category, article_id, limit), fetch="all") or []
+    except Exception as e:
+        log.error(f"related_articles_for_api error: {e}")
+        return []
+    related = []
+    for r in rows:
+        rid, title, cat, posted_at, found_at, slug = r
+        dt = posted_at or found_at
+        related.append({
+            "id": rid,
+            "title": _api_clean_text(strip_source_links(title), 160),
+            "category": _api_category(cat),
+            "slug": slug or "",
+            "time": mvt_display_time(dt),
+        })
+    return related
+
+def _absolute_api_url(path):
+    """Build full Railway URL for GitHub Pages."""
+    return request.url_root.rstrip("/") + path
+
+@api_app.after_request
+def add_cors_headers(response):
+    """Allow GitHub Pages to read this API."""
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return response
+
+@api_app.get("/")
+def api_home():
+    return jsonify({
+        "status": "online",
+        "name": "Samuga News Bot API",
+        "version": SAMUGA_VERSION,
+        "endpoints": ["/api/stories", "/api/article?id=ARTICLE_ID", "/api/health", "/api/chat", "/api/public-interest"]
+    })
+
+@api_app.get("/api/health")
+def api_health():
+    latest = None
+    try:
+        row = db_execute("""
+            SELECT title, posted_at, found_at, status
+            FROM articles
+            WHERE (status IN ('posted','published','social_posted') OR (status='queued' AND lang='en'))
+            ORDER BY COALESCE(posted_at, found_at) DESC NULLS LAST
+            LIMIT 1
+        """, fetch="one")
+        if row:
+            latest = {
+                "title": _api_clean_text(row[0], 160),
+                "time": (row[1] or row[2]).strftime("%d %b %Y • %H:%M") if (row[1] or row[2]) else "Recent",
+                "status": row[3]
+            }
+    except Exception as e:
+        log.error(f"Website API /api/health error: {e}")
+
+    return jsonify({
+        "status": "online",
+        "db_enabled": bool(DB_ENABLED),
+        "latest": latest,
+        "queue": len(_social_queue) if "_social_queue" in globals() else 0
+    })
+
+
+@api_app.get("/api/banner")
+def api_banner():
+    """Optional sponsored/banner block for the website frontend."""
+    try:
+        return jsonify({
+            "active": bool(website_banner.get("active")),
+            "text": str(website_banner.get("text") or ""),
+            "image_url": str(website_banner.get("image_url") or ""),
+            "updated_at": website_banner.get("updated_at"),
+        })
+    except Exception as e:
+        log.error(f"Website API /api/banner error: {e}")
+        return jsonify({"active": False, "text": "", "updated_at": None})
+
+@api_app.get("/api/public-interest")
+def api_public_interest():
+    """Aggregated public Samuga AI interest radar. No private messages exposed."""
+    try:
+        rows = db_execute("""
+            SELECT topic, platform, SUM(count) AS total
+            FROM public_interest_daily
+            WHERE day >= CURRENT_DATE - INTERVAL '7 days'
+            GROUP BY topic, platform
+            ORDER BY total DESC
+            LIMIT 50
+        """, fetch="all") or []
+        items = [{"topic": r[0], "platform": r[1], "count": int(r[2] or 0)} for r in rows]
+        return jsonify({"ok": True, "window": "7d", "items": items})
+    except Exception as e:
+        log.error(f"Website API /api/public-interest error: {e}")
+        return jsonify({"ok": False, "items": []})
+
+@api_app.get("/api/stories")
+def api_stories():
+    """
+    Public website feed for GitHub Pages.
+
+    Important:
+    The website should show article data, not Telegram/Instagram square cards.
+    So this endpoint returns clean JSON only: title, summary, category, source, url, time, lang.
+    It reads all statuses that mean public/published. Queue items are marked posted
+    by queue_for_social() when they enter the public publishing queue.
+    """
+    try:
+        rows = db_execute("""
+            SELECT id, title, summary, category, source, link, posted_at, found_at, lang, status, article_excerpt, article_slug
+            FROM articles
+            WHERE (status IN ('posted','published','social_posted') OR (status='queued' AND lang='en'))
+            ORDER BY COALESCE(posted_at, found_at) DESC NULLS LAST
+            LIMIT 80
+        """, fetch="all") or []
+
+        stories = []
+        seen_titles = set()
+
+        for row in rows:
+            article_id, title, summary, category, source, link, posted_at, found_at, lang, status, article_excerpt, article_slug = row
+            dt = posted_at or found_at
+            safe_title = _api_clean_text(strip_source_links(title), 500)
+            safe_summary = _api_clean_text(strip_source_links(article_excerpt or summary), 420)
+            if not safe_title:
                 continue
-            sched_lines = "\n".join([
-                f"  ⏰ {s['departure_time']} — {s['route_from']} → {s['route_to']} | 📌 {s.get('location','Jetty No. 1, Male')}"
-                for s in scheds
-            ])
-            buttons = [[InlineKeyboardButton("📅 View & Manage Schedule", callback_data="op_today")]]
-            try:
-                from datetime import timezone, timedelta as _tdtz
-                mvt_hour = (datetime.now(timezone.utc) + _tdtz(hours=5)).hour
-                if 5 <= mvt_hour < 12:
-                    greeting = "🌅 Good morning"
-                    note = "Have a great day on the water! 🌊"
-                elif 12 <= mvt_hour < 17:
-                    greeting = "☀️ Good afternoon"
-                    note = "Hope the afternoon trips are going smoothly! 🚤"
-                elif 17 <= mvt_hour < 21:
-                    greeting = "🌇 Good evening"
-                    note = "Please review tomorrow's trips before the day starts. 🌊"
-                else:
-                    greeting = "🌙 Good night"
-                    note = "Please review tomorrow's trips before the day starts. 🌊"
-                await ctx.bot.send_message(op["telegram_id"],
-                    f"{greeting}, *{op['business_name']}!*\n\n"
-                    f"Tomorrow's schedule check — *{tomorrow}*:\n{sched_lines}\n\n"
-                    f"⚠️ Any changes? Tap below to manage departures before customers arrive.\n\n"
-                    f"_{note}_",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup(buttons))
-            except Exception as e:
-                logger.error(f"Daily ping failed for {op['telegram_id']}: {e}")
+            if not public_text_is_safe(f"{safe_title}\n{safe_summary}"):
+                continue
 
-async def job_subscription_check(ctx: ContextTypes.DEFAULT_TYPE):
+            # Hide old broken Latin Thaana rows from the website feed.
+            # New rows are fixed before publish by normalize_article_language_for_public().
+            if looks_latin_thaana(f"{safe_title} {safe_summary}") and not _api_has_thaana(f"{safe_title} {safe_summary}"):
+                continue
+
+            # Dedupe same headline in API so the site stays clean
+            key = _caption_match_key(safe_title) or safe_title.lower()[:80]
+            if key in seen_titles:
+                continue
+            seen_titles.add(key)
+
+            stories.append({
+                "id": article_id,
+                "title": safe_title,
+                "summary": safe_summary,
+                "category": _api_category(category, safe_title, safe_summary),
+                "source": SAMUGA_PUBLIC_SOURCE,
+                "url": f"article.html?id={article_id}",
+                "community_url": SAMUGA_PUBLIC_LINK,
+                "article_api": _absolute_api_url(f"/api/article?id={article_id}"),
+                "slug": article_slug or make_article_slug(safe_title, article_id),
+                "time": mvt_display_time(dt),
+                "lang": _api_lang(safe_title, safe_summary, lang),
+                "status": status or "posted"
+            })
+
+        return jsonify(stories)
+
+    except Exception as e:
+        log.error(f"Website API /api/stories error: {e}")
+        return jsonify([])
+
+
+@api_app.get("/api/article")
+def api_article():
+    """Full website article page data for GitHub Pages article.html?id=..."""
+    try:
+        article_id = (request.args.get("id") or "").strip()
+        if not article_id:
+            return jsonify({"error": "missing article id"}), 400
+
+        row = db_execute("""
+            SELECT id, title, summary, category, source, link, posted_at, found_at, lang, status,
+                   article_excerpt, article_body, article_slug, is_breaking
+            FROM articles
+            WHERE id=%s
+              AND (status IN ('posted','published','social_posted') OR (status='queued' AND lang='en'))
+            LIMIT 1
+        """, (article_id,), fetch="one")
+
+        if not row:
+            return jsonify({"error": "article not found"}), 404
+
+        (rid, title, summary, category, source, link, posted_at, found_at, lang, status,
+         article_excerpt, article_body, article_slug, is_breaking) = row
+
+        safe_title = _api_clean_text(strip_source_links(title), 500)
+        safe_summary = _api_clean_text(strip_source_links(summary), 1800)
+        if not public_text_is_safe(f"{safe_title}\n{safe_summary}"):
+            return jsonify({"error": "article failed public safety check"}), 404
+        if looks_latin_thaana(f"{safe_title} {safe_summary}") and not _api_has_thaana(f"{safe_title} {safe_summary}"):
+            return jsonify({"error": "article language cleanup pending"}), 404
+        safe_category = _api_category(category, safe_title, safe_summary)
+        safe_lang = _api_lang(safe_title, safe_summary, lang)
+        body = article_body
+        if not body or len(str(body).strip()) < 80:
+            body = ensure_article_engine_body(
+                rid, safe_title, safe_summary, safe_category,
+                lang=safe_lang, is_breaking=bool(is_breaking)
+            )
+        body = _clean_article_engine_output(body, title=safe_title) if safe_lang == "en" else _api_clean_text(body, 4000)
+        dt = posted_at or found_at
+
+        return jsonify({
+            "id": rid,
+            "title": safe_title,
+            "excerpt": _api_clean_text(article_excerpt or safe_summary, 360),
+            "body": body,
+            "paragraphs": [p.strip() for p in str(body or "").split("\n\n") if p.strip()],
+            "category": safe_category,
+            "source": SAMUGA_PUBLIC_SOURCE,
+            "source_url": SAMUGA_PUBLIC_LINK,
+            "community_url": SAMUGA_PUBLIC_LINK,
+            "url": SAMUGA_PUBLIC_LINK,
+            "time": mvt_display_time(dt),
+            "lang": safe_lang,
+            "slug": article_slug or make_article_slug(safe_title, rid),
+            "related": related_articles_for_api(rid, safe_category, limit=4)
+        })
+    except Exception as e:
+        log.error(f"Website API /api/article error: {e}")
+        return jsonify({"error": "article unavailable"}), 200
+
+
+# ── Public Website Chat API ───────────────────────────────────────────────────
+# Safe public chat endpoint for samugamedia.com.
+# IMPORTANT: Website chat should answer from TODAY'S Samuga archive first,
+# not from old model memory. It also cleans markdown so replies feel human.
+_PUBLIC_CHAT_RATE = {}  # ip -> [timestamps]
+_PUBLIC_CHAT_LIMIT = 12
+_PUBLIC_CHAT_WINDOW = 60 * 10  # 12 messages per 10 minutes per IP
+_PUBLIC_CHAT_MAX_CHARS = 600
+_PUBLIC_CHAT_BLOCKED_COMMANDS = [
+    "/approve", "/approved", "/reject", "/confirm", "/cancel", "/ai ",
+    "/remember", "/forget", "/memory", "/learning", "/post", "/queue",
+    "approve this", "reject this", "post this", "send to telegram", "send to facebook",
+    "send to instagram", "content lab", "core team", "admin", "database", "token",
+    "api key", "password", "environment variable"
+]
+_PUBLIC_CHAT_NEWS_WORDS = [
+    "latest", "news", "headline", "headlines", "today", "update", "updates", "breaking",
+    "current", "what happened", "briefing", "summary", "summarize", "ޚަބަރު", "އަޕްޑޭޓް", "މިއަދު"
+]
+
+def _public_chat_client_id():
+    """Return a stable-ish client ID for rate limiting behind Railway/proxies."""
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:80]
+    return (request.remote_addr or "unknown")[:80]
+
+def _public_chat_allowed(client_id):
+    """Simple in-memory rate limiter. Good enough for Phase 1 public chat."""
+    now = time.time()
+    window_start = now - _PUBLIC_CHAT_WINDOW
+    hits = [t for t in _PUBLIC_CHAT_RATE.get(client_id, []) if t >= window_start]
+    if len(hits) >= _PUBLIC_CHAT_LIMIT:
+        _PUBLIC_CHAT_RATE[client_id] = hits
+        return False, _PUBLIC_CHAT_LIMIT
+    hits.append(now)
+    _PUBLIC_CHAT_RATE[client_id] = hits
+    if len(_PUBLIC_CHAT_RATE) > 1000:
+        for k in list(_PUBLIC_CHAT_RATE.keys())[:200]:
+            _PUBLIC_CHAT_RATE.pop(k, None)
+    return True, _PUBLIC_CHAT_LIMIT
+
+def _public_chat_clean_message(message):
+    """Clean and cap public website message."""
+    msg = _api_clean_text(message, _PUBLIC_CHAT_MAX_CHARS)
+    return msg.strip()
+
+def _public_chat_is_blocked(message):
+    """Block admin/control prompts from the public website chat."""
+    low = (message or "").lower()
+    if low.startswith("/") and not low.startswith("/search"):
+        return True
+    return any(term in low for term in _PUBLIC_CHAT_BLOCKED_COMMANDS)
+
+def _public_chat_is_news_query(message):
+    low = (message or "").lower()
+    return any(w in low for w in _PUBLIC_CHAT_NEWS_WORDS)
+
+def _public_chat_clean_reply(reply):
+    """Make AI replies feel like chat, not raw Markdown/bot formatting."""
+    txt = str(reply or "")
+    txt = txt.replace("**", "")
+    txt = txt.replace("__", "")
+    txt = txt.replace("###", "")
+    txt = txt.replace("##", "")
+    txt = txt.replace("#", "")
+    txt = re.sub(r"\n\s*[-*]\s+", "\n• ", txt)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)
+    txt = re.sub(r"[ \t]{2,}", " ", txt)
+    return _api_clean_text(txt.strip(), 1000)
+
+def _public_chat_latest_rows(lang=None, limit=8, hours=30):
+    """Read newest public website stories from DB. Default: recent/current only."""
+    try:
+        since = utcnow() - timedelta(hours=hours)
+        rows = db_execute("""
+            SELECT title, summary, category, source, link, posted_at, found_at, lang, status
+            FROM articles
+            WHERE status IN ('posted','published','social_posted')
+              AND COALESCE(posted_at, found_at) >= %s
+            ORDER BY COALESCE(posted_at, found_at) DESC NULLS LAST
+            LIMIT %s
+        """, (since, limit * 3), fetch="all") or []
+
+        clean = []
+        seen = set()
+        for title, summary, category, source, link, posted_at, found_at, row_lang, status in rows:
+            safe_title = _api_clean_text(strip_source_links(title), 260)
+            safe_summary = _api_clean_text(strip_source_links(summary), 520)
+            if not safe_title or not public_text_is_safe(f"{safe_title}\n{safe_summary}"):
+                continue
+            if not public_text_is_safe(f"{safe_title}\n{safe_summary}"):
+                continue
+            detected = _api_lang(safe_title, safe_summary, row_lang)
+            if lang in ("en", "dv") and detected != lang:
+                continue
+            key = _caption_match_key(safe_title) or safe_title.lower()[:90]
+            if key in seen:
+                continue
+            seen.add(key)
+            dt = posted_at or found_at
+            clean.append({
+                "title": safe_title,
+                "summary": safe_summary,
+                "category": _api_category(category, safe_title, safe_summary),
+                "source": SAMUGA_PUBLIC_SOURCE,
+                "url": SAMUGA_PUBLIC_LINK,
+                "time": mvt_display_time(dt),
+                "lang": detected
+            })
+            if len(clean) >= limit:
+                break
+        return clean
+    except Exception as e:
+        log.error(f"Website chat latest rows error: {e}")
+        return []
+
+def _public_chat_search_rows(message, lang=None, limit=6):
+    """Simple archive search from website DB for specific user topics."""
+    try:
+        terms = [w for w in re.findall(r"[\w\u0780-\u07BF]{3,}", message or "") if w.lower() not in {
+            "latest", "news", "today", "what", "about", "show", "give", "tell", "ޚަބަރު", "މިއަދު"
+        }]
+        if not terms:
+            return []
+        # Use up to 3 strong terms to avoid huge/slow search.
+        q = " ".join(terms[:3])
+        pattern = f"%{q}%"
+        rows = db_execute("""
+            SELECT title, summary, category, source, link, posted_at, found_at, lang, status
+            FROM articles
+            WHERE status IN ('posted','published','social_posted')
+              AND (title ILIKE %s OR summary ILIKE %s OR source ILIKE %s)
+            ORDER BY COALESCE(posted_at, found_at) DESC NULLS LAST
+            LIMIT %s
+        """, (pattern, pattern, pattern, limit * 3), fetch="all") or []
+        clean = []
+        seen = set()
+        for title, summary, category, source, link, posted_at, found_at, row_lang, status in rows:
+            safe_title = _api_clean_text(strip_source_links(title), 260)
+            safe_summary = _api_clean_text(strip_source_links(summary), 520)
+            detected = _api_lang(safe_title, safe_summary, row_lang)
+            if lang in ("en", "dv") and detected != lang:
+                continue
+            key = _caption_match_key(safe_title) or safe_title.lower()[:90]
+            if not safe_title or key in seen:
+                continue
+            seen.add(key)
+            dt = posted_at or found_at
+            clean.append({
+                "title": safe_title,
+                "summary": safe_summary,
+                "category": _api_category(category, safe_title, safe_summary),
+                "source": SAMUGA_PUBLIC_SOURCE,
+                "url": SAMUGA_PUBLIC_LINK,
+                "time": mvt_display_time(dt),
+                "lang": detected
+            })
+            if len(clean) >= limit:
+                break
+        return clean
+    except Exception as e:
+        log.error(f"Website chat search rows error: {e}")
+        return []
+
+def _public_chat_format_news(rows, lang="en", searched=False):
+    """Friendly website chat answer from real Samuga DB rows."""
+    if not rows:
+        return "I don't see fresh public stories in the website archive yet bro. Try again in a few minutes." if lang != "dv" else "ވެބްސައިޓް އާކައިވްގައި އަދި އާ ޚަބަރެއް ނުފެނޭ. މަދުކޮށް ފަހުން އަހާލާ."
+
+    if lang == "dv":
+        intro = "މިއީ ސަމުގާގެ އެންމެ އާ ޚަބަރުތައް:" if not searched else "މިއީ ހޯދުމުން ފެނުނު ޚަބަރުތައް:"
+        parts = [intro]
+        for i, r in enumerate(rows[:6], 1):
+            line = f"{i}. {r['title']}"
+            if r.get("summary"):
+                line += f" — {r['summary'][:180]}"
+            parts.append(line)
+        parts.append("އެއް ޚަބަރެއް ތަފްސީލުން ބުނަން ބޭނުންތަ؟")
+        return "\n\n".join(parts)
+
+    intro = "Here are the latest stories on Samuga right now:" if not searched else "Here’s what I found in the Samuga archive:"
+    parts = [intro]
+    for i, r in enumerate(rows[:6], 1):
+        line = f"{i}. {r['title']}"
+        if r.get("summary"):
+            line += f" — {r['summary'][:190]}"
+        line += f"\nSamuga Media • {r.get('time','Recent')}"
+        parts.append(line)
+    parts.append("Ask me about any one of these and I’ll explain it clearly.")
+    return "\n\n".join(parts)
+
+def _public_chat_tavily_context(message, lang="en"):
+    """Live search context for website chat, sanitized so no source URLs leak."""
+    try:
+        if not TAVILY_API_KEY:
+            return ""
+        q = f"Maldives latest news {message}" if lang != "dv" else f"Maldives news {message}"
+        ctx = tavily_search(q)
+        return strip_source_links(_api_clean_text(ctx, 1200))
+    except Exception as e:
+        log.warning(f"Website chat Tavily context failed: {e}")
+        return ""
+
+def _public_chat_context(rows):
+    lines = []
+    for r in rows[:8]:
+        lines.append(f"- {r['title']} | {r.get('summary','')} | Samuga Media | {r.get('time','')}")
+    return "\n".join(lines)
+
+
+
+# ── Unified Public Samuga AI Brain ────────────────────────────────────────────
+# Website chat, public Telegram DM, and future WhatsApp should all call this one
+# function so Samuga AI has one public personality, one memory, and one analytics stream.
+
+_PUBLIC_TOPIC_KEYWORDS = {
+    "housing": ["housing","flat","flats","rent","land","apartment","gedhoru","hiya","vinares","ފްލެޓް","ބިން"],
+    "politics": ["politics","president","minister","majlis","parliament","mdp","pnc","ppm","election","bill","law","ރައީސް","މަޖިލީސް"],
+    "economy": ["economy","dollar","usd","mvr","rufiyaa","debt","tax","price","inflation","budget","ޑޮލަރ","ރުފިޔާ"],
+    "tourism": ["tourism","tourist","resort","travel","airport","arrival","hotel","ޓޫރިޒަމް"],
+    "crime": ["police","arrest","court","murder","stab","drug","gang","theft","ފުލުހުން","ކޯޓު"],
+    "health": ["health","hospital","doctor","clinic","aasandha","disease","ސިއްހަތު","ހޮސްޕިޓަލް"],
+    "education": ["school","student","visa","university","teacher","exam","ސްކޫލް","ދަރިވަރު"],
+    "weather": ["weather","rain","storm","wind","sea","alert","mms","ވައި","ވާރޭ"],
+    "foreign": ["iran","israel","us","usa","america","india","china","qatar","uk","war","global","world","އިންޑިޔާ","ޗައިނާ"],
+    "sports": ["sports","football","fifa","match","team","ކުޅިވަރު","ފުޓްބޯޅަ"],
+}
+
+_CURRENT_GLOBAL_WORDS = [
+    "now","current","latest","today","breaking","happening","war","conflict","iran","israel",
+    "america","us ","usa","ukraine","russia","qatar","oil","global","world"
+]
+
+def public_detect_topics(message):
+    low = (message or "").lower()
+    topics = []
+    for topic, kws in _PUBLIC_TOPIC_KEYWORDS.items():
+        if any(k in low for k in kws):
+            topics.append(topic)
+    if not topics and _public_chat_is_news_query(message):
+        topics.append("news")
+    if not topics:
+        topics.append("general")
+    return topics[:5]
+
+def public_detect_intent(message):
+    low = (message or "").lower()
+    if any(w in low for w in ["hi", "hello", "hey", "salaam", "ހެލޯ"]) and len(low.split()) <= 4:
+        return "greeting"
+    if any(w in low for w in ["breaking", "urgent", "ބްރޭކިންގ"]):
+        return "breaking_news"
+    if any(w in low for w in ["summarize", "summary", "briefing", "biggest", "today", "މިއަދު"]):
+        return "briefing"
+    if _public_chat_is_news_query(message):
+        return "news_query"
+    if any(w in low for w in _CURRENT_GLOBAL_WORDS):
+        return "current_global"
+    return "general_chat"
+
+def public_is_global_current_query(message):
+    low = " " + (message or "").lower() + " "
+    local_hits = ["maldives","raajje","dhivehi","male","malé","samuga","ރާއްޖެ","ދިވެހި"]
+    if any(x in low for x in local_hits):
+        return False
+    return any(w in low for w in _CURRENT_GLOBAL_WORDS) or any(t in public_detect_topics(message) for t in ["foreign"])
+
+def public_log_chat(platform, session_id, user_key, user_message, bot_reply, lang, intent, topics, used_search=False):
+    """Store public Samuga AI chats for interest analytics across website/Telegram/future WhatsApp."""
+    try:
+        if not DB_ENABLED:
+            return
+        topics = topics or ["general"]
+        db_execute("""
+            INSERT INTO public_chat_messages
+                (platform, session_id, user_key, user_message, bot_reply, lang, intent, topics, used_search)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            platform, str(session_id or "")[:120], str(user_key or "")[:160],
+            str(user_message or "")[:1200], str(bot_reply or "")[:1800],
+            lang, intent, topics, bool(used_search)
+        ))
+        for topic in topics:
+            db_execute("""
+                INSERT INTO public_interest_daily (day, topic, platform, count, updated_at)
+                VALUES (CURRENT_DATE, %s, %s, 1, NOW())
+                ON CONFLICT (day, topic, platform)
+                DO UPDATE SET count = public_interest_daily.count + 1, updated_at = NOW()
+            """, (topic, platform))
+    except Exception as e:
+        log.debug(f"Public chat analytics save failed: {e}")
+
+def public_session_key(platform, user_key, session_id=""):
+    platform = str(platform or "web").lower()
+    user_key = str(user_key or "anon")[:80]
+    session_id = str(session_id or "default")[:80]
+    if platform == "telegram":
+        return f"public:telegram:{user_key}"
+    if platform == "whatsapp":
+        return f"public:whatsapp:{user_key}"
+    return f"public:web:{user_key}:{session_id}"
+
+def public_get_recent_interest(limit=8):
+    try:
+        rows = db_execute("""
+            SELECT topic, SUM(count) AS c
+            FROM public_interest_daily
+            WHERE day >= CURRENT_DATE - INTERVAL '3 days'
+            GROUP BY topic
+            ORDER BY c DESC
+            LIMIT %s
+        """, (limit,), fetch="all") or []
+        return ", ".join([f"{r[0]} ({r[1]})" for r in rows])
+    except Exception:
+        return ""
+
+def public_build_live_context(message, lang="en"):
+    """Use Tavily smartly: local queries search Maldives; global/current queries search globally."""
+    try:
+        if not TAVILY_API_KEY:
+            return "", False
+        if public_is_global_current_query(message):
+            q = message
+        elif _public_chat_is_news_query(message):
+            q = f"Maldives news {message}"
+        else:
+            # For normal questions we usually don't need search.
+            return "", False
+        ctx = tavily_search(q)
+        return strip_source_links(_api_clean_text(ctx, 1800)), bool(ctx)
+    except Exception as e:
+        log.warning(f"Public Samuga AI live search failed: {e}")
+        return "", False
+
+def public_samuga_ai_chat(message, platform="web", user_key="", session_id="", lang=None):
     """
-    Runs daily at 9AM MVT.
-    - Warns operators 7 days before trial/subscription ends
-    - Suspends expired operators (hides schedules from customers)
+    One public Samuga AI for website + @SamugaNewsBot + future WhatsApp.
+    This is NOT the private core-team brain.
     """
-    from datetime import timedelta
-    now = datetime.now()
-    warn_threshold = now + timedelta(days=7)
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        subs = await conn.fetch("""
-            SELECT s.*, o.telegram_id, o.business_name, o.id as op_id
-            FROM subscriptions s
-            JOIN operators o ON s.operator_id = o.id
-            WHERE o.status = 'approved'
-        """)
-    for sub in subs:
-        tg_id = sub["telegram_id"]
-        name  = sub["business_name"]
-        fee   = await get_setting("subscription_fee", "500")
+    message = _public_chat_clean_message(message)
+    if not message:
+        return "Ask me something bro. I can chat or help with latest news."
 
-        if sub["status"] == "trial":
-            trial_end = sub["trial_ends_at"]
-            if not trial_end: continue
-            if now >= trial_end:
-                # Trial expired — suspend
-                pool2 = await get_pool()
-                async with pool2.acquire() as conn2:
-                    await conn2.execute(
-                        "UPDATE subscriptions SET status='expired' WHERE id=$1", sub["id"])
-                    await conn2.execute(
-                        "UPDATE operators SET subscription_status='expired' WHERE id=$1", sub["op_id"])
-                try:
-                    await ctx.bot.send_message(tg_id,
-                        f"❌ *Trial Ended — {name}*\n\n"
-                        f"Your 2-month free trial has ended.\n\n"
-                        f"Your schedules are currently hidden from customers.\n\n"
-                        f"Subscribe for *MVR {fee}/month* to reactivate.\n"
-                        f"Tap /start → 💳 My Subscription to pay.",
-                        parse_mode="Markdown")
-                except: pass
-            elif trial_end <= warn_threshold:
-                days_left = (trial_end - now).days
-                try:
-                    await ctx.bot.send_message(tg_id,
-                        f"⚠️ *Trial Ending Soon — {name}*\n\n"
-                        f"Your free trial ends in *{days_left} days* "
-                        f"({trial_end.strftime('%d %b %Y')}).\n\n"
-                        f"Subscribe for *MVR {fee}/month* to keep your listings active.\n"
-                        f"Tap /start → 💳 My Subscription to pay now.",
-                        parse_mode="Markdown")
-                except: pass
+    detected_lang = "dv" if (lang == "dv" or is_dhivehi(message)) else "en"
+    skey = public_session_key(platform, user_key, session_id)
+    history = get_conversation(skey)[-8:]
+    intent = public_detect_intent(message)
+    topics = public_detect_topics(message)
 
-        elif sub["status"] == "active":
-            paid_until = sub["paid_until"]
-            if not paid_until: continue
-            if now >= paid_until:
-                # Subscription expired
-                pool2 = await get_pool()
-                async with pool2.acquire() as conn2:
-                    await conn2.execute(
-                        "UPDATE subscriptions SET status='expired' WHERE id=$1", sub["id"])
-                    await conn2.execute(
-                        "UPDATE operators SET subscription_status='expired' WHERE id=$1", sub["op_id"])
-                try:
-                    await ctx.bot.send_message(tg_id,
-                        f"❌ *Subscription Expired — {name}*\n\n"
-                        f"Your schedules are now hidden from customers.\n\n"
-                        f"Renew for *MVR {fee}/month* to reactivate.\n"
-                        f"Tap /start → 💳 My Subscription to pay.",
-                        parse_mode="Markdown")
-                except: pass
-            elif paid_until <= warn_threshold:
-                days_left = (paid_until - now).days
-                try:
-                    await ctx.bot.send_message(tg_id,
-                        f"⚠️ *Subscription Expiring — {name}*\n\n"
-                        f"Your subscription expires in *{days_left} days* "
-                        f"({paid_until.strftime('%d %b %Y')}).\n\n"
-                        f"Renew now to avoid interruption! *MVR {fee}/month*\n"
-                        f"Tap /start → 💳 My Subscription.",
-                        parse_mode="Markdown")
-                except: pass
+    # Story intelligence first if the archive can directly answer.
+    story_answer = None
+    try:
+        story_answer = answer_story_query(message)
+    except Exception as e:
+        log.debug(f"Public story query fallback: {e}")
 
-async def job_departure_reminders(ctx: ContextTypes.DEFAULT_TYPE):
-    """Run every 5 minutes — send 45-min reminders to confirmed customers"""
-    from datetime import timedelta
-    now = datetime.now()
-    today = now.date()
-    # Target: departures happening in 40-50 minutes from now
-    remind_from = (now.replace(second=0, microsecond=0) + timedelta(minutes=40)).strftime("%H:%M")
-    remind_to   = (now.replace(second=0, microsecond=0) + timedelta(minutes=50)).strftime("%H:%M")
+    latest_rows = []
+    search_rows = []
+    db_context = ""
+    if intent in ("news_query", "breaking_news", "briefing", "current_global") or topics != ["general"]:
+        latest_rows = _public_chat_latest_rows(lang=None if detected_lang == "en" else "dv", limit=8, hours=48)
+        search_rows = _public_chat_search_rows(message, lang=None if detected_lang == "en" else "dv", limit=6)
+        context_rows = search_rows or latest_rows
+        if intent == "breaking_news":
+            breaking_rows = [r for r in latest_rows if str(r.get("category","")).upper() == "BREAKING"]
+            context_rows = breaking_rows or latest_rows[:4]
+        db_context = _public_chat_context(context_rows[:6])
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        # Find bookings with departures in ~45 min, not yet reminded
-        bookings = await conn.fetch("""
-            SELECT b.customer_telegram_id, b.booking_ref, b.passenger_count,
-                   COALESCE(sc.new_time, s.departure_time) as dep_time,
-                   COALESCE(sc.new_boat_name, s.boat_name, o.boat_name) as boat_name,
-                   s.location, s.route_from, s.route_to, o.business_name
-            FROM bookings b
-            JOIN schedules s ON b.schedule_id = s.id
-            JOIN operators o ON b.operator_id = o.id
-            LEFT JOIN schedule_changes sc ON sc.schedule_id=s.id AND sc.change_date=$1 AND sc.status='active'
-            WHERE b.travel_date = $1
-              AND b.status = 'confirmed'
-              AND b.reminder_sent = FALSE
-              AND COALESCE(sc.new_time, s.departure_time) >= $2
-              AND COALESCE(sc.new_time, s.departure_time) <= $3
-        """, today, remind_from, remind_to)
+    live_context, used_search = public_build_live_context(message, lang=detected_lang)
+    interests = public_get_recent_interest()
 
-        for bk in bookings:
+    if story_answer and not public_is_global_current_query(message):
+        reply = _public_chat_clean_reply(story_answer)
+        add_to_conversation(skey, "user", message)
+        add_to_conversation(skey, "assistant", reply)
+        public_log_chat(platform, session_id, user_key, message, reply, detected_lang, intent, topics, used_search=False)
+        return reply
+
+    system = f"""You are Samuga AI, the single public chatbot for Samuga Media.
+You are used on the website, Telegram @SamugaNewsBot, and later WhatsApp.
+You are friendly, sharp, and useful — like a Maldivian news buddy, not a hard-coded bot.
+
+IMPORTANT IDENTITY:
+- You are the PUBLIC Samuga AI, not the private core-team newsroom brain.
+- Never reveal admin/content-lab/private commands.
+- You can answer Maldives news, global current events, and normal questions.
+- For current/global questions, use live search context if provided.
+- For Maldives questions, use Samuga archive first, then live search if helpful.
+- Do not include external source URLs. Send people to @samugacommunity for Samuga updates.
+- Keep replies conversational. No markdown **, ###, long separators, or robotic lists.
+- Short by default. If news: max 3 items unless user asks for more.
+- Remember the chat history and answer follow-ups naturally.
+- If user uses Dhivehi/Thaana, answer in natural Dhivehi. If English, answer in English.
+
+Public interest radar from recent chats: {interests or "not enough data yet"}.
+"""
+
+    user_block = f"""User message:
+{message}
+
+Intent: {intent}
+Topics: {", ".join(topics)}
+Platform: {platform}
+Fresh Samuga archive context:
+{db_context or "No direct Samuga archive context found."}
+
+Live search context:
+{live_context or "No live search context used or available."}
+"""
+
+    try:
+        messages = []
+        for h in history[-8:]:
+            role = h.get("role")
+            content = h.get("content", "")
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content[:1200]})
+        messages.append({"role": "user", "content": user_block})
+
+        if detected_lang == "dv" and GEMINI_API_KEY:
+            # Gemini is stronger for Dhivehi. Include history manually in prompt.
+            hist_txt = "\n".join([f"{h.get('role')}: {h.get('content','')}" for h in history[-6:]])
+            gemini_prompt = f"""{system}
+
+Recent chat history:
+{hist_txt}
+
+{user_block}
+
+Answer now in natural Dhivehi Thaana if the user used Dhivehi; otherwise English.
+"""
+            reply = _gemini_post(gemini_prompt, timeout=25) or ""
+            if not reply:
+                raise RuntimeError("Gemini public chat returned empty")
+        else:
+            msg = ai.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=650,
+                system=system,
+                messages=messages
+            )
+            reply = msg.content[0].text.strip()
+
+    except Exception as e:
+        log.error(f"Unified public Samuga AI failed: {e}")
+        # Safe fallback: show latest DB rows if available.
+        if latest_rows:
+            reply = _public_chat_format_news(latest_rows[:3], lang=detected_lang)
+        else:
+            reply = "I had a small issue checking live updates bro. Try again in a moment."
+
+    reply = _public_chat_clean_reply(reply)
+    add_to_conversation(skey, "user", message)
+    add_to_conversation(skey, "assistant", reply)
+    public_log_chat(platform, session_id, user_key, message, reply, detected_lang, intent, topics, used_search=used_search)
+    return reply
+
+
+@api_app.route("/api/chat", methods=["POST", "OPTIONS"])
+def api_chat():
+    """Public website chat endpoint using the unified public Samuga AI brain."""
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True})
+
+    try:
+        client_id = _public_chat_client_id()
+        allowed, limit = _public_chat_allowed(client_id)
+        if not allowed:
+            return jsonify({
+                "ok": False,
+                "error": "rate_limited",
+                "reply": "Too many messages too fast bro 😅 Please wait a few minutes and try again."
+            }), 429
+
+        data = request.get_json(silent=True) or {}
+        message = _public_chat_clean_message(data.get("message", ""))
+        session_id = _api_clean_text(data.get("session_id", "web"), 80) or "web"
+        requested_lang = str(data.get("lang") or "").lower()
+        lang = "dv" if requested_lang == "dv" or is_dhivehi(message) else "en"
+
+        if not message:
+            return jsonify({
+                "ok": False,
+                "error": "empty_message",
+                "reply": "Ask me something bro. I can chat or help with latest news."
+            }), 400
+
+        if _public_chat_is_blocked(message):
+            return jsonify({
+                "ok": True,
+                "reply": "I can only do public chat and public news here bro. Posting, approvals, and newsroom controls are only for the private Samuga team."
+            })
+
+        log.info(f"🌐 Website public Samuga AI {client_id}: {message[:80]}")
+        reply = public_samuga_ai_chat(
+            message=message,
+            platform="web",
+            user_key=client_id,
+            session_id=session_id,
+            lang=lang
+        )
+
+        return jsonify({
+            "ok": True,
+            "reply": reply,
+            "source": "Unified public Samuga AI",
+            "mode": "public_samuga_ai",
+            "rate_limit": {"limit": limit, "window_seconds": _PUBLIC_CHAT_WINDOW}
+        })
+
+    except Exception as e:
+        log.error(f"Website API /api/chat error: {e}")
+        return jsonify({
+            "ok": False,
+            "error": "server_error",
+            "reply": "Something went wrong bro 😅 Try again in a moment."
+        })
+
+def start_api_server():
+    """Start the public website API on Railway's assigned PORT."""
+    port = int(os.environ.get("PORT", 8080))
+    log.info(f"🌐 Website API starting on port {port}")
+    api_app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+
+
+# ── State Persistence (JSON fallback — survives Railway restarts) ─────────────
+import os as _os, json as _json, threading as _threading
+DATA_DIR   = "/data"
+_os.makedirs(DATA_DIR, exist_ok=True)
+SEEN_FILE  = _os.path.join(DATA_DIR, "seen_articles.json")
+STATE_FILE = _os.path.join(DATA_DIR, "bot_state.json")
+_state_lock = _threading.Lock()
+_poll_offset = [0]
+
+def load_seen():
+    try:
+        if _os.path.exists(SEEN_FILE):
+            with open(SEEN_FILE) as f: return set(_json.load(f))
+    except Exception as e: log.error(f"load_seen: {e}")
+    return set()
+
+def save_seen(seen):
+    try:
+        with open(SEEN_FILE,"w") as f: _json.dump(list(seen)[-1000:], f)
+    except Exception as e: log.error(f"save_seen: {e}")
+
+def _load_state():
+    try:
+        if _os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f: return _json.load(f)
+    except Exception as e: log.error(f"load_state: {e}")
+    return {}
+
+def _save_state(state):
+    try:
+        with _state_lock:
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as f: _json.dump(state, f)
+            _os.replace(tmp, STATE_FILE)
+    except Exception as e: log.error(f"save_state: {e}")
+
+def _serialize_social_counts():
+    sc = dict(social_post_counts)
+    if sc.get("date") and not isinstance(sc["date"], str):
+        sc["date"] = sc["date"].isoformat()
+    return sc
+
+def _serialize_approval_queue():
+    """Serialize queue for STATE FILE — includes card_bytes as base64."""
+    import base64
+    out = {}
+    for k, v in approval_queue.items():
+        item = dict(v)
+        if item.get("card_bytes"):
             try:
-                await ctx.bot.send_message(bk["customer_telegram_id"],
-                    f"🌊 *Almost time to set sail!*\n\n"
-                    f"Hey there! Just a friendly reminder that your boat departs in about *45 minutes*. "
-                    f"Please make your way to the jetty soon! 😊\n\n"
-                    f"🚤 *{bk['boat_name'] or bk['business_name']}*\n"
-                    f"📍 *{bk['route_from']} → {bk['route_to']}*\n"
-                    f"⏰ Departure: *{bk['dep_time']}*\n"
-                    f"📌 Location: *{bk.get('location') or 'Jetty No. 1, Male'}*\n"
-                    f"🎫 Booking: `{bk['booking_ref']}` | 👥 {bk['passenger_count']} pax\n\n"
-                    f"📱 You can use the *FollowMe* app to track your boat in real time.\n\n"
-                    f"Wishing you a safe, smooth and wonderful journey! 🌟\n"
-                    f"Safe travels from all of us at *Samuga Travels* 🌊🤝",
-                    parse_mode="Markdown")
-                # Mark as reminded
-                await conn.execute(
-                    "UPDATE bookings SET reminder_sent=TRUE WHERE booking_ref=$1",
-                    bk["booking_ref"])
-                logger.info(f"✅ Reminder sent to {bk['customer_telegram_id']} for {bk['booking_ref']}")
+                item["card_bytes"] = base64.b64encode(item["card_bytes"]).decode()
+                item["_card_b64"] = True
+            except Exception:
+                item["card_bytes"] = None
+                item["_card_b64"] = False
+        item["created_at"] = item["created_at"].isoformat() if item.get("created_at") else None
+        out[k] = item
+    return out
+
+def _serialize_approval_queue_for_pg():
+    """Serialize queue for POSTGRESQL — strips card_bytes (too large for jsonb).
+    On restore, EN cards without bytes will be marked as needing rebuild.
+    DV cards never had bytes anyway (built on approval).
+    The critical data (title, dv_text, timing) all survives."""
+    out = {}
+    for k, v in approval_queue.items():
+        item = dict(v)
+        # Strip card_bytes — can be 100-500KB as base64, causes silent PG failures
+        item["card_bytes"] = None
+        item["_card_b64"] = False
+        item["_needs_card_rebuild"] = True  # flag so restore knows to skip auto-posting
+        item["created_at"] = item["created_at"].isoformat() if item.get("created_at") else None
+        # Strip bg_image too if present
+        item.pop("_bg_image", None)
+        out[k] = item
+    return out
+
+def persist_state():
+    """Snapshot all volatile state to disk."""
+    try:
+        sq_serialized = []
+        with _social_queue_lock:
+            for item in _social_queue:
+                sq_serialized.append({
+                    "img_bytes_b64": __import__("base64").b64encode(item["img_bytes"]).decode(),
+                    "caption": item["caption"],
+                    "queued_at": item["queued_at"].isoformat(),
+                    "article_id": item.get("article_id"),
+                    "title": item.get("title",""),
+                    "summary": item.get("summary",""),
+                    "cat": item.get("cat","LOCAL"),
+                    "source": item.get("source","Samuga Media"),
+                    "link": item.get("link",""),
+                    "lang": item.get("lang","en"),
+                    "is_breaking": item.get("is_breaking", False),
+                    "key_label": item.get("key_label","Post"),
+                    "tg_ok": item.get("tg_ok", False),
+                    "post_telegram": item.get("post_telegram", True),
+                    "notify_chat_id": item.get("notify_chat_id"),
+                    "notify_thread_id": item.get("notify_thread_id"),
+                })
+        state = {
+            "recent_story_titles": [(t, ts.isoformat()) for (t, ts) in recent_story_titles],
+            "recent_posts": recent_posts[-50:],
+            "analytics": analytics,
+            "daily_sports_count": daily_sports_count,
+            "daily_world_count": daily_world_count,
+            "daily_tourism_count": daily_tourism_count,
+            "social_post_counts": _serialize_social_counts(),
+            "polls_today": polls_today,
+            "last_regular_post_time": last_regular_post_time.isoformat() if last_regular_post_time else None,
+            "last_social_post_time": _last_social_post_time.isoformat() if _last_social_post_time else None,
+            "approval_counter": _approval_counter[0],
+            "approval_queue": _serialize_approval_queue(),
+            "poll_offset": _poll_offset[0],
+            "social_queue": sq_serialized,
+            "website_banner": website_banner,
+            "source_health": get_source_health_snapshot(),
+            "ops_watchdog_state": {
+                "source_health_alerts": {k: v.isoformat() if isinstance(v, datetime) else v for k, v in _ops_watchdog_state.get("source_health_alerts", {}).items()},
+                "duplicate_hits_recent": [t.isoformat() for t in _ops_watchdog_state.get("duplicate_hits_recent", []) if isinstance(t, datetime)],
+                "manual_post_failures": [t.isoformat() for t in _ops_watchdog_state.get("manual_post_failures", []) if isinstance(t, datetime)],
+                "social_queue_stuck_since": _ops_watchdog_state.get("social_queue_stuck_since").isoformat() if isinstance(_ops_watchdog_state.get("social_queue_stuck_since"), datetime) else None,
+                "last_posted_dv": _ops_watchdog_state.get("last_posted_dv", 0),
+            },
+        }
+        _save_state(state)
+        # Also persist approval queue to PostgreSQL — survives Railway restarts/crashes
+        # Use lightweight version (no card_bytes) to prevent silent PG save failures
+        try:
+            kv_set("approval_queue_backup", _serialize_approval_queue_for_pg())
+            kv_set("approval_counter_backup", _approval_counter[0])
+        except Exception as pg_e:
+            log.warning(f"persist_state PG backup: {pg_e}")
+    except Exception as e:
+        log.error(f"persist_state: {e}")
+
+def restore_state():
+    """Load persisted state back into memory on startup."""
+    global recent_story_titles, recent_posts, analytics
+    global daily_sports_count, daily_world_count, daily_tourism_count
+    global social_post_counts, polls_today, last_regular_post_time
+    state = _load_state()
+    if not state:
+        log.info("📦 No saved state — starting fresh")
+        return
+    import base64
+    try:
+        recent_story_titles.clear()
+        for (t, ts) in state.get("recent_story_titles", []):
+            try: recent_story_titles.append((t, datetime.fromisoformat(ts)))
+            except Exception: pass
+        recent_posts.clear()
+        recent_posts.extend(state.get("recent_posts", []))
+        analytics.update(state.get("analytics", {}))
+        daily_sports_count.update(state.get("daily_sports_count", {}))
+        daily_world_count.update(state.get("daily_world_count", {}))
+        daily_tourism_count.update(state.get("daily_tourism_count", {}))
+        social_post_counts.update(state.get("social_post_counts", {}))
+        polls_today.update(state.get("polls_today", {}))
+        lrt = state.get("last_regular_post_time")
+        if lrt:
+            try: last_regular_post_time = datetime.fromisoformat(lrt)
+            except Exception: pass
+        _approval_counter[0] = state.get("approval_counter", 0)
+        _poll_offset[0] = state.get("poll_offset", 0)
+        try:
+            website_banner.update(state.get("website_banner", {}))
+        except Exception:
+            pass
+        try:
+            load_source_health(state.get("source_health", {}))
+        except Exception:
+            pass
+        try:
+            ws = state.get("ops_watchdog_state", {}) or {}
+            _ops_watchdog_state["source_health_alerts"] = {k: datetime.fromisoformat(v) for k, v in (ws.get("source_health_alerts", {}) or {}).items() if v}
+            _ops_watchdog_state["duplicate_hits_recent"] = [datetime.fromisoformat(t) for t in (ws.get("duplicate_hits_recent", []) or []) if t]
+            _ops_watchdog_state["manual_post_failures"] = [datetime.fromisoformat(t) for t in (ws.get("manual_post_failures", []) or []) if t]
+            sss = ws.get("social_queue_stuck_since")
+            _ops_watchdog_state["social_queue_stuck_since"] = datetime.fromisoformat(sss) if sss else None
+            _ops_watchdog_state["last_posted_dv"] = int(ws.get("last_posted_dv", 0) or 0)
+        except Exception:
+            pass
+        global _last_social_post_time
+        lspt = state.get("last_social_post_time")
+        if lspt:
+            try: _last_social_post_time = datetime.fromisoformat(lspt)
+            except Exception: pass
+        sq = state.get("social_queue", [])
+        if sq:
+            import base64 as _b64
+            with _social_queue_lock:
+                for item in sq:
+                    try:
+                        _social_queue.append({
+                            "img_bytes": _b64.b64decode(item["img_bytes_b64"]),
+                            "caption": item["caption"],
+                            "queued_at": datetime.fromisoformat(item["queued_at"]),
+                            "article_id": item.get("article_id"),
+                            "title": item.get("title",""),
+                            "summary": item.get("summary",""),
+                            "cat": item.get("cat","LOCAL"),
+                            "source": item.get("source","Samuga Media"),
+                            "link": item.get("link",""),
+                            "lang": item.get("lang","en"),
+                            "is_breaking": item.get("is_breaking", False),
+                            "key_label": item.get("key_label","Post"),
+                            "tg_ok": item.get("tg_ok", False),
+                            "post_telegram": item.get("post_telegram", True),
+                            "notify_chat_id": item.get("notify_chat_id"),
+                            "notify_thread_id": item.get("notify_thread_id"),
+                        })
+                    except Exception: pass
+            log.info(f"📲 Social queue restored: {len(_social_queue)} post(s) waiting")
+        # Restore approval queue — try PostgreSQL first (survives crashes), then fall back to file
+        pg_queue = {}
+        try:
+            pg_queue = kv_get("approval_queue_backup", {}) or {}
+            if pg_queue:
+                log.info(f"📦 Loading approval queue from PostgreSQL ({len(pg_queue)} items)")
+        except Exception as pg_e:
+            log.debug(f"restore PG queue: {pg_e}")
+
+        # Merge: PG takes priority for keys it has, file fills the rest
+        queue_source = {**state.get("approval_queue", {}), **pg_queue}
+
+        for k, item in queue_source.items():
+            try:
+                if item.get("_card_b64") and item.get("card_bytes"):
+                    item["card_bytes"] = base64.b64decode(item["card_bytes"])
+                item.pop("_card_b64", None)
+                item["created_at"] = datetime.fromisoformat(item["created_at"]) if item.get("created_at") else utcnow()
+                approval_queue[k] = item
             except Exception as e:
-                logger.error(f"Reminder failed for {bk['customer_telegram_id']}: {e}")
+                log.error(f"restore approval {k}: {e}")
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
-async def main():
-    # Init DB first before anything else
-    logger.info("🌊 Starting Samuga Travels Bot v1.2...")
-    await init_db()
-    logger.info("✅ DB ready — building bot...")
+        # Also restore approval counter from PG if available
+        try:
+            pg_counter = kv_get("approval_counter_backup", None)
+            if pg_counter is not None and pg_counter > _approval_counter[0]:
+                _approval_counter[0] = pg_counter
+        except Exception:
+            pass
+        log.info(f"📦 State restored: {len(recent_story_titles)} dedup titles, "
+                 f"{len(approval_queue)} pending cards, {len(recent_posts)} recent posts")
+        # Alert team if pending cards were restored after restart
+        log.info(f"[PG] Queue backup status: {len(approval_queue)} cards in queue, counter={_approval_counter[0]}")
+        if len(approval_queue) > 0:
+            try:
+                lines = ["🔄 <b>Bot restarted — pending cards restored:</b>\n"]
+                for k, v in list(approval_queue.items()):
+                    age = ""
+                    if v.get("created_at"):
+                        mins = int((utcnow() - v["created_at"]).total_seconds() / 60)
+                        age = f" ({mins}min ago)"
+                    lang = v.get("lang","en").upper()
+                    cat  = v.get("cat","LOCAL")
+                    title = v.get("title","")[:50]
+                    expires = ""
+                    if v.get("created_at"):
+                        remaining = 7200 - int((utcnow() - v["created_at"]).total_seconds())
+                        if remaining > 0:
+                            expires = f" — {remaining//60}min left"
+                        else:
+                            expires = " — EXPIRED"
+                    lines.append(f"• <code>{k}</code> [{lang}/{cat}]{age}{expires}")
+                    lines.append(f"  📰 {title}")
+                    lines.append(f"  ✅ <code>/approved {k}</code>  ❌ <code>/reject {k}</code>")
+                lines.append("\nRun <code>/pending</code> to see full queue.")
+                _startup_queue_msg = "\n".join(lines)
+                # send after bot is fully up — schedule for 10 seconds after start
+                import threading as _st
+                def _send_startup_alert():
+                    import time as _t; _t.sleep(10)
+                    try:
+                        send_text(CORE_TEAM_CHAT_ID, _startup_queue_msg, thread_id=ALERT_THREAD_ID)
+                    except Exception: pass
+                _st.Thread(target=_send_startup_alert, daemon=True).start()
+            except Exception as _e:
+                log.warning(f"startup queue alert: {_e}")
+    except Exception as e:
+        log.error(f"restore_state: {e}")
 
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-    async def cmd_start_with_verify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        """Handle /start — if it has verify_ payload, run ticket verify instead"""
-        args = ctx.args or []
-        if args and args[0].startswith("verify_"):
-            await cmd_verify(update, ctx)
-        else:
-            await cmd_start(update, ctx)
-    app.add_handler(CommandHandler("start",  cmd_start_with_verify))
-    app.add_handler(CommandHandler("cancel",    cmd_cancel))
-    app.add_handler(CommandHandler("verify",    cmd_verify))
-    app.add_handler(CommandHandler("register",  cmd_register))
-    app.add_handler(CommandHandler("recommend", cmd_recommend))
-    app.add_handler(CommandHandler("admin",     cmd_admin))
-    app.add_handler(CommandHandler("ops",       cmd_ops))
-    app.add_handler(CommandHandler("urgent",       cmd_urgent))
-    app.add_handler(CommandHandler("deletemydata", cmd_delete_my_data))
-    app.add_handler(CommandHandler("status",       cmd_status))
-    app.add_handler(CommandHandler("findcustomer", cmd_findcustomer))
 
-    # ── Flexible operator/customer shortcuts ──
-    class FakeCallbackQuery:
-        def __init__(self, update, data):
-            self.message = update.message
-            self.from_user = update.effective_user
-            self.data = data
-        async def answer(self, *args, **kwargs):
-            return None
-        async def edit_message_text(self, text=None, parse_mode=None, reply_markup=None, **kwargs):
-            await self.message.reply_text(text or "", parse_mode=parse_mode, reply_markup=reply_markup)
-        async def edit_message_caption(self, caption=None, parse_mode=None, reply_markup=None, **kwargs):
-            await self.message.reply_text(caption or "", parse_mode=parse_mode, reply_markup=reply_markup)
-
-    class FakeCallbackUpdate:
-        def __init__(self, update, data):
-            self.callback_query = FakeCallbackQuery(update, data)
-            self.effective_user = update.effective_user
-            self.effective_chat = update.effective_chat
-            self.effective_message = update.message
-
-    async def run_callback_shortcut(update, context, data: str):
-        await handle_callback(FakeCallbackUpdate(update, data), context)
-
-    async def cmd_profile(u, c):
-        sd = await get_user_state(u.effective_user.id)
-        if sd.get("role") == "operator":
-            await run_callback_shortcut(u, c, "op_profile")
-        else:
-            await cmd_start(u, c)
-    async def cmd_schedules_shortcut(u, c):
-        op = await get_operator(u.effective_user.id)
-        if op and op.get("status") == "approved":
-            await set_user_state(u.effective_user.id, OP_AWAIT_SCHEDULE_ROUTE, {})
-            await u.message.reply_text("🗓️ *Add a Schedule*\n\nEnter the route stops comma-separated:\n_Example: Male, Thoddoo_", parse_mode="Markdown")
-        else:
-            await u.message.reply_text("⚠️ Operator account required.")
-    async def cmd_bookings_shortcut(u, c):
-        await run_callback_shortcut(u, c, "op_bookings")
-    async def cmd_fleet_shortcut(u, c):
-        await run_callback_shortcut(u, c, "op_fleet")
-    async def cmd_today_shortcut(u, c):
-        await run_callback_shortcut(u, c, "op_today")
-    async def cmd_search_shortcut(u, c):
-        await u.message.reply_text("🔍 Type your route to search:\n_Example: Male to Thoddoo_", parse_mode="Markdown")
-    async def cmd_mybookings_shortcut(u, c):
-        await run_callback_shortcut(u, c, "cx_my_bookings")
-    async def cmd_help_full(u, c):
-        sd = await get_user_state(u.effective_user.id)
-        role = sd.get("role","customer")
-        op = await get_operator(u.effective_user.id)
-        is_op = op and op.get("status") == "approved"
-        if is_op:
-            await u.message.reply_text(
-                "🌊 *Samuga Travels — Operator Commands*\n\n"
-                "Just type naturally or use any of these:\n\n"
-                "/profile — View your profile\n"
-                "/schedules — Add a schedule\n"
-                "/bookings — Pending bookings\n"
-                "/fleet — Manage your boats\n"
-                "/today — Today\'s schedule\n"
-                "/status — Your account status\n"
-                "/urgent — Request urgent review\n"
-                "/cancel — Cancel current action\n"
-                "/start — Main menu\n\n"
-                "_Commands are flexible — close enough works!_",
-                parse_mode="Markdown")
-        else:
-            await u.message.reply_text(
-                "🌊 *Samuga Travels — Help*\n\n"
-                "Just type a route like *Male to Thoddoo* to start!\n\n"
-                "/start — Main menu\n"
-                "/mybookings — Your bookings\n"
-                "/search — Search boats\n"
-                "/status — Application status\n"
-                "/cancel — Cancel current action\n\n"
-                "_You can also just type naturally — the bot understands!_",
-                parse_mode="Markdown")
-
-    for cmd in ["profile", "myprofile"]:
-        app.add_handler(CommandHandler(cmd, cmd_profile))
-    for cmd in ["schedules", "addschedule", "schedule"]:
-        app.add_handler(CommandHandler(cmd, cmd_schedules_shortcut))
-    for cmd in ["bookings", "mybookings", "pending"]:
-        app.add_handler(CommandHandler(cmd, cmd_bookings_shortcut))
-    for cmd in ["fleet", "boats", "myfleet"]:
-        app.add_handler(CommandHandler(cmd, cmd_fleet_shortcut))
-    for cmd in ["today", "todayschedule"]:
-        app.add_handler(CommandHandler(cmd, cmd_today_shortcut))
-    for cmd in ["report", "monthly", "earnings"]:
-        app.add_handler(CommandHandler(cmd, lambda u, c: run_callback_shortcut(u, c, "op_monthly_report")))
-    for cmd in ["search", "searchboats", "book"]:
-        app.add_handler(CommandHandler(cmd, cmd_search_shortcut))
-    for cmd in ["help", "commands"]:
-        app.add_handler(CommandHandler(cmd, cmd_help_full))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_error_handler(error_handler)
-
-    # ── Scheduled jobs ──
-    from datetime import time as dt_time
-    jq = app.job_queue
-    # Evening schedule-prep ping: 20:00 MVT = 15:00 UTC
-    jq.run_daily(job_morning_ping, time=dt_time(15, 0, 0), name="evening_schedule_ping")
-    # Departure reminders: every 5 minutes
-    jq.run_repeating(job_departure_reminders, interval=300, first=30, name="departure_reminders")
-    # Payment confirmation watchdog: first ping after 15 min, second ping 5 min later
-    jq.run_repeating(job_payment_confirmation_watchdog, interval=300, first=120, name="payment_confirmation_watchdog")
-    # Subscription expiry check: daily 9AM MVT = 04:00 UTC
-    jq.run_daily(job_subscription_check, time=dt_time(4, 0, 0), name="subscription_check")
-    logger.info("✅ Scheduled jobs registered")
-
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    logger.info("🌊 Samuga Travels Bot v1.2 LIVE!")
-
-    # Graceful shutdown on SIGTERM (Railway stop signal)
-    stop_event = asyncio.Event()
-    def _handle_sigterm(*_):
-        logger.info("🛑 SIGTERM received — shutting down gracefully...")
-        stop_event.set()
-    signal.signal(signal.SIGTERM, _handle_sigterm)
-    signal.signal(signal.SIGINT, _handle_sigterm)
-
-    await stop_event.wait()
-    logger.info("👋 Stopping bot...")
-    await app.updater.stop()
-    await app.stop()
-    await app.shutdown()
-
+# ── Entry ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    asyncio.run(main())
+    import signal, atexit
+
+    def _graceful_shutdown(signum=None, frame=None):
+        """Save all state before Railway kills the process on redeploy."""
+        log.info("🛑 Shutdown signal received — saving state before exit...")
+        try:
+            persist_state()
+            log.info("✅ State saved — approval queue, social queue, counters all persisted")
+        except Exception as e:
+            log.error(f"State save on shutdown: {e}")
+
+    # Railway sends SIGTERM before killing the container on redeploy
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    signal.signal(signal.SIGINT,  _graceful_shutdown)
+    # Also register with atexit as a backup (catches normal Python exit)
+    atexit.register(_graceful_shutdown)
+
+    log.info(f"🚀 Samuga AI v{SAMUGA_VERSION} starting (newsroom intelligence + story timelines + live brain)...")
+    # Install Noto fonts for Thaana/Dhivehi support
+    if not os.path.exists("/usr/share/fonts/truetype/noto/NotoSansThaana-Bold.ttf") and not os.path.exists("/app/NotoSansThaana-Bold.ttf"):
+        try:
+            import subprocess
+            subprocess.run(["apt-get", "install", "-y", "fonts-noto"], capture_output=True, timeout=60)
+            log.info("✅ Noto fonts installed via apt")
+        except Exception as e:
+            log.warning(f"Noto font install failed: {e}")
+    else:
+        log.info("✅ Thaana fonts available")
+    log.info("📅 News: 6AM-10PM every 15min | Night: breaking only")
+    log.info("🌤️ Weather: 8AM, 2PM, 10:30PM → all platforms | MMS alerts auto")
+    log.info("🌅 7AM Brief | 🌙 12AM Summary | 📊 Friday Digest | 🕌 Prayer times + Hijri")
+    log.info("📚 Story Intelligence: timeline threads active")
+    log.info("🧠 Core team brain: live newsroom awareness + persistent memory")
+    log.info("💬 Smart chat: history, web search, Dhivehi support, story queries")
+    if posting_paused():
+        log.warning("🛑 POSTING_PAUSED=true — all public posting is blocked")
+    elif social_paused():
+        log.warning("🛑 SOCIAL_PAUSED=true — Buffer/social posting is blocked")
+
+    # Start social queue worker — drains one post every 10 minutes
+    threading.Thread(target=_social_queue_worker, daemon=True).start()
+    log.info("📲 Social queue worker started (10-min gap between posts)")
+
+    init_database()  # connect to Postgres (falls back to JSON if unavailable)
+    restore_state()  # bring back dedup memory, daily counters, pending cards, analytics
+
+
+    # Wire db module with shared functions
+    import db as _db
+    _db.utcnow       = utcnow
+    _db.ai           = ai
+    _db._gemini_post = _gemini_post
+    _db.send_text    = send_text
+    _db.GEMINI_API_KEY   = GEMINI_API_KEY
+    _db.CORE_TEAM_CHAT_ID = CORE_TEAM_CHAT_ID
+    _db.ALERT_THREAD_ID   = ALERT_THREAD_ID
+
+    # Wire scoring module with utcnow
+    import scoring as _sc
+    _sc.utcnow = utcnow
+
+    # Wire fetchers module with shared AI client
+    import fetchers as _ft
+    _ft.ai             = ai
+    _ft._gemini_post   = _gemini_post
+    _ft.GEMINI_API_KEY = GEMINI_API_KEY
+
+    import scoring as _sg
+    _sg.utcnow = utcnow
+    _sg.normalize_story_signal = story_signal_key
+    _sg.SOURCE_HEALTH_LOOKUP = source_health_score
+
+    # Wire weather module with shared functions (avoids circular imports)
+    import weather as _wx
+    _wx.send_photo      = send_photo
+    _wx.send_text       = send_text
+    _wx.queue_for_social = queue_for_social
+    _wx.utcnow          = utcnow
+    _wx.mvt_now         = mvt_now
+    seen_on_start=load_seen()
+    log.info(f"📚 Loaded {len(seen_on_start)} seen articles")
+
+    threading.Thread(target=handle_updates, daemon=True).start()
+    threading.Thread(target=start_api_server, daemon=True).start()
+
+    scheduler=BlockingScheduler(timezone="UTC")
+    scheduler.add_job(scheduled_check, "interval", minutes=15)
+    # Breaking news fast check every 5 min (LOCAL/DISASTER only)
+    scheduler.add_job(breaking_news_check, "interval", minutes=5)
+    # Approval lifecycle — English auto-posts at 15min, Dhivehi expires at 2h. Check every 5 min.
+    scheduler.add_job(expire_old_approvals, "interval", minutes=5)
+    # release_content_lab_drip removed — cards now go to Content Lab immediately when ready
+    # Morning brief 7AM MVT = 2AM UTC
+    scheduler.add_job(send_morning_brief, "cron", hour=1, minute=0)  # 6AM MVT
+    # AI Nightly Journalist brief 10:30PM MVT = 5:30PM UTC (before night summary)
+    scheduler.add_job(send_ai_journalist_brief, "cron", hour=17, minute=30)  # 10:30PM MVT
+    # Night summary 12AM MVT = 7PM UTC
+    scheduler.add_job(send_night_summary,   "cron", hour=18, minute=0)   # 11PM MVT
+    scheduler.add_job(night_queue_review,   "cron", hour=18, minute=5)   # 11:05PM MVT — queue review
+    scheduler.add_job(night_queue_autoclear,"cron", hour=18, minute=30)  # 11:30PM MVT — auto clear if no action
+    # Weekly digest Friday 6PM MVT = 1PM UTC Friday
+    scheduler.add_job(send_weekly_digest, "cron", day_of_week="fri", hour=13, minute=0)
+    # Weekly analytics report Friday 6:30PM MVT = 1:30PM UTC Friday
+    scheduler.add_job(send_weekly_analytics, "cron", day_of_week="fri", hour=13, minute=30)
+    # Phase 2: mid-week view backfill — Tue 10PM UTC = 3AM Wed MVT (quiet hours)
+    scheduler.add_job(backfill_tg_views, "cron", day_of_week="tue", hour=22, minute=0)
+    # Phase 2.5: mid-week Meta (FB+IG) engagement refresh — Tue 10PM UTC too
+    scheduler.add_job(fetch_meta_insights, "cron", day_of_week="tue", hour=22, minute=15)
+    # Weather cards — 3x daily to ALL platforms (Telegram + FB + IG + X)
+    # 8:00 AM MVT = 3:00 UTC
+    scheduler.add_job(lambda: send_weather_update("morning"), "cron", hour=3, minute=0)
+    # 2:00 PM MVT = 9:00 UTC
+    scheduler.add_job(lambda: send_weather_update("afternoon"), "cron", hour=9, minute=0)
+    # 10:30 PM MVT = 17:30 UTC
+    scheduler.add_job(lambda: send_weather_update("evening"), "cron", hour=17, minute=30)
+    # Tip/story CTA 8:30AM MVT = 3:30AM UTC
+    scheduler.add_job(send_tip_cta, "cron", hour=3, minute=30)  # 8:30AM MVT
+    # Tip/story CTA 8:30PM MVT = 3:30PM UTC
+    scheduler.add_job(send_tip_cta, "cron", hour=15, minute=30)  # 8:30PM MVT
+
+    # Periodic state heartbeat — saves every 5 minutes so restarts lose minimal state
+    scheduler.add_job(persist_state, "interval", minutes=5, id="state_heartbeat")
+    scheduler.add_job(ops_watchdog, "interval", minutes=10)
+    try:
+        from discovery import run_discovery as _run_discovery
+        scheduler.add_job(_run_discovery, "interval", hours=1)
+        log.info("🔍 Discovery Engine scheduled — runs every hour")
+    except ImportError:
+        log.warning("⚠️ discovery.py not found — Discovery Engine disabled")
+
+    # Wire story builder
+    try:
+        import story_builder as _sb
+        _sb._gemini_post   = _gemini_post
+        _sb.kv_get         = kv_get
+        _sb.kv_set         = kv_set
+        _sb.GEMINI_API_KEY = GEMINI_API_KEY
+        log.info("📝 Story Builder wired — full article generation active")
+    except ImportError:
+        pass
+
+    log.info("⏰ Scheduler started!")
+    scheduler.start()
