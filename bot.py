@@ -1220,7 +1220,10 @@ mutation CreatePost($input: CreatePostInput!) {
 # Prevents flooding FB/IG/X when multiple cards are approved at once.
 # Each item: {"img_bytes": bytes, "caption": str, "queued_at": datetime}
 _social_queue = []
-_social_queue_lock = threading.Lock()
+_social_queue_lock = threading.RLock()  # RLock: reentrant — persist_state() acquires
+                                        # this same lock, and several call sites invoke
+                                        # persist_state() while already holding it. A plain
+                                        # Lock self-deadlocks there and freezes the whole bot.
 _last_social_post_time = None
 SOCIAL_GAP_SECONDS = 600  # 10 minutes
 
@@ -1284,7 +1287,6 @@ def _social_queue_worker():
                     send_text(notify_cid, "🚫 Post blocked by placeholder safety gate before publishing.", thread_id=notify_tid)
                 continue
 
-            _last_social_post_time = utcnow()
             remaining = len(_social_queue)
             key_label  = item.get("key_label", "Post")
             notify_cid = item.get("notify_chat_id")
@@ -1330,16 +1332,31 @@ def _social_queue_worker():
                     except Exception as e:
                         log.error(f"[QUEUE] Telegram: {e}")
                 else:
-                    log.info("[QUEUE] Telegram skipped — daily cap or 2hr gap not met")
-                    # Re-queue for later unless it's been waiting too long
-                    age_mins = (utcnow() - item.get("queued_at", utcnow())).total_seconds() / 60
-                    if age_mins < 180:  # give up after 3 hours
+                    # Telegram is capped or inside its 2hr gap. Do NOT hold the whole
+                    # item hostage — FB/IG/X are not subject to the Telegram cap.
+                    # Re-queue (Telegram-first) only for a limited window, then give up
+                    # on Telegram and let the item fall through to social so it never
+                    # gets stuck forever. queued_at missing → treat as already old.
+                    qa = item.get("queued_at")
+                    if isinstance(qa, str):
+                        try: qa = datetime.fromisoformat(qa)
+                        except Exception: qa = None
+                    age_mins = (utcnow() - qa).total_seconds() / 60 if qa else 9999
+                    if age_mins < 120:
+                        log.info(f"[QUEUE] Telegram capped/gap — re-queueing {key_label} ({int(age_mins)}m old)")
                         with _social_queue_lock:
                             _social_queue.insert(0, item)  # put back at front
-                        time.sleep(60)  # wait a minute before re-checking
+                        time.sleep(60)  # wait before re-checking
                         continue
+                    else:
+                        # Aged out — skip Telegram, still publish to FB/IG/X below.
+                        log.info(f"[QUEUE] Telegram given up after {int(age_mins)}m — posting {key_label} to social only")
+                        tg_ok = False
             else:
                 tg_ok = item.get("tg_ok", False)
+
+            # We are now committed to posting this item — advance the 10-min gate.
+            _last_social_post_time = utcnow()
 
             # 2. Post to FB + IG + X
             results = _post_to_social_now(
@@ -1742,7 +1759,9 @@ def _send_approval_card(key, item, force=False):
     if item["lang"] == "dv" and item.get("dv_text"):
         header += f"<b>Bot wrote:</b>\n{item['dv_text']}\n\n"
     footer = (
-        f"✅ <code>/approved {key}</code>\n"
+        f"Choose where to post — <b>website is always published</b> on approval:\n"
+        f"📣 Telegram only · 📱 Socials only · 🌐 All · ✏️ Edit · ❌ Reject\n\n"
+        f"Text fallback: <code>/approved {key}</code> (posts everywhere)\n"
     )
     if item["lang"] == "dv":
         footer += f"✏️ <code>/approved {key} [corrected dhivehi text]</code>\n"
@@ -1760,15 +1779,22 @@ def _send_approval_card(key, item, force=False):
         footer += "<i>⏰ Expires in 2h if not approved — Dhivehi never auto-posts</i>"
     msg = header + footer
 
-    # ── Inline buttons — one tap approve/reject ──────────────────────────────
+    # ── Inline buttons — choose destination per post ─────────────────────────
+    # post_tg  → Telegram community only (+ website)
+    # post_soc → FB/IG/X only (+ website)
+    # post_all → everywhere (+ website)
+    # Website is always published on any approval.
     if item["lang"] == "dv":
         buttons = [
-            [("✅ Approve DV", f"approve:{key}"), ("❌ Reject", f"reject:{key}")],
-            [("✏️ Edit & Approve", f"edit_approve:{key}")]
+            [("📣 Post to Telegram", f"post_tg:{key}"), ("📱 Post to Social", f"post_soc:{key}")],
+            [("🌐 Post to All", f"post_all:{key}")],
+            [("✏️ Edit", f"edit_approve:{key}"), ("❌ Reject", f"reject:{key}")],
         ]
     else:
         buttons = [
-            [("✅ Approve", f"approve:{key}"), ("❌ Reject", f"reject:{key}")]
+            [("📣 Post to Telegram", f"post_tg:{key}"), ("📱 Post to Social", f"post_soc:{key}")],
+            [("🌐 Post to All", f"post_all:{key}")],
+            [("✏️ Edit", f"edit_approve:{key}"), ("❌ Reject", f"reject:{key}")],
         ]
     kb = _make_inline_kb(buttons)
 
@@ -3797,89 +3823,117 @@ def dm_check_and_increment(user_id):
 
 def handle_updates():
     # Use persisted offset so we never miss messages across restarts
-    def publish_approved_item(item, key, approver="Team", corrected=None):
+    def publish_approved_item(item, key, approver="Team", corrected=None, destination="all"):
         """
         Shared approve logic — called by both text command and button tap.
-        Wraps the same queue/publish flow used by the existing /approved handler.
+
+        destination:
+          "telegram" → post to Telegram community only (no FB/IG/X queue)
+          "social"   → post to FB/IG/X only (via queue, no Telegram)
+          "all"      → Telegram (direct) + FB/IG/X (queue)
+
+        Website publishing ALWAYS happens for any approved destination — no questions.
+        Telegram, when selected, posts DIRECTLY (not through the social queue), so a
+        Telegram post never gets stuck behind the social rate-limit queue.
         """
+        want_tg     = destination in ("telegram", "all")
+        want_social = destination in ("social", "all")
         try:
+            # ── Build card bytes + caption (same for both languages) ──────────
             if item["lang"] == "dv":
-                # Run DV card generation in background thread
                 final_dv = corrected if corrected else item.get("dv_text","")
                 kw = item.get("keyword", item["cat"].lower())
                 bg = item.get("_bg_image") or fetch_background_image(kw)
                 ts_now = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
                 card = generate_card(final_dv, SAMUGA_PUBLIC_SOURCE, ts_now, item["cat"], bg)
+                card.seek(0)
+                card_bytes = card.getvalue()
                 full_caption = (
                     f"🇲🇻 <b>{item['title']}</b>\n\n"
                     f"{final_dv}\n\n"
                     f"📡 <b>ސަމުގާ މީޑިއާ</b> | @samugacommunity"
                 )
-                card.seek(0)
-                remember_post(item["title"], item["cat"], ts_now)
-                db_mark_status(item.get("article_id",""), "posted", posted=True)
                 db_log_learning(
                     article_id=item.get("article_id"),
                     action=("edited" if corrected else "approved"),
-                    member=approver,
-                    category=item.get("cat",""),
-                    source=item.get("source",""),
-                    theme=item.get("_trend_theme",""),
+                    member=approver, category=item.get("cat",""),
+                    source=item.get("source",""), theme=item.get("_trend_theme",""),
                     original_caption=item.get("dv_text",""),
-                    final_caption=(corrected or item.get("dv_text","")),
-                    lang="dv")
+                    final_caption=(corrected or item.get("dv_text","")), lang="dv")
+            else:
+                card_bytes   = item["card_bytes"]
+                full_caption = item["caption"]
+                db_log_learning(
+                    article_id=item.get("article_id"),
+                    action="approved", member=approver, category=item.get("cat",""),
+                    source=item.get("source",""), theme=item.get("_trend_theme",""),
+                    original_caption=item.get("caption",""),
+                    final_caption=item.get("caption",""), lang="en")
+
+            is_breaking_card = item.get("is_breaking", False)
+            lang   = item["lang"]
+            cat    = item.get("cat","LOCAL")
+            ts_now = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
+
+            # ── Website publish — ALWAYS, for any approved destination ─────────
+            try:
+                if lang != "dv" or should_publish_dhivehi_to_website(item, approved=True):
+                    db_publish_article_for_website(
+                        article_id=item.get("article_id"),
+                        title=item.get("title",""), summary=item.get("summary",""),
+                        category=cat, source=item.get("source","Samuga Media"),
+                        link=item.get("link",""), lang=lang, is_breaking=is_breaking_card)
+                    log.info(f"🌐 Website published on approval: {item.get('title','')[:60]}")
+            except Exception as we:
+                log.error(f"[WEBSITE] approve publish failed: {we}")
+
+            db_mark_status(item.get("article_id",""), "posted", posted=True)
+            remember_post(item["title"], cat, ts_now, is_breaking_card)
+
+            # ── Telegram: DIRECT post (no queue) ──────────────────────────────
+            tg_ok = False
+            if want_tg:
+                try:
+                    if is_breaking_card or can_post_regular() or destination == "telegram":
+                        # Manual "Post to Telegram" overrides the regular gap/cap —
+                        # a human chose to post it now.
+                        tg_ok = bool(send_to_telegram(io.BytesIO(card_bytes), full_caption))
+                        if tg_ok:
+                            if isinstance(tg_ok, int) and item.get("article_id"):
+                                db_set_article_message(item.get("article_id"), tg_ok)
+                            if not is_breaking_card:
+                                global last_regular_post_time
+                                last_regular_post_time = utcnow()
+                                persist_state()
+                        log.info(f"📣 Direct Telegram post {key.upper()}: {'✅' if tg_ok else '❌'}")
+                    else:
+                        log.info(f"📣 Telegram cap/gap not met for {key.upper()} — posting anyway (manual approve)")
+                        tg_ok = bool(send_to_telegram(io.BytesIO(card_bytes), full_caption))
+                except Exception as te:
+                    log.error(f"Direct Telegram post failed: {te}")
+
+            # ── Social (FB/IG/X): via queue, Telegram already handled above ───
+            if want_social:
                 queue_for_social(
-                    io.BytesIO(card.getvalue()), full_caption,
+                    io.BytesIO(card_bytes), full_caption,
                     notify_chat_id=CORE_TEAM_CHAT_ID,
                     notify_thread_id=CONTENT_LAB_THREAD_ID,
                     key_label=key.upper(),
-                    tg_ok=False,
-                    post_telegram=True,
+                    tg_ok=tg_ok,
+                    post_telegram=False,          # Telegram never goes through the queue now
                     article_id=item.get("article_id"),
-                    title=item.get("title",""),
-                    summary=item.get("summary",""),
-                    cat=item.get("cat","LOCAL"),
-                    source=item.get("source","Samuga Media"),
-                    link=item.get("link",""),
-                    lang="dv",
-                    is_breaking=item.get("is_breaking", False))
-            else:
-                # English — use existing card bytes
-                is_breaking_card = item.get("is_breaking", False)
-                if is_breaking_card:
-                    _publish_now(
-                        item["card_bytes"], item["caption"], item["cat"],
-                        item["title"], item["link"],
-                        is_breaking_flag=True,
-                        allow_social=True,
-                        article_id=item.get("article_id",""))
-                else:
-                    db_mark_status(item.get("article_id",""), "posted", posted=True)
-                    db_log_learning(
-                        article_id=item.get("article_id"),
-                        action="approved",
-                        member=approver,
-                        category=item.get("cat",""),
-                        source=item.get("source",""),
-                        theme=item.get("_trend_theme",""),
-                        original_caption=item.get("caption",""),
-                        final_caption=item.get("caption",""),
-                        lang="en")
-                    queue_for_social(
-                        io.BytesIO(item["card_bytes"]), item["caption"],
-                        notify_chat_id=CORE_TEAM_CHAT_ID,
-                        notify_thread_id=CONTENT_LAB_THREAD_ID,
-                        key_label=key.upper(),
-                        tg_ok=False,
-                        post_telegram=True,
-                        article_id=item.get("article_id"),
-                        title=item.get("title",""),
-                        summary=item.get("summary",""),
-                        cat=item.get("cat","LOCAL"),
-                        source=item.get("source","Samuga Media"),
-                        link=item.get("link",""),
-                        lang="en",
-                        is_breaking=is_breaking_card)
+                    title=item.get("title",""), summary=item.get("summary",""),
+                    cat=cat, source=item.get("source","Samuga Media"),
+                    link=item.get("link",""), lang=lang, is_breaking=is_breaking_card)
+
+            # ── Confirmation ──────────────────────────────────────────────────
+            dest_label = {"telegram":"Telegram only","social":"Socials only","all":"Telegram + Socials"}.get(destination, destination)
+            tg_icon = "✅" if tg_ok else ("⏭️" if not want_tg else "❌")
+            soc_icon = "🕐 queued" if want_social else "⏭️ skipped"
+            send_text(CORE_TEAM_CHAT_ID,
+                f"📤 <b>{key.upper()}</b> approved by <b>{approver}</b> → {dest_label}\n"
+                f"Telegram {tg_icon} · Socials {soc_icon} · Website ✅",
+                thread_id=CONTENT_LAB_THREAD_ID)
         except Exception as e:
             log.error(f"publish_approved_item error: {e}")
             send_text(CORE_TEAM_CHAT_ID, f"❌ Error publishing {key}: {e}",
@@ -3910,40 +3964,39 @@ def handle_updates():
                     cbq_chat_id = cbq_chat.get("id")
                     cbq_name = cbq_user.get("first_name","Team")
 
-                    if cbq_data.startswith("approve:") or cbq_data.startswith("reject:") or cbq_data.startswith("edit_approve:"):
+                    if (cbq_data.startswith("post_tg:") or cbq_data.startswith("post_soc:")
+                            or cbq_data.startswith("post_all:") or cbq_data.startswith("approve:")
+                            or cbq_data.startswith("reject:") or cbq_data.startswith("edit_approve:")):
                         parts    = cbq_data.split(":", 1)
                         action   = parts[0]
                         cb_key   = parts[1].lower() if len(parts) > 1 else ""
 
-                        if action == "approve" and cb_key in approval_queue:
-                            answer_callback_query(cbq_id, "✅ Approving...")
+                        # Map button → destination
+                        DEST_MAP = {"post_tg":"telegram", "post_soc":"social",
+                                    "post_all":"all", "approve":"all"}
+
+                        if action in DEST_MAP and cb_key in approval_queue:
+                            destination = DEST_MAP[action]
+                            dest_word = {"telegram":"Telegram","social":"Socials","all":"everywhere"}[destination]
+                            answer_callback_query(cbq_id, f"📤 Posting to {dest_word}...")
                             item = approval_queue.pop(cb_key)
                             persist_state()
-                            # Remove buttons from the card message
                             edit_message_reply_markup(cbq_chat_id, cbq_msg_id, {"inline_keyboard": []})
-                            # Run the same approve logic as the text command
                             try:
-                                ok = False
                                 if item["lang"] == "dv":
                                     import threading as _thr
-                                    def _approve_dv_bg(itm, k, nm):
-                                        try:
-                                            from cards import generate_dhivehi_card, fetch_background_image
-                                            bg = fetch_background_image(None, itm.get("cat","LOCAL"), itm.get("title",""))
-                                            buf = generate_dhivehi_card(itm.get("dv_text",""), itm.get("source",""), itm.get("timestamp",""), itm.get("cat","LOCAL"), bg)
-                                            if buf:
-                                                itm["card_bytes"] = buf.getvalue() if hasattr(buf,"getvalue") else buf.read()
-                                        except Exception as ex:
-                                            log.error(f"DV card bg: {ex}")
-                                        publish_approved_item(itm, k, approver=nm)
-                                    _thr.Thread(target=_approve_dv_bg, args=(item, cb_key, cbq_name), daemon=True).start()
-                                    send_text(cbq_chat_id, f"✅ <b>{cbq_name}</b> approved <b>{cb_key.upper()}</b> (Dhivehi) — generating card...", thread_id=CONTENT_LAB_THREAD_ID)
+                                    def _approve_dv_bg(itm, k, nm, dest):
+                                        publish_approved_item(itm, k, approver=nm, destination=dest)
+                                    _thr.Thread(target=_approve_dv_bg,
+                                                args=(item, cb_key, cbq_name, destination), daemon=True).start()
+                                    send_text(cbq_chat_id,
+                                        f"✅ <b>{cbq_name}</b> approved <b>{cb_key.upper()}</b> (Dhivehi) → {dest_word} — generating card...",
+                                        thread_id=CONTENT_LAB_THREAD_ID)
                                 else:
-                                    publish_approved_item(item, cb_key, approver=cbq_name)
-                                    send_text(cbq_chat_id, f"✅ <b>{cbq_name}</b> approved <b>{cb_key.upper()}</b> — publishing!", thread_id=CONTENT_LAB_THREAD_ID)
+                                    publish_approved_item(item, cb_key, approver=cbq_name, destination=destination)
                             except Exception as e:
-                                log.error(f"Button approve error: {e}")
-                                send_text(cbq_chat_id, f"⚠️ Error approving {cb_key}: {e}", thread_id=CONTENT_LAB_THREAD_ID)
+                                log.error(f"Button post error: {e}")
+                                send_text(cbq_chat_id, f"⚠️ Error posting {cb_key}: {e}", thread_id=CONTENT_LAB_THREAD_ID)
 
                         elif action == "reject" and cb_key in approval_queue:
                             import random as _rnd
@@ -3957,12 +4010,14 @@ def handle_updates():
                                 thread_id=CONTENT_LAB_THREAD_ID)
                             log.info(f"❌ {cb_key} rejected via button by {cbq_name}")
 
-                        elif action == "edit_approve":
-                            # Prompt for corrected text via reply
-                            answer_callback_query(cbq_id, "✏️ Reply with corrected Dhivehi text")
+                        elif action == "edit_approve" and cb_key in approval_queue:
+                            # Prompt for corrected text via reply. After they reply with
+                            # corrected text, the /approved handler re-posts with buttons.
+                            answer_callback_query(cbq_id, "✏️ Reply with corrected text")
                             send_text(cbq_chat_id,
-                                f"✏️ <b>{cbq_name}</b>, reply with the corrected Dhivehi text for <b>{cb_key.upper()}</b>:\n"
-                                f"Or just type: <code>/approved {cb_key} [corrected text]</code>",
+                                f"✏️ <b>{cbq_name}</b>, reply with the corrected text for <b>{cb_key.upper()}</b>,\n"
+                                f"then tap a post button again — or type:\n"
+                                f"<code>/approved {cb_key} [corrected text]</code>",
                                 thread_id=CONTENT_LAB_THREAD_ID)
 
                         elif cb_key not in approval_queue:
@@ -4128,130 +4183,21 @@ def handle_updates():
                             if key in approval_queue:
                                 item = approval_queue.pop(key)
                                 persist_state()
-                                action = "edited" if corrected else "approved"
+                                # Text /approved behaves like "Post to All" (Telegram + Socials + Website)
                                 try:
-                                    ok = False
                                     if item["lang"] == "dv":
-                                        # Run card generation in background — gives Uly instant feedback
-                                        def _process_dv(_item=item, _key=key, _corrected=corrected,
-                                                        _cid=chat_id, _tid=thread_id, _fname=first_name, _mid=msg_id):
-                                            try:
-                                                final_dv = _corrected if _corrected else _item["dv_text"]
-                                                kw = _item.get("keyword", _item["cat"].lower())
-                                                # Use pre-fetched bg if available, else fetch now
-                                                bg = _item.get("_bg_image") or fetch_background_image(kw)
-                                                ts_now = (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M")
-                                                card = generate_card(final_dv, SAMUGA_PUBLIC_SOURCE, ts_now, _item["cat"], bg)
-                                                full_caption = (
-                                                    f"🇲🇻 <b>{_item['title']}</b>\n\n"
-                                                    f"{final_dv}\n\n"
-                                                    f"📡 <b>ސަމުގާ މީޑިއާ</b> | @samugacommunity"
-                                                )
-                                                card.seek(0)
-                                                # Queue handles Telegram + FB + IG + X with 10-min gap
-                                                # tg_ok=False initially — queue will post Telegram too
-                                                remember_post(_item["title"], _item["cat"], ts_now)
-                                                db_mark_status(_item.get("article_id",""), "posted", posted=True)
-                                                db_log_learning(
-                                                    article_id=_item.get("article_id"),
-                                                    action=("edited" if _corrected else "approved"),
-                                                    member=_fname,
-                                                    category=_item.get("cat",""),
-                                                    source=_item.get("source",""),
-                                                    theme=_item.get("_trend_theme",""),
-                                                    original_caption=_item.get("dv_text",""),
-                                                    final_caption=(_corrected or _item.get("dv_text","")),
-                                                    lang="dv")
-                                                queue_for_social(
-                                                    io.BytesIO(card.getvalue()), full_caption,
-                                                    notify_chat_id=_cid,
-                                                    notify_thread_id=_tid,
-                                                    key_label=_key.upper(),
-                                                    tg_ok=False,
-                                                    post_telegram=True,   # queue posts Telegram too
-                                                    article_id=_item.get("article_id"),
-                                                    title=_item.get("title",""),
-                                                    summary=_item.get("summary",""),
-                                                    cat=_item.get("cat","LOCAL"),
-                                                    source=_item.get("source","Samuga Media"),
-                                                    link=_item.get("link",""),
-                                                    lang="dv",
-                                                    is_breaking=_item.get("is_breaking", False)
-                                                )
-                                            except Exception as e:
-                                                log.error(f"DV approval processing: {e}")
-                                                send_text(_cid, f"❌ Error processing {_key}: {e}", thread_id=_tid)
+                                        def _process_dv(_item=item, _key=key, _corrected=corrected, _fname=first_name):
+                                            publish_approved_item(_item, _key, approver=_fname,
+                                                                  corrected=_corrected, destination="all")
                                         threading.Thread(target=_process_dv, daemon=True).start()
-                                        ok = True  # optimistic — thread handles actual result
+                                        send_text(chat_id, f"✅ Approved <b>{key.upper()}</b> (Dhivehi) → posting everywhere…",
+                                                  reply_to=msg_id, thread_id=thread_id)
                                     else:
-                                        # English — queue for Telegram + social (10-min gap)
-                                        # EXCEPT breaking which fires immediately
-                                        is_breaking_card = item.get("is_breaking", False)
-                                        if is_breaking_card:
-                                            # Breaking bypasses queue — fires to all platforms now
-                                            tg_ok, social_res = _publish_now(
-                                                item["card_bytes"], item["caption"], item["cat"],
-                                                item["title"], item["link"],
-                                                is_breaking_flag=True,
-                                                allow_social=item.get("allow_social", True),
-                                                rewritten=item.get("rewritten",""),
-                                                summary=item.get("summary",""),
-                                                report_to=(chat_id, thread_id),
-                                                article_id=item.get("article_id")
-                                            )
-                                            ok = tg_ok
-                                        else:
-                                            # Regular — joins queue with 10-min gap
-                                            buf = io.BytesIO(item["card_bytes"])
-                                            queue_for_social(
-                                                buf, item["caption"],
-                                                notify_chat_id=chat_id,
-                                                notify_thread_id=thread_id,
-                                                key_label=key.upper(),
-                                                tg_ok=False,
-                                                post_telegram=True,
-                                                article_id=item.get("article_id"),
-                                                title=item.get("title",""),
-                                                summary=item.get("summary",""),
-                                                cat=item.get("cat","LOCAL"),
-                                                source=item.get("source","Samuga Media"),
-                                                link=item.get("link",""),
-                                                lang=item.get("lang","en"),
-                                                is_breaking=item.get("is_breaking", False)
-                                            )
-                                            ok = True
-
-                                    # DV cards handled entirely in background thread above
-                                    if item.get("lang") == "dv":
-                                        pass  # thread handles posting, confirmation and logging
-                                    elif ok:
-                                        if item.get("article_id"):
-                                            db_mark_status(item["article_id"], "posted", posted=True)
-                                        db_log_learning(
-                                            article_id=item.get("article_id"),
-                                            action=("edited" if corrected else "approved"),
-                                            member=first_name,
-                                            category=item.get("cat",""),
-                                            source=item.get("source",""),
-                                            theme=item.get("_trend_theme",""),
-                                            original_caption=item.get("dv_text") or item.get("caption",""),
-                                            final_caption=(corrected or item.get("dv_text") or item.get("caption","")),
-                                            lang=item.get("lang","en"))
-                                        log.info(f"✅ {key} ({item['lang']}) posted by {first_name}")
-                                    else:
-                                        # Telegram failed — put card back so team can retry
-                                        approval_queue[key] = item
-                                        persist_state()
-                                        send_text(chat_id,
-                                            f"❌ <b>{key.upper()} — Telegram failed</b>\n\n"
-                                            f"Card is still in queue. Try again:\n"
-                                            f"<code>/approved {key}</code>\n"
-                                            f"Or reject: <code>/reject {key}</code>",
-                                            reply_to=msg_id, thread_id=thread_id)
-                                        log.error(f"❌ {key} post failed for {first_name}")
+                                        publish_approved_item(item, key, approver=first_name,
+                                                              corrected=corrected, destination="all")
+                                    log.info(f"✅ {key} ({item['lang']}) approved by {first_name} (text /approved)")
                                 except Exception as e:
                                     log.error(f"Approval post error: {e}")
-                                    # Put card back so team can retry
                                     approval_queue[key] = item
                                     persist_state()
                                     send_text(chat_id,
@@ -5101,17 +5047,21 @@ def handle_updates():
                         elif text.strip().lower().startswith("/qdel "):
                             try:
                                 n = int(text.strip().split()[1]) - 1  # convert to 0-indexed
+                                removed = None
+                                remaining = 0
                                 with _social_queue_lock:
                                     if 0 <= n < len(_social_queue):
                                         removed = _social_queue.pop(n)
-                                        title = removed.get("title", removed.get("key_label","?"))[:60]
-                                        send_text(chat_id,
-                                            f"🗑 <b>Deleted from queue:</b>\n{title}\n"
-                                            f"<i>{len(_social_queue)} item(s) remaining</i>",
-                                            reply_to=msg_id, thread_id=thread_id)
-                                        persist_state()
-                                    else:
-                                        send_text(chat_id, f"❌ No item #{n+1} in queue. Use <code>/queue</code> to see current list.", reply_to=msg_id, thread_id=thread_id)
+                                        remaining = len(_social_queue)
+                                if removed is not None:
+                                    title = removed.get("title", removed.get("key_label","?"))[:60]
+                                    send_text(chat_id,
+                                        f"🗑 <b>Deleted from queue:</b>\n{title}\n"
+                                        f"<i>{remaining} item(s) remaining</i>",
+                                        reply_to=msg_id, thread_id=thread_id)
+                                    persist_state()
+                                else:
+                                    send_text(chat_id, f"❌ No item #{n+1} in queue. Use <code>/queue</code> to see current list.", reply_to=msg_id, thread_id=thread_id)
                             except (ValueError, IndexError):
                                 send_text(chat_id, "Usage: <code>/qdel 2</code> (deletes item #2 from queue)", reply_to=msg_id, thread_id=thread_id)
                             except Exception as qde:
@@ -5133,19 +5083,20 @@ def handle_updates():
                                     send_text(chat_id, f"▶️ Force posting: <b>{title}</b>...", reply_to=msg_id, thread_id=thread_id)
                                     try:
                                         import io as _io
-                                        img_buf = _io.BytesIO(item["img_bytes"])
-                                        result = post_to_buffer(img_buf, item["caption"])
                                         tg_ok = item.get("tg_ok", False)
                                         if not tg_ok and item.get("post_telegram", True):
-                                            tg_ok = send_photo_to_community(item["img_bytes"], item["caption"])
-                                        fb = "✅" if result.get("fb") else "❌"
-                                        ig = "✅" if result.get("ig") else "❌"
-                                        x  = "✅" if result.get("x")  else "❌"
+                                            tg_ok = bool(send_to_telegram(_io.BytesIO(item["img_bytes"]), item["caption"]))
+                                        results = _post_to_social_now(_io.BytesIO(item["img_bytes"]), item["caption"]) or {}
+                                        fb = "✅" if results.get("Facebook")  else "❌"
+                                        ig = "✅" if results.get("Instagram") else "❌"
+                                        x  = "✅" if results.get("Twitter")   else "❌"
                                         tg = "✅" if tg_ok else "❌"
+                                        with _social_queue_lock:
+                                            still = len(_social_queue)
                                         send_text(chat_id,
                                             f"✅ <b>Force posted!</b>\n"
                                             f"Telegram {tg} · FB {fb} · IG {ig} · X {x}\n"
-                                            f"<i>{len(_social_queue)} item(s) still in queue</i>",
+                                            f"<i>{still} item(s) still in queue</i>",
                                             reply_to=msg_id, thread_id=thread_id)
                                         globals()["_last_social_post_time"] = utcnow()
                                         persist_state()
@@ -6858,7 +6809,7 @@ DATA_DIR   = "/data"
 _os.makedirs(DATA_DIR, exist_ok=True)
 SEEN_FILE  = _os.path.join(DATA_DIR, "seen_articles.json")
 STATE_FILE = _os.path.join(DATA_DIR, "bot_state.json")
-_state_lock = _threading.Lock()
+_state_lock = _threading.RLock()  # reentrant for safety against nested persist calls
 _poll_offset = [0]
 
 def load_seen():
