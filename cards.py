@@ -278,15 +278,31 @@ def generate_dhivehi_card(text, source, timestamp, cat, bg_image=None):
     ctx.move_to(63, tag_y + 6); PangoCairo.show_layout(ctx, cat_lo)
 
     # Headline + body
-    words = text.split()
-    hw, bw, cc = [], [], 0
-    for i, w in enumerate(words):
-        if cc < 80:
-            hw.append(w); cc += len(w) + 1
+    # Rule: an explicit blank line (\n\n) is an intentional headline/subhead
+    # separator and is ALWAYS honored. Part 1 = headline, the rest = subhead.
+    # If there is NO blank line, the whole text stays as headline and simply
+    # wraps to more lines — UNLESS it is very long (no blank line, >160 chars),
+    # in which case we fall back to the old 80-char auto-split so auto-generated
+    # cards still look balanced.
+    _blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
+    if len(_blocks) >= 2:
+        headline = _blocks[0].replace("\n", " ").strip()
+        body     = " ".join(b.replace("\n", " ") for b in _blocks[1:]).strip()
+    else:
+        single = (_blocks[0] if _blocks else text).replace("\n", " ").strip()
+        if len(single) <= 160:
+            headline = single
+            body     = ""
         else:
-            bw = words[i:]; break
-    headline = " ".join(hw)
-    body     = " ".join(bw)
+            words = single.split()
+            hw, bw, cc = [], [], 0
+            for i, w in enumerate(words):
+                if cc < 80:
+                    hw.append(w); cc += len(w) + 1
+                else:
+                    bw = words[i:]; break
+            headline = " ".join(hw)
+            body     = " ".join(bw)
 
     def to_arabic_nums(t):
         return t.translate(str.maketrans("0123456789", "\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669"))
@@ -446,17 +462,32 @@ def generate_card(text, source, timestamp, cat, bg_image=None, morning=False, _s
             "0123456789", "\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669"))
 
     # Split headline vs body
-    if has_thaana:
-        words = text.split(); hw, bw, cc = [], [], 0
-        for i, w in enumerate(words):
-            if cc < 80: hw.append(w); cc += len(w) + 1
-            else:       bw = words[i:]; break
-        headline = " ".join(hw)
-        body     = " ".join(bw)
+    # Rule: explicit blank line (\n\n) = intentional headline/subhead separator,
+    # always honored. No blank line = whole text stays headline (wraps), unless
+    # very long, where we fall back to the original auto-split behaviour.
+    _blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
+    if len(_blocks) >= 2:
+        headline = _blocks[0].replace("\n", " ").strip()
+        body     = " ".join(b.replace("\n", " ") for b in _blocks[1:]).strip()
+    elif has_thaana:
+        single = (_blocks[0] if _blocks else text).replace("\n", " ").strip()
+        if len(single) <= 160:
+            headline = single; body = ""
+        else:
+            words = single.split(); hw, bw, cc = [], [], 0
+            for i, w in enumerate(words):
+                if cc < 80: hw.append(w); cc += len(w) + 1
+                else:       bw = words[i:]; break
+            headline = " ".join(hw)
+            body     = " ".join(bw)
     else:
-        sentences = text.split(". ")
-        headline  = sentences[0] + ("." if len(sentences) > 1 else "")
-        body      = ". ".join(sentences[1:]) if len(sentences) > 1 else ""
+        single = (_blocks[0] if _blocks else text).replace("\n", " ").strip()
+        if len(single) <= 120 and ". " not in single:
+            headline = single; body = ""
+        else:
+            sentences = single.split(". ")
+            headline  = sentences[0] + ("." if len(sentences) > 1 else "")
+            body      = ". ".join(sentences[1:]) if len(sentences) > 1 else ""
 
     y = tag_y + 48
     for line in wrap(headline, f_title, W - 100)[:4]:

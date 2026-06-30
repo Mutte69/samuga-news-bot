@@ -5475,21 +5475,18 @@ def handle_updates():
                                     card_headline = parts[0]
                                     card_subhead  = " ".join(parts[1:])  # everything after first blank line
                                     if len(card_subhead) <= SUBHEAD_CARD_LIMIT:
-                                        # Fits on card — pass as one block with newline so
-                                        # generate_card renders it as headline + smaller body.
-                                        # We use ". " trick for English, space for Dhivehi path.
-                                        if has_thaana_input:
-                                            content_text = card_headline + " " + card_subhead
-                                        else:
-                                            content_text = card_headline.rstrip(".") + ". " + card_subhead
+                                        # Fits on card — pass headline + subhead separated by a
+                                        # blank line. generate_card / generate_dhivehi_card now
+                                        # honor \n\n as the headline/subhead split explicitly.
+                                        content_text = card_headline + "\n\n" + card_subhead
                                         caption_subhead = ""   # already on card, not needed in caption
                                     else:
                                         # Too long — card gets headline only, subhead goes to caption
                                         content_text  = card_headline
                                         caption_subhead = card_subhead
                                 else:
-                                    # No blank line = just headline, no subhead
-                                    content_text    = raw_text
+                                    # No blank line = everything is headline (wraps), no subhead
+                                    content_text    = parts[0] if parts else raw_text
                                     caption_subhead = ""
 
                                 content_text = content_text or "Samuga Media"
@@ -6887,7 +6884,7 @@ def _save_state(state):
     try:
         with _state_lock:
             tmp = STATE_FILE + ".tmp"
-            with open(tmp, "w") as f: _json.dump(state, f)
+            with open(tmp, "w") as f: _json.dump(state, f, default=str)
             _os.replace(tmp, STATE_FILE)
     except Exception as e: log.error(f"save_state: {e}")
 
@@ -6910,6 +6907,9 @@ def _serialize_approval_queue():
             except Exception:
                 item["card_bytes"] = None
                 item["_card_b64"] = False
+        # Strip non-serializable PIL Image — caused "Object of type Image is not
+        # JSON serializable" crash on every save_state, freezing the bot.
+        item.pop("_bg_image", None)
         item["created_at"] = item["created_at"].isoformat() if item.get("created_at") else None
         out[k] = item
     return out
