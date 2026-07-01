@@ -67,10 +67,46 @@ BREAKING_KEYWORDS = [
 BREAKING_CONTEXT_KEYWORDS = {
     "disaster": ["disaster management", "disaster authority", "disaster relief org",
                  "national disaster", "disaster preparedness", "disaster response org",
-                 "disaster management authority"],
-    "flood":    ["flood relief", "flood management authority"],
-    "fire":     ["fire service", "fire department", "fire station", "fire authority"],
+                 "disaster management authority", "disaster training",
+                 "disaster drill", "disaster exercise", "disaster simulation"],
+    "flood":    ["flood relief", "flood management authority", "flood drill",
+                 "flood exercise", "flood simulation", "flood preparedness"],
+    "fire":     ["fire service", "fire department", "fire station", "fire authority",
+                 "fire drill", "fire exercise", "fire simulation", "fire training",
+                 "smoke and fire used during", "not to be alarmed by smoke",
+                 "do not be alarmed by smoke"],
 }
+
+# Planned drills/exercises often use urgent words such as emergency, disaster,
+# smoke, fire, evacuation, and rescue. These are public notices, not breaking
+# news, unless the text also confirms a real incident happened.
+PLANNED_EXERCISE_TERMS = [
+    "exercise", "emergency exercise", "full-scale emergency exercise",
+    "drill", "mock drill", "safety drill", "fire drill",
+    "simulation", "training", "disaster training", "disaster management training",
+    "preparedness", "preparedness protocols", "routine safety",
+    "planned drill", "planned exercise", "scheduled drill", "scheduled exercise",
+    "annual exercise", "annual full-scale", "test", "trial", "practice",
+    "awareness", "not to be alarmed", "do not be alarmed",
+    "public is urged not to be alarmed", "public advised not to be alarmed",
+]
+
+EMERGENCY_WORDS = [
+    "emergency", "disaster", "fire", "smoke", "evacuation", "evacuate",
+    "rescue", "alarm", "incident", "hazard", "sirens", "explosion",
+]
+
+REAL_INCIDENT_TERMS = [
+    "breaking", "developing", "happening now", "currently", "ongoing",
+    "broke out", "breaks out", "has broken out", "caught fire", "on fire",
+    "explosion", "blast", "gas leak", "emergency landing", "crash landed",
+    "capsized", "sank", "sinking", "collision", "crash", "collapsed",
+    "killed", "dead", "dies", "death", "fatal", "injured", "wounded",
+    "missing", "swept away", "search and rescue", "rescue operation",
+    "evacuated", "evacuation ordered", "public warned", "warning issued",
+    "road closed", "airport closed", "services suspended", "operations halted",
+    "police confirm", "mndf confirms", "firefighters", "ambulance",
+]
 
 BREAKING_BLACKLIST = [
     "world cup", "football", "cricket", "sports", "fifa", "champions league",
@@ -98,6 +134,15 @@ def _looks_like_ad(text):
     t = text.lower()
     return any(m in t for m in _AD_MARKERS)
 
+def _has_phrase(text, phrase):
+    """Safer phrase match so blacklist word 'team' does not match 'teams'."""
+    t = text or ""
+    p = (phrase or "").strip().lower()
+    if not p:
+        return False
+    pattern = r"(?<![a-z0-9])" + re.escape(p).replace(r"\ ", r"\s+") + r"(?![a-z0-9])"
+    return re.search(pattern, t) is not None
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Language helpers
@@ -117,31 +162,63 @@ def _is_context_breaking(text, kw, false_contexts):
             return False
     return True
 
-def is_breaking(title, summary="", cat=""):
-    """Return True if article qualifies as breaking news."""
+def is_planned_exercise_notice(text):
+    """Return True when scary emergency language is only describing a planned drill/training.
+
+    This prevents false BREAKING posts like "emergency exercise",
+    "disaster training", "fire drill", or "do not be alarmed by smoke".
+    A real incident phrase overrides this guard.
+    """
+    t = (text or "").lower()
+    has_exercise_context = any(term in t for term in PLANNED_EXERCISE_TERMS)
+    has_emergency_word = any(term in t for term in EMERGENCY_WORDS)
+    has_real_incident = any(term in t for term in REAL_INCIDENT_TERMS)
+
+    # When the story clearly says a real incident happened, do not block breaking.
+    if has_real_incident:
+        return False
+
+    return bool(has_exercise_context and has_emergency_word)
+
+def classify_breaking_context(title, summary="", cat=""):
+    """Explain the breaking-news decision for admin/debug use."""
     text = (title + " " + summary).lower()
 
     if cat in ["FOOTBALL", "TOURISM", "WEATHER", "SPORTS", "LIFESTYLE"]:
-        return False
+        return {"breaking": False, "category": "normal", "reason": f"Category {cat} is not eligible for breaking."}
     if _looks_like_ad(text):
-        return False
-    if any(bl in text for bl in BREAKING_BLACKLIST):
-        return False
-    # Check standard keywords
+        return {"breaking": False, "category": "normal", "reason": "Looks like ad/promo content."}
+    if any(_has_phrase(text, bl) for bl in BREAKING_BLACKLIST):
+        return {"breaking": False, "category": "normal", "reason": "Routine/blacklisted context, not breaking."}
+    if is_planned_exercise_notice(text):
+        hits = [x for x in PLANNED_EXERCISE_TERMS if x in text][:4]
+        return {
+            "breaking": False,
+            "category": "public_notice",
+            "reason": "Emergency/disaster words appear in planned drill/training context: " + ", ".join(hits),
+        }
+
     standard_hit = any(kw in text for kw in BREAKING_KEYWORDS)
-    # Check context-aware keywords (e.g. "disaster" only if NOT "disaster management authority")
     context_hit = any(
         _is_context_breaking(text, kw, false_ctxs)
         for kw, false_ctxs in BREAKING_CONTEXT_KEYWORDS.items()
     )
     if not standard_hit and not context_hit:
-        return False
+        return {"breaking": False, "category": "normal", "reason": "No confirmed real breaking incident signal."}
+
     if cat == "LOCAL":
         mv_terms = ["maldives", "male", "malé", "dhivehi", "maldivian", "raajje",
-                    "atoll", "police", "court", "majlis", "minister", "president", "island"]
+                    "atoll", "police", "court", "majlis", "minister", "president", "island",
+                    "velana", "hulhumale", "hulhumalé", "villimale", "villimalé",
+                    "thilafushi", "kaafu", "addu", "fuvahmulah"]
         if not any(t in text for t in mv_terms):
-            return False
-    return True
+            return {"breaking": False, "category": "normal", "reason": "Local category but no Maldives/local signal."}
+
+    return {"breaking": True, "category": "breaking", "reason": "Real urgent incident signal detected."}
+
+def is_breaking(title, summary="", cat=""):
+    """Return True if article qualifies as real breaking news."""
+    return bool(classify_breaking_context(title, summary, cat).get("breaking"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
