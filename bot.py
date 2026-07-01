@@ -396,7 +396,7 @@ def expire_old_approvals():
             buf = io.BytesIO(item["card_bytes"])
             queue_for_social(buf, item["caption"],
                 key_label=f"{k.upper()} (breaking auto)",
-                tg_ok=False, post_telegram=True, is_breaking=True,
+                tg_ok=False, post_telegram=False, is_breaking=True,
                 article_id=item.get("article_id"), title=item.get("title",""),
                 summary=item.get("summary",""), cat=item.get("cat","BREAKING"),
                 source=item.get("source","Samuga Media"), link=item.get("link",""),
@@ -421,7 +421,7 @@ def expire_old_approvals():
             buf = io.BytesIO(item["card_bytes"])
             queue_for_social(buf, item["caption"],
                 key_label=f"{k.upper()} (auto)",
-                tg_ok=False, post_telegram=True,
+                tg_ok=False, post_telegram=False,
                 article_id=item.get("article_id"), title=item.get("title",""),
                 summary=item.get("summary",""), cat=item.get("cat","LOCAL"),
                 source=item.get("source","Samuga Media"), link=item.get("link",""),
@@ -1216,8 +1216,10 @@ mutation CreatePost($input: CreatePostInput!) {
         log.error(f"Buffer exception [{channel_id[:8]}]: {e}")
     return False
 
-# ── Social posting queue — 10 minute gap between posts ───────────────────────
-# Prevents flooding FB/IG/X when multiple cards are approved at once.
+# ── Social posting queue — dynamic gap for FB/IG/X only ──────────────────────
+# Telegram is intentionally NOT handled by this queue. Telegram posts are sent
+# directly from the manual Telegram / All buttons, so a Telegram cap/gap can
+# never hold FB/IG/X hostage again.
 # Each item: {"img_bytes": bytes, "caption": str, "queued_at": datetime}
 _social_queue = []
 _social_queue_lock = threading.RLock()  # RLock: reentrant — persist_state() acquires
@@ -1225,14 +1227,18 @@ _social_queue_lock = threading.RLock()  # RLock: reentrant — persist_state() a
                                         # persist_state() while already holding it. A plain
                                         # Lock self-deadlocks there and freezes the whole bot.
 _last_social_post_time = None
-SOCIAL_GAP_SECONDS = 600  # 10 minutes
+SOCIAL_NORMAL_GAP_SECONDS = int(os.environ.get("SOCIAL_NORMAL_GAP_SECONDS", "300"))       # 5 minutes normally
+SOCIAL_BACKLOG_GAP_SECONDS = int(os.environ.get("SOCIAL_BACKLOG_GAP_SECONDS", "60"))      # 1 minute catch-up
+SOCIAL_BACKLOG_TRIGGER = int(os.environ.get("SOCIAL_BACKLOG_TRIGGER", "5"))               # queue size for catch-up
+SOCIAL_MAX_WAIT_SECONDS = int(os.environ.get("SOCIAL_MAX_WAIT_SECONDS", "600"))           # oldest item target wait
+SOCIAL_STUCK_ALERT_SECONDS = int(os.environ.get("SOCIAL_STUCK_ALERT_SECONDS", "900"))     # 15 minute ops alert
 
 # Personality messages for queue notifications
 QUEUE_PERSONALITY = [
     "yea yea it's in the queue. 😮‍💨",
     "queued. The algorithm likes it spaced out. Unlike Uly's approvals. 😅",
     "in the queue. Good things take time. 🕐",
-    "queued. You're too bossy today, I need my 10 minutes. 😤",
+    "queued. You're too bossy today, but I'll speed up if backlog gets big. 😤",
     "in the queue. Quality over quantity. 💅",
     "queued. I'm tired, not lazy. There's a difference. 😴",
     "queued. Back-to-back posting is so 2022. ⏳",
@@ -1245,18 +1251,44 @@ def _get_queue_msg():
     import random
     return random.choice(QUEUE_PERSONALITY)
 
+def _oldest_social_queue_age_seconds():
+    """Age of the oldest queued social item in seconds."""
+    with _social_queue_lock:
+        if not _social_queue:
+            return 0
+        qa = _social_queue[0].get("queued_at")
+    if isinstance(qa, str):
+        try:
+            qa = datetime.fromisoformat(qa)
+        except Exception:
+            qa = None
+    if not qa:
+        return SOCIAL_MAX_WAIT_SECONDS
+    return max(0, (utcnow() - qa).total_seconds())
+
+def _current_social_gap_seconds():
+    """Dynamic social gap: 5min normally, 1min during backlog/catch-up."""
+    with _social_queue_lock:
+        qlen = len(_social_queue)
+    oldest_age = _oldest_social_queue_age_seconds()
+    if qlen >= SOCIAL_BACKLOG_TRIGGER or oldest_age >= SOCIAL_MAX_WAIT_SECONDS:
+        return SOCIAL_BACKLOG_GAP_SECONDS
+    return SOCIAL_NORMAL_GAP_SECONDS
+
 def _calc_eta_seconds():
     """How many seconds until the next social post can go out."""
     if _last_social_post_time is None:
         return 0
+    gap = _current_social_gap_seconds()
     elapsed = (utcnow() - _last_social_post_time).total_seconds()
-    return max(0, SOCIAL_GAP_SECONDS - elapsed)
+    return max(0, gap - elapsed)
 
 def _social_queue_worker():
     """
-    Background thread — drains one post every 10 minutes.
-    Each item posts to Telegram community + FB + IG + X in sequence.
-    BREAKING news bypasses this queue entirely and posts immediately.
+    Background thread — drains FB/IG/X only.
+    Normal pace is 1 post every 5 minutes. If the queue builds up or the oldest
+    item reaches the max-wait target, it switches to 1 post every minute until
+    caught up. Telegram is never posted from this worker.
     """
     global _last_social_post_time
     while True:
@@ -1266,8 +1298,9 @@ def _social_queue_worker():
                 if not _social_queue:
                     continue
                 now = utcnow()
+                gap = _current_social_gap_seconds()
                 if (_last_social_post_time and
-                        (now - _last_social_post_time).total_seconds() < SOCIAL_GAP_SECONDS):
+                        (now - _last_social_post_time).total_seconds() < gap):
                     continue
                 item = _social_queue.pop(0)
 
@@ -1291,71 +1324,17 @@ def _social_queue_worker():
             key_label  = item.get("key_label", "Post")
             notify_cid = item.get("notify_chat_id")
             notify_tid = item.get("notify_thread_id")
-            log.info(f"[QUEUE] Posting {key_label} (Telegram + FB+IG+X) — {remaining} remaining")
+            log.info(f"[QUEUE] Posting {key_label} to FB+IG+X only — {remaining} remaining")
 
-            # 1. Post to Telegram community (respects daily cap + 2hr gap for regular posts)
-            tg_ok = False
-            if item.get("post_telegram", True):
-                is_breaking_item = item.get("is_breaking", False)
-                if is_breaking_item or can_post_regular():
-                    try:
-                        buf = io.BytesIO(item["img_bytes"])
-                        tg_ok = bool(send_to_telegram(buf, item["caption"]))
-                        if tg_ok and not is_breaking_item:
-                            global last_regular_post_time
-                            last_regular_post_time = utcnow()
-                            persist_state()
-                        log.info(f"[QUEUE] Telegram: {'✅' if tg_ok else '❌'}")
-                        if tg_ok and item.get("article_id"):
-                            try:
-                                if item.get("lang","en") != "dv" or should_publish_dhivehi_to_website(item, approved=True):
-                                    db_publish_article_for_website(
-                                        article_id=item.get("article_id"),
-                                        title=item.get("title",""),
-                                        summary=item.get("summary",""),
-                                        category=item.get("cat","LOCAL"),
-                                        source=item.get("source","Samuga Media"),
-                                        link=item.get("link",""),
-                                        lang=item.get("lang","en"),
-                                        is_breaking=item.get("is_breaking", False)
-                                    )
-                                else:
-                                    log.info(f"🌐 Dhivehi website sync skipped (approval-only policy): {item.get('title','')[:70]}")
-                                if isinstance(tg_ok, int):
-                                    db_set_article_message(item.get("article_id"), tg_ok)
-                                if item.get("title"):
-                                    remember_post(item.get("title"), item.get("cat","LOCAL"),
-                                                  (utcnow() + timedelta(hours=5)).strftime("%d %b %Y • %H:%M"),
-                                                  item.get("is_breaking", False))
-                            except Exception as e:
-                                log.error(f"[WEBSITE] queue publish sync failed: {e}")
-                    except Exception as e:
-                        log.error(f"[QUEUE] Telegram: {e}")
-                else:
-                    # Telegram is capped or inside its 2hr gap. Do NOT hold the whole
-                    # item hostage — FB/IG/X are not subject to the Telegram cap.
-                    # Re-queue (Telegram-first) only for a limited window, then give up
-                    # on Telegram and let the item fall through to social so it never
-                    # gets stuck forever. queued_at missing → treat as already old.
-                    qa = item.get("queued_at")
-                    if isinstance(qa, str):
-                        try: qa = datetime.fromisoformat(qa)
-                        except Exception: qa = None
-                    age_mins = (utcnow() - qa).total_seconds() / 60 if qa else 9999
-                    if age_mins < 120:
-                        log.info(f"[QUEUE] Telegram capped/gap — re-queueing {key_label} ({int(age_mins)}m old)")
-                        with _social_queue_lock:
-                            _social_queue.insert(0, item)  # put back at front
-                        time.sleep(60)  # wait before re-checking
-                        continue
-                    else:
-                        # Aged out — skip Telegram, still publish to FB/IG/X below.
-                        log.info(f"[QUEUE] Telegram given up after {int(age_mins)}m — posting {key_label} to social only")
-                        tg_ok = False
-            else:
-                tg_ok = item.get("tg_ok", False)
+            # Telegram is deliberately separated from the social queue.
+            # Older persisted queue items may still have post_telegram=True; ignore it
+            # so Telegram cap/gap can never re-queue or block social publishing.
+            tg_ok = item.get("tg_ok", False)
+            if item.get("post_telegram"):
+                log.info(f"[QUEUE] Telegram skipped for {key_label} — social queue is FB/IG/X only")
+                item["post_telegram"] = False
 
-            # We are now committed to posting this item — advance the 10-min gate.
+            # We are now committed to posting this item — advance the dynamic gate.
             _last_social_post_time = utcnow()
 
             # 2. Post to FB + IG + X
@@ -1363,11 +1342,11 @@ def _social_queue_worker():
                 io.BytesIO(item["img_bytes"]), item["caption"])
 
             # 3. Send per-platform confirmation
-            tg_icon = "✅" if tg_ok else "❌"
+            tg_icon = "✅ already" if tg_ok else "⏭️ skipped"
             fb_icon = "✅" if results.get("Facebook")  else "❌"
             ig_icon = "✅" if results.get("Instagram") else "❌"
             x_icon  = "✅" if results.get("Twitter")   else "❌"
-            conf_msg = (f"📤 <b>{key_label}</b> posted\n"
+            conf_msg = (f"📤 <b>{key_label}</b> social posted\n"
                         f"Telegram {tg_icon} · FB {fb_icon} · IG {ig_icon} · X {x_icon}")
             if notify_cid:
                 send_text(notify_cid, conf_msg, thread_id=notify_tid)
@@ -1384,9 +1363,9 @@ def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=Non
                      article_id=None, title="", summary="", cat="LOCAL",
                      source="Samuga Media", link="", lang="en", is_breaking=False):
     """
-    Add a card to the 10-minute publish queue.
-    post_telegram=True  → queue will post to Telegram community too (standard flow)
-    post_telegram=False → Telegram was already posted separately (breaking news)
+    Add a card to the dynamic FB/IG/X publish queue.
+    Telegram is not posted from this queue. Use the separate Telegram / All
+    buttons for Telegram; this prevents Telegram caps from blocking socials.
 
     Website sync fix:
     If article_id/title are passed, the article is marked as posted for /api/stories
@@ -1436,8 +1415,8 @@ def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=Non
         })
         queue_pos = len(_social_queue)
 
-    # Calculate real ETA
-    eta_secs = _calc_eta_seconds() + (queue_pos - 1) * SOCIAL_GAP_SECONDS
+    # Calculate real ETA with the current dynamic gap
+    eta_secs = _calc_eta_seconds() + (queue_pos - 1) * _current_social_gap_seconds()
     eta_min  = max(1, round(eta_secs / 60))
 
     if notify_chat_id:
@@ -1447,7 +1426,7 @@ def queue_for_social(img_buf, caption, notify_chat_id=None, notify_thread_id=Non
             msg = f"📲 {key_label} — {_get_queue_msg()} Posts in ~{eta_min} min."
         send_text(notify_chat_id, msg, thread_id=notify_thread_id)
 
-    log.info(f"[SOCIAL] Queued pos #{queue_pos}, ETA ~{eta_min}m")
+    log.info(f"[SOCIAL] Queued pos #{queue_pos}, ETA ~{eta_min}m, gap={_current_social_gap_seconds()}s")
     try: persist_state()
     except Exception: pass
 
@@ -1536,7 +1515,7 @@ def post_to_social(img_buf, caption):
         return
     if not can_post_social():
         limit = 20 if is_day_social() else 3
-        log.info(f"📵 Social limit reached ({30 if is_day_social() else 5} posts {'day' if is_day_social() else 'night'}) — skipping")
+        log.info(f"📵 Social limit reached ({20 if is_day_social() else 3} posts {'day' if is_day_social() else 'night'}) — skipping")
         return
     try:
         img_bytes = img_buf.getvalue()
@@ -5084,17 +5063,17 @@ def handle_updates():
                                     try:
                                         import io as _io
                                         tg_ok = item.get("tg_ok", False)
-                                        if not tg_ok and item.get("post_telegram", True):
-                                            tg_ok = bool(send_to_telegram(_io.BytesIO(item["img_bytes"]), item["caption"]))
+                                        if item.get("post_telegram"):
+                                            log.info(f"[QUEUE] /qpost Telegram skipped for {item.get('key_label','Post')} — queue is FB/IG/X only")
                                         results = _post_to_social_now(_io.BytesIO(item["img_bytes"]), item["caption"]) or {}
                                         fb = "✅" if results.get("Facebook")  else "❌"
                                         ig = "✅" if results.get("Instagram") else "❌"
                                         x  = "✅" if results.get("Twitter")   else "❌"
-                                        tg = "✅" if tg_ok else "❌"
+                                        tg = "✅ already" if tg_ok else "⏭️ skipped"
                                         with _social_queue_lock:
                                             still = len(_social_queue)
                                         send_text(chat_id,
-                                            f"✅ <b>Force posted!</b>\n"
+                                            f"✅ <b>Force posted to socials!</b>\n"
                                             f"Telegram {tg} · FB {fb} · IG {ig} · X {x}\n"
                                             f"<i>{still} item(s) still in queue</i>",
                                             reply_to=msg_id, thread_id=thread_id)
@@ -5570,7 +5549,7 @@ def handle_updates():
                                         tg_ok_now = bool(send_to_telegram(tg_buf, cap))
                                         tg_icon = "✅" if tg_ok_now else "❌"
 
-                                        # Socials via 10-min queue — confirmation after posting
+                                        # Socials via dynamic FB/IG/X queue — confirmation after posting
                                         social_buf = io.BytesIO(cbytes)
                                         queue_for_social(social_buf, cap,
                                             notify_chat_id=chat_id,
@@ -5837,11 +5816,13 @@ def ops_watchdog():
                 issues.append(f"Social queue is high: {len(_social_queue)} items waiting.")
 
             if len(_social_queue) > 0:
-                if not _ops_watchdog_state.get("social_queue_stuck_since"):
-                    _ops_watchdog_state["social_queue_stuck_since"] = utcnow()
-                stuck_for = (utcnow() - _ops_watchdog_state["social_queue_stuck_since"]).total_seconds()
-                if stuck_for > 45 * 60 and _last_social_post_time:
-                    issues.append(f"Social queue may be stuck: {len(_social_queue)} item(s) still waiting after {int(stuck_for//60)} minutes.")
+                oldest_age = _oldest_social_queue_age_seconds()
+                if oldest_age > SOCIAL_STUCK_ALERT_SECONDS:
+                    issues.append(f"Social queue may be stuck: {len(_social_queue)} item(s) waiting; oldest item is {int(oldest_age//60)} minutes old.")
+                    if not _ops_watchdog_state.get("social_queue_stuck_since"):
+                        _ops_watchdog_state["social_queue_stuck_since"] = utcnow()
+                else:
+                    _ops_watchdog_state["social_queue_stuck_since"] = None
             else:
                 _ops_watchdog_state["social_queue_stuck_since"] = None
         except Exception:
@@ -6903,7 +6884,7 @@ def persist_state():
                     "is_breaking": item.get("is_breaking", False),
                     "key_label": item.get("key_label","Post"),
                     "tg_ok": item.get("tg_ok", False),
-                    "post_telegram": item.get("post_telegram", True),
+                    "post_telegram": False,
                     "notify_chat_id": item.get("notify_chat_id"),
                     "notify_thread_id": item.get("notify_thread_id"),
                 })
@@ -7015,7 +6996,7 @@ def restore_state():
                             "is_breaking": item.get("is_breaking", False),
                             "key_label": item.get("key_label","Post"),
                             "tg_ok": item.get("tg_ok", False),
-                            "post_telegram": item.get("post_telegram", True),
+                            "post_telegram": False,
                             "notify_chat_id": item.get("notify_chat_id"),
                             "notify_thread_id": item.get("notify_thread_id"),
                         })
